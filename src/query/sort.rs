@@ -115,22 +115,28 @@ pub fn execute_sort_limit(
 
 /// Reorder every column of `batch` by `indices`.
 ///
-/// Columns are gathered in parallel: each one is an independent random-access
-/// pass over its own memory, so with several columns this is the cheapest
-/// parallelism available in the sort. Below the threshold the rayon hand-off
-/// costs more than the gather itself.
+/// Deliberately serial. Gathering the columns in parallel looks like free
+/// parallelism — each column is an independent pass — but measuring it (see
+/// tests/diag_sort.rs) showed it losing on three of four shapes, and by 2x on a
+/// 10k-row sort:
+///
+///   rows / batches      parallel     serial
+///   10k  / 10            0.958 ms    0.472 ms
+///   100k / 98            5.554 ms    4.199 ms
+///   10k  / 1             0.825 ms    0.301 ms
+///   100k / 1             2.877 ms    2.963 ms
+///
+/// Two reasons. A typical result has a handful of columns, so rayon is asked to
+/// schedule across a three-element slice and the hand-off costs more than the
+/// work. And a gather is random access bound by memory latency rather than by
+/// CPU, so extra threads contend for the same bus instead of adding throughput.
+///
+/// A very wide result might flip that, but nothing here measured one, and a
+/// threshold chosen on a guess is how the regression got in.
 fn gather(batch: &RecordBatch, indices: &[usize]) -> FalconResult<RecordBatch> {
-    let parallel = batch.column_count() > 1 && indices.len() >= 8_192;
-
-    let cols: FalconResult<Vec<_>> = if parallel {
-        batch.columns.par_iter()
-            .map(|col| col.filter_by_indices(indices))
-            .collect()
-    } else {
-        batch.columns.iter()
-            .map(|col| col.filter_by_indices(indices))
-            .collect()
-    };
+    let cols: FalconResult<Vec<_>> = batch.columns.iter()
+        .map(|col| col.filter_by_indices(indices))
+        .collect();
     RecordBatch::new(batch.schema.clone(), cols?)
 }
 
