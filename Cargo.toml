@@ -1,0 +1,61 @@
+[package]
+name = "falcondb"
+version = "0.1.0"
+edition = "2021"
+authors = ["falcondb contributors"]
+description = "A high-performance columnar analytical database engine"
+license = "MIT"
+
+[lib]
+name = "falcondb"
+crate-type = ["rlib"]
+
+[features]
+default  = []
+python   = ["pyo3"]
+postgres = []
+
+[dependencies]
+sqlparser          = "0.47"
+rayon              = "1.10"
+thiserror          = "1.0"
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
+lz4_flex           = "0.11"
+bytemuck           = { version = "1.16", features = ["derive"] }
+memmap2            = "0.9"
+crossbeam          = "0.8"
+pyo3               = { version = "0.22", features = ["extension-module"], optional = true }
+tokio              = { version = "1", features = ["full"] }
+arrow              = { version = "53", features = ["ipc"] }
+parquet            = { version = "53", features = ["arrow"] }
+wide               = "0.7"
+
+actix-web  = "4"
+
+[dev-dependencies]
+criterion          = { version = "0.5", features = ["html_reports"] }
+pretty_assertions  = "1.4"
+tempfile           = "3"
+polars             = { version = "0.46", features = ["lazy", "csv", "parquet", "dtype-full"] }
+duckdb             = "1"
+datafusion         = "43"
+
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+
+[[bench]]
+name    = "query_bench"
+harness = false
+
+[profile.bench]
+opt-level = 3
+# Debug info is deliberately off. It does not affect codegen or the measured
+# timings, but combined with the inherited `lto = "fat"` and
+# `codegen-units = 1` it pushed the final link past 45 minutes and 29 GB of
+# RAM. Turn it back on only when a profiler needs symbols.
+debug     = false
