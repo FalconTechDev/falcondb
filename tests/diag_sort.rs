@@ -53,18 +53,34 @@ fn build(rows: usize, batch_rows: usize) -> Table {
     table
 }
 
-fn time_sort(table: &Table, reps: usize) -> f64 {
+/// Best time over several series, in milliseconds.
+///
+/// Reports the minimum rather than the mean. The noise on this machine comes
+/// from its own state — frequency scaling, other processes, cache pressure —
+/// not from the code under test, and that kind of noise only ever *adds* time.
+/// Averaging folds it in; the minimum is the closest thing to a measurement of
+/// the code itself.
+///
+/// This matters more than it sounds. Timing identical code six times with the
+/// mean gave 4.2, 4.4, 5.5, 7.1, 5.5 and 5.8 ms — a 70% spread, wide enough to
+/// invent or hide any difference smaller than about 2x.
+fn time_sort(table: &Table, series: usize, reps: usize) -> f64 {
     let keys = [SortExpr::desc(Expr::Column("score".into()))];
 
     // Warm up so the first run's allocation does not land in the measurement.
     let _ = execute_sort(&table.batches, &keys).unwrap();
 
-    let t0 = Instant::now();
-    for _ in 0..reps {
-        let out = execute_sort(&table.batches, &keys).unwrap();
-        assert_eq!(out.row_count(), table.row_count());
+    let mut best = f64::INFINITY;
+    for _ in 0..series {
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let out = execute_sort(&table.batches, &keys).unwrap();
+            assert_eq!(out.row_count(), table.row_count());
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+        best = best.min(ms);
     }
-    t0.elapsed().as_secs_f64() * 1000.0 / reps as f64
+    best
 }
 
 #[test]
@@ -75,7 +91,7 @@ fn report_sort_timings() {
         println!(
             "rows={rows} batches={} -> sort {:.3} ms",
             table.batches.len(),
-            time_sort(&table, 20)
+            time_sort(&table, 8, 20)
         );
     }
 
@@ -85,7 +101,7 @@ fn report_sort_timings() {
         let table = build(rows, rows);
         println!(
             "rows={rows} batches=1 -> sort {:.3} ms",
-            time_sort(&table, 20)
+            time_sort(&table, 8, 20)
         );
     }
 }

@@ -1,0 +1,158 @@
+{
+  "filter_where|datafusion|10000": [
+    1526000.0,
+    1496600.0
+  ],
+  "filter_where|datafusion|100000": [
+    3472000.0,
+    3544400.0
+  ],
+  "filter_where|datafusion|1000000": [
+    21415000.0,
+    21452000.0
+  ],
+  "filter_where|duckdb|10000": [
+    617420.0,
+    600080.0
+  ],
+  "filter_where|duckdb|100000": [
+    4209700.0,
+    4185399.9999999995
+  ],
+  "filter_where|duckdb|1000000": [
+    25213000.0,
+    25803000.0
+  ],
+  "filter_where|polars|10000": [
+    350870.0,
+    335330.0
+  ],
+  "filter_where|polars|100000": [
+    1907600.0,
+    1869200.0
+  ],
+  "filter_where|polars|1000000": [
+    18281000.0,
+    18321000.0
+  ],
+  "full_scan|datafusion|10000": [
+    1313100.0,
+    1415600.0
+  ],
+  "full_scan|datafusion|100000": [
+    1920900.0,
+    2110000.0
+  ],
+  "full_scan|datafusion|1000000": [
+    3361800.0,
+    3384800.0
+  ],
+  "full_scan|duckdb|10000": [
+    207980.0,
+    208240.0
+  ],
+  "full_scan|duckdb|100000": [
+    318460.0,
+    317830.0
+  ],
+  "full_scan|duckdb|1000000": [
+    559490.0,
+    558480.0
+  ],
+  "full_scan|polars|10000": [
+    132740.0,
+    129630.0
+  ],
+  "full_scan|polars|100000": [
+    270650.0,
+    276050.0
+  ],
+  "full_scan|polars|1000000": [
+    4328100.0,
+    4002000.0
+  ],
+  "group_by_agg|datafusion|10000": [
+    2476400.0,
+    2330100.0
+  ],
+  "group_by_agg|datafusion|100000": [
+    2967400.0,
+    2929500.0
+  ],
+  "group_by_agg|datafusion|1000000": [
+    9633100.0,
+    9307800.0
+  ],
+  "group_by_agg|duckdb|10000": [
+    1529300.0,
+    1436300.0
+  ],
+  "group_by_agg|duckdb|100000": [
+    3949900.0,
+    3873500.0
+  ],
+  "group_by_agg|duckdb|1000000": [
+    6230900.0,
+    6242700.0
+  ],
+  "group_by_agg|polars|10000": [
+    772050.0,
+    768220.0
+  ],
+  "group_by_agg|polars|100000": [
+    3203600.0,
+    3770900.0
+  ],
+  "group_by_agg|polars|1000000": [
+    26018000.0,
+    25764000.0
+  ],
+  "order_by|datafusion|10000": [
+    1210900.0,
+    1257700.0
+  ],
+  "order_by|datafusion|100000": [
+    6909200.0,
+    6948600.0
+  ],
+  "order_by|duckdb|10000": [
+    1884200.0,
+    1872100.0
+  ],
+  "order_by|duckdb|100000": [
+    15757000.0,
+    16254000.000000002
+  ],
+  "order_by|polars|10000": [
+    892990.0,
+    693400.0
+  ],
+  "order_by|polars|100000": [
+    4874900.0,
+    4658700.0
+  ],
+  "sql_pipeline|datafusion|10000": [
+    2266100.0,
+    2197500.0
+  ],
+  "sql_pipeline|datafusion|100000": [
+    2969000.0,
+    2838100.0
+  ],
+  "sql_pipeline|duckdb|10000": [
+    2336200.0,
+    2154700.0
+  ],
+  "sql_pipeline|duckdb|100000": [
+    3959700.0,
+    3915500.0
+  ],
+  "sql_pipeline|polars|10000": [
+    1192400.0,
+    964430.0
+  ],
+  "sql_pipeline|polars|100000": [
+    3970500.0,
+    3650100.0
+  ]
+}
