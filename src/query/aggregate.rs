@@ -1120,7 +1120,7 @@ fn scalar_vec_to_column(vals: &[ScalarValue], n: usize) -> FalconResult<(DataTyp
             let (p, s) = (*p, *s);
             Column::Decimal128(crate::storage::column::Decimal128Column::new(
                 vals.iter().map(|v| match v {
-                    ScalarValue::Decimal128(opt, _, _) => *opt,
+                    ScalarValue::Decimal128(d) => d.value,
                     _ => None,
                 }).collect(),
                 p, s,
@@ -1141,8 +1141,8 @@ fn scalar_to_single_row_col(val: &ScalarValue) -> Column {
         ScalarValue::Utf8(v)    => Column::Utf8(Utf8Column::new(vec![v.clone()])),
         ScalarValue::Date32(v)                 => Column::Date32(PrimitiveColumn::new(vec![*v])),
         ScalarValue::Timestamp(v)              => Column::Timestamp(PrimitiveColumn::new(vec![*v])),
-        ScalarValue::Decimal128(v, p, s)       => Column::Decimal128(
-            crate::storage::column::Decimal128Column::new(vec![*v], *p, *s)
+        ScalarValue::Decimal128(d)             => Column::Decimal128(
+            crate::storage::column::Decimal128Column::new(vec![d.value], d.precision, d.scale)
         ),
         ScalarValue::Null                      => Column::Int64(PrimitiveColumn::new(vec![None])),
     }

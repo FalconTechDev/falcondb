@@ -277,8 +277,8 @@ fn column_stats(col: &Column) -> ColumnStats {
             }
             let (p, s) = (c.precision, c.scale);
             ColumnStats {
-                min: mn.map(|v| ScalarValue::Decimal128(Some(v), p, s)),
-                max: mx.map(|v| ScalarValue::Decimal128(Some(v), p, s)),
+                min: mn.map(|v| ScalarValue::decimal(Some(v), p, s)),
+                max: mx.map(|v| ScalarValue::decimal(Some(v), p, s)),
                 null_count: nulls,
                 row_count,
             }

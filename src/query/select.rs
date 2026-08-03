@@ -354,7 +354,7 @@ pub fn project_batch(batch: &RecordBatch, exprs: &[SelectExpr]) -> FalconResult<
             DataType::Decimal128(p, s) => Column::Decimal128(
                 crate::storage::column::Decimal128Column::new(
                     values.iter().map(|v| match v {
-                        ScalarValue::Decimal128(n, _, _) => *n,
+                        ScalarValue::Decimal128(d) => d.value,
                         _ => None,
                     }).collect(),
                     p,

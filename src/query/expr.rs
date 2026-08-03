@@ -372,7 +372,8 @@ impl Expr {
                                 ScalarValue::Utf8(Some(s))             => s.parse::<f64>().map_err(|_|
                                     FalconError::InvalidQuery(format!("cannot cast '{s}' to FLOAT"))
                                 )?,
-                                ScalarValue::Decimal128(Some(n), _, s) => *n as f64 / 10f64.powi(*s as i32),
+                                ScalarValue::Decimal128(d) if d.value.is_some() =>
+                                    d.value.unwrap() as f64 / 10f64.powi(d.scale as i32),
                                 other => return Err(FalconError::InvalidQuery(
                                     format!("cannot cast {other} to FLOAT")
                                 )),
@@ -419,7 +420,7 @@ impl Expr {
                         }
                         DataType::Decimal128(p, s) => {
                             let n = match &v {
-                                ScalarValue::Decimal128(Some(n), _, _) => *n,
+                                ScalarValue::Decimal128(d) if d.value.is_some() => d.value.unwrap(),
                                 ScalarValue::Int64(Some(i))   => (*i as i128) * 10i128.pow(*s as u32),
                                 ScalarValue::Float64(Some(f)) => (*f * 10f64.powi(*s as i32)) as i128,
                                 ScalarValue::Utf8(Some(st))   => parse_decimal(st, *s).ok_or_else(|| {
@@ -429,7 +430,7 @@ impl Expr {
                                     format!("cannot cast {other} to DECIMAL")
                                 )),
                             };
-                            ScalarValue::Decimal128(Some(n), *p, *s)
+                            ScalarValue::decimal(Some(n), *p, *s)
                         }
                         _ => v,
                     })

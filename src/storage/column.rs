@@ -64,7 +64,7 @@ impl Column {
             Column::Utf8(c)       => ScalarValue::Utf8(c.get(index)),
             Column::Date32(c)     => ScalarValue::Date32(c.get(index)),
             Column::Timestamp(c)  => ScalarValue::Timestamp(c.get(index)),
-            Column::Decimal128(c) => ScalarValue::Decimal128(c.inner.get(index), c.precision, c.scale),
+            Column::Decimal128(c) => ScalarValue::decimal(c.inner.get(index), c.precision, c.scale),
         })
     }
 

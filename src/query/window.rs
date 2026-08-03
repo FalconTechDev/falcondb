@@ -414,7 +414,7 @@ fn scalars_to_col(vals: &[ScalarValue]) -> Column {
         DataType::Decimal128(p, s) =>
             Column::Decimal128(crate::storage::column::Decimal128Column::new(
                 vals.iter().map(|v| match v {
-                    ScalarValue::Decimal128(n, _, _) => *n, _ => None,
+                    ScalarValue::Decimal128(d) => d.value, _ => None,
                 }).collect(),
                 *p,
                 *s,

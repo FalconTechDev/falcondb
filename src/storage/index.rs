@@ -55,9 +55,10 @@ impl IndexKey {
             ScalarValue::Date32(Some(d))         => Self::Int(*d as i64),
             ScalarValue::Timestamp(None)         => Self::Null,
             ScalarValue::Timestamp(Some(ts))     => Self::Int(*ts),
-            ScalarValue::Decimal128(None, _, _)  => Self::Null,
-            ScalarValue::Decimal128(Some(n), _, s) =>
-                Self::Float(f64_to_ord_bits(*n as f64 / 10f64.powi(*s as i32))),
+            ScalarValue::Decimal128(d) if d.value.is_none()  => Self::Null,
+            ScalarValue::Decimal128(d) => Self::Float(f64_to_ord_bits(
+                d.value.unwrap_or(0) as f64 / 10f64.powi(d.scale as i32),
+            )),
         }
     }
 }

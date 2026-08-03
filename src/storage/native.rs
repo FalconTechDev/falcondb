@@ -137,7 +137,7 @@ fn gather_column(table: &Table, col_idx: usize) -> FalconResult<Column> {
         )),
         DataType::Decimal128(p, s) => Column::Decimal128(Decimal128Column::new(
             vals.iter().map(|v| match v {
-                ScalarValue::Decimal128(opt, _, _) => *opt,
+                ScalarValue::Decimal128(d) => d.value,
                 _ => None,
             }).collect(),
             *p, *s,

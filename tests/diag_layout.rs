@@ -1,8 +1,11 @@
 // Memory layout of the values the hot paths pass around.
 //
-// ORDER BY and projection both funnel every cell through a `ScalarValue`. How
-// big that enum is decides how much of a sort key set fits in cache, so the
+// General expression evaluation funnels every cell through a `ScalarValue`. How
+// big that enum is decides how much of a working set fits in cache, so the
 // number is worth having in front of us rather than estimated.
+//
+// It was 48 bytes: `Decimal128` held an `i128` inline, whose 16-byte alignment
+// set the size of every variant. Boxing that payload took it to 24.
 
 use std::mem::size_of;
 

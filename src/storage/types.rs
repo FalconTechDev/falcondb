@@ -46,11 +46,31 @@ pub enum ScalarValue {
     Utf8(Option<String>),
     Date32(Option<i32>),
     Timestamp(Option<i64>),
-    Decimal128(Option<i128>, u8, i8),
+    /// Boxed so the i128's 16-byte alignment does not set the size of every
+    /// ScalarValue. Inline it and the enum is 48 bytes; boxed it is 32, and the
+    /// common variants are the ones that get carried around in bulk.
+    Decimal128(Box<DecimalValue>),
     Null,
 }
 
+/// Payload of `ScalarValue::Decimal128`.
+///
+/// `PartialOrd` compares the raw integer without reconciling scale, matching how
+/// `ScalarValue` already ordered decimals when the fields were inline. Comparing
+/// decimals of different scales goes through `as_f64` instead.
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub struct DecimalValue {
+    pub value:     Option<i128>,
+    pub precision: u8,
+    pub scale:     i8,
+}
+
 impl ScalarValue {
+    /// Build a decimal value without the caller naming the box.
+    pub fn decimal(value: Option<i128>, precision: u8, scale: i8) -> Self {
+        ScalarValue::Decimal128(Box::new(DecimalValue { value, precision, scale }))
+    }
+
     pub fn data_type(&self) -> DataType {
         match self {
             ScalarValue::Boolean(_)           => DataType::Boolean,
@@ -61,7 +81,7 @@ impl ScalarValue {
             ScalarValue::Utf8(_)              => DataType::Utf8,
             ScalarValue::Date32(_)            => DataType::Date32,
             ScalarValue::Timestamp(_)         => DataType::Timestamp,
-            ScalarValue::Decimal128(_, p, s)  => DataType::Decimal128(*p, *s),
+            ScalarValue::Decimal128(d)        => DataType::Decimal128(d.precision, d.scale),
             ScalarValue::Null                 => DataType::Null,
         }
     }
@@ -76,7 +96,7 @@ impl ScalarValue {
             ScalarValue::Utf8(v)             => v.is_none(),
             ScalarValue::Date32(v)           => v.is_none(),
             ScalarValue::Timestamp(v)        => v.is_none(),
-            ScalarValue::Decimal128(v, _, _) => v.is_none(),
+            ScalarValue::Decimal128(d) => d.value.is_none(),
             ScalarValue::Null                => true,
         }
     }
@@ -94,7 +114,7 @@ impl ScalarValue {
             ScalarValue::Int64(v)   => v.map(|n| n as f64),
             ScalarValue::Float32(v) => v.map(|n| n as f64),
             ScalarValue::Float64(v) => *v,
-            ScalarValue::Decimal128(v, _, s) => v.map(|n| n as f64 / 10f64.powi(*s as i32)),
+            ScalarValue::Decimal128(d) => d.value.map(|n| n as f64 / 10f64.powi(d.scale as i32)),
             _ => None,
         }
     }
@@ -133,7 +153,8 @@ impl fmt::Display for ScalarValue {
             ScalarValue::Utf8(Some(v))             => write!(f, "{v}"),
             ScalarValue::Date32(Some(d))           => write!(f, "{}", date32_to_string(*d)),
             ScalarValue::Timestamp(Some(ts))       => write!(f, "{}", timestamp_to_string(*ts)),
-            ScalarValue::Decimal128(Some(v), _, s) => write!(f, "{}", decimal_to_string(*v, *s)),
+            ScalarValue::Decimal128(d) if d.value.is_some() =>
+                write!(f, "{}", decimal_to_string(d.value.unwrap(), d.scale)),
             _ => write!(f, "NULL"),
         }
     }

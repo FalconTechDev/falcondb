@@ -337,7 +337,7 @@ fn scalars_to_column(vals: &[ScalarValue], dt: &DataType) -> FalconResult<Column
             use crate::storage::column::Decimal128Column;
             Column::Decimal128(Decimal128Column::new(
                 convert(vals, dt, |v| match v {
-                    ScalarValue::Decimal128(opt, _, _) => *opt,
+                    ScalarValue::Decimal128(d) => d.value,
                     other => other.as_f64().map(|f| (f * 10f64.powi(s as i32)) as i128),
                 })?,
                 p, s,
