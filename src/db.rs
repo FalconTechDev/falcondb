@@ -765,8 +765,21 @@ impl Database {
         use crate::query::sql::CopyFormat;
 
         let p = std::path::Path::new(path);
-        if !p.exists() {
+        let is_glob = path.contains('*') || path.contains('?');
+        if !is_glob && !p.exists() {
             return Err(FalconError::InvalidQuery(format!("no such file: {path}")));
+        }
+
+        // `COPY t FROM 'data/*.parquet'` loads every matching file as one table.
+        if is_glob {
+            if format != CopyFormat::Parquet {
+                return Err(FalconError::InvalidQuery(
+                    "glob patterns are only supported for Parquet".into(),
+                ));
+            }
+            let batches = crate::storage::parquet_io::read_parquet_glob(path, table)?;
+            let rows = self.create_table_from_batches(table, batches)?;
+            return Ok(rows_affected(rows));
         }
 
         let rows = match format {

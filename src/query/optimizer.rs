@@ -208,6 +208,32 @@ fn flatten_and(expr: Expr) -> Vec<Expr> {
     }
 }
 
+/// Drop conjuncts that repeat one already in the list.
+///
+/// `WHERE a > 5 AND b < 2 AND a > 5` evaluates `a > 5` twice, once per row, for
+/// no gain. Written-out queries rarely look like that, but generated SQL and
+/// predicates assembled by pushdown routinely do.
+///
+/// Only structurally identical conjuncts are removed. Proving that `a > 5` and
+/// `5 < a` mean the same thing needs a normal form this optimiser does not have,
+/// and guessing would change results.
+pub fn dedup_predicates(expr: Expr) -> Expr {
+    let preds = flatten_and(expr);
+    if preds.len() < 2 {
+        return rebuild_and(preds);
+    }
+
+    let mut seen: Vec<Expr> = Vec::with_capacity(preds.len());
+    for p in preds {
+        // `Expr` implements structural PartialEq; subquery nodes compare only to
+        // themselves, so nothing is merged across a subquery boundary.
+        if !seen.contains(&p) {
+            seen.push(p);
+        }
+    }
+    rebuild_and(seen)
+}
+
 fn rebuild_and(mut preds: Vec<Expr>) -> Expr {
     assert!(!preds.is_empty());
     let mut result = preds.remove(0);
@@ -328,8 +354,11 @@ impl HasJoinTable for crate::query::sql::JoinClause {
 // ─── Full optimization pipeline ───────────────────────────────────────────────
 
 pub fn optimize_filter(expr: Expr) -> Expr {
-    let folded  = fold_constants(expr);
-    order_predicates(folded)
+    let folded = fold_constants(expr);
+    // Deduplicate before ordering: two identical conjuncts have identical cost,
+    // so removing one after sorting would be a coin flip over which survives.
+    let deduped = dedup_predicates(folded);
+    order_predicates(deduped)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

@@ -113,6 +113,103 @@ pub fn execute_hash_join(
     )
 }
 
+// ─── Sort-merge join ─────────────────────────────────────────────────────────
+
+/// Inner join by sorting both sides on the key and walking them in step.
+///
+/// The hash join builds a table of every distinct right-hand key, which for a
+/// large build side is a large allocation and a random-access probe per left
+/// row. Sort-merge trades that for two sorts and a single linear pass, so its
+/// memory is bounded by the sort rather than by key cardinality, and both scans
+/// are sequential.
+///
+/// Which is faster depends on the shape of the data, so this is offered
+/// alongside the hash join rather than replacing it — see `should_sort_merge`.
+/// Only INNER is implemented; outer variants need unmatched-row bookkeeping that
+/// the hash path already does well.
+pub fn execute_sort_merge_join(
+    left_batches:  &[RecordBatch],
+    right_batches: &[RecordBatch],
+    left_keys:     &[&str],
+    right_keys:    &[&str],
+) -> FalconResult<RecordBatch> {
+    if left_keys.len() != right_keys.len() || left_keys.is_empty() {
+        return Err(FalconError::InvalidQuery(
+            "join key lists must have the same length".into(),
+        ));
+    }
+
+    let left  = merge_batches(left_batches)?;
+    let right = merge_batches(right_batches)?;
+
+    let left_key_cols: Vec<&Column> = left_keys.iter()
+        .map(|k| left.column_by_name(k))
+        .collect::<FalconResult<_>>()?;
+    let right_key_cols: Vec<&Column> = right_keys.iter()
+        .map(|k| right.column_by_name(k))
+        .collect::<FalconResult<_>>()?;
+
+    // Sort row indices by key rather than the rows themselves: the payload
+    // columns are gathered once at the end, so they are never moved twice.
+    let mut l_idx: Vec<usize> = (0..left.row_count()).collect();
+    let mut r_idx: Vec<usize> = (0..right.row_count()).collect();
+
+    let l_keys: Vec<String> = (0..left.row_count())
+        .map(|r| row_key(&left_key_cols, r))
+        .collect::<FalconResult<_>>()?;
+    let r_keys: Vec<String> = (0..right.row_count())
+        .map(|r| row_key(&right_key_cols, r))
+        .collect::<FalconResult<_>>()?;
+
+    l_idx.sort_unstable_by(|&a, &b| l_keys[a].cmp(&l_keys[b]));
+    r_idx.sort_unstable_by(|&a, &b| r_keys[a].cmp(&r_keys[b]));
+
+    let mut left_out:  Vec<Option<usize>> = Vec::new();
+    let mut right_out: Vec<Option<usize>> = Vec::new();
+
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < l_idx.len() && j < r_idx.len() {
+        let lk = &l_keys[l_idx[i]];
+        let rk = &r_keys[r_idx[j]];
+
+        match lk.cmp(rk) {
+            std::cmp::Ordering::Less    => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                // Equal keys form a run on each side; every pairing matches, so
+                // emit the cross product of the two runs.
+                let i_end = (i..l_idx.len()).find(|&x| &l_keys[l_idx[x]] != lk).unwrap_or(l_idx.len());
+                let j_end = (j..r_idx.len()).find(|&x| &r_keys[r_idx[x]] != rk).unwrap_or(r_idx.len());
+
+                for &l in &l_idx[i..i_end] {
+                    for &r in &r_idx[j..j_end] {
+                        left_out.push(Some(l));
+                        right_out.push(Some(r));
+                    }
+                }
+                i = i_end;
+                j = j_end;
+            }
+        }
+    }
+
+    build_output(&left, &right, &left_out, &right_out)
+}
+
+/// Is sort-merge the better choice for these inputs?
+///
+/// Hash join wins when the build side is small: the table fits in cache and the
+/// probe is one lookup per row. It loses when the build side is large enough
+/// that the table stops fitting, at which point every probe is a cache miss and
+/// the two sorts become the cheaper option.
+///
+/// The threshold is a judgement call, not a measured optimum — it is deliberately
+/// high so the default stays with the well-tested hash path.
+pub fn should_sort_merge(left_rows: usize, right_rows: usize) -> bool {
+    const BUILD_SIDE_LIMIT: usize = 1_000_000;
+    right_rows > BUILD_SIDE_LIMIT && left_rows > BUILD_SIDE_LIMIT
+}
+
 // ─── Build phase ─────────────────────────────────────────────────────────────
 
 /// Smallest build side worth filtering. Below this the filter costs more to

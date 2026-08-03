@@ -717,14 +717,60 @@ impl GroupByExec {
 
     // в”Ђв”Ђ Slow path (original row-by-row, general Expr support) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
+    /// Two-phase aggregation: each batch builds its own hash table, then the
+    /// tables are merged.
+    ///
+    /// Sharing one table across threads would need a lock on every row. Building
+    /// per-batch tables and merging costs an extra pass over the *groups*, which
+    /// is normally a tiny fraction of the rows.
+    ///
+    /// Group order stays deterministic. Merging keeps the left side's order and
+    /// appends whatever keys the right side introduces; since that is associative
+    /// and rayon reduces over contiguous ranges, the result matches what a serial
+    /// left-to-right pass would have produced.
     fn execute_slow(&self, batches: &[RecordBatch]) -> FalconResult<RecordBatch> {
-        let mut groups:           HashMap<GroupKey, Vec<Accumulator>> = HashMap::new();
-        let mut key_order:        Vec<GroupKey>                       = Vec::new();
-        let mut group_key_values: HashMap<GroupKey, Vec<ScalarValue>> = HashMap::new();
+        type Partial = (
+            HashMap<GroupKey, Vec<Accumulator>>,
+            Vec<GroupKey>,
+            HashMap<GroupKey, Vec<ScalarValue>>,
+        );
 
-        for batch in batches {
-            self.accumulate_slow(batch, &mut groups, &mut key_order, &mut group_key_values)?;
-        }
+        let empty = || -> Partial { (HashMap::new(), Vec::new(), HashMap::new()) };
+
+        let merge = |mut a: Partial, b: Partial| -> FalconResult<Partial> {
+            let (b_groups, b_order, mut b_vals) = b;
+            let mut b_groups = b_groups;
+            for key in b_order {
+                match a.0.get_mut(&key) {
+                    Some(existing) => {
+                        if let Some(incoming) = b_groups.remove(&key) {
+                            for (acc, other) in existing.iter_mut().zip(incoming) {
+                                acc.merge(other);
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(incoming) = b_groups.remove(&key) {
+                            a.0.insert(key.clone(), incoming);
+                            if let Some(v) = b_vals.remove(&key) {
+                                a.2.insert(key.clone(), v);
+                            }
+                            a.1.push(key);
+                        }
+                    }
+                }
+            }
+            Ok(a)
+        };
+
+        let (groups, key_order, group_key_values) = batches
+            .par_iter()
+            .try_fold(empty, |mut acc, batch| -> FalconResult<Partial> {
+                self.accumulate_slow(batch, &mut acc.0, &mut acc.1, &mut acc.2)?;
+                Ok(acc)
+            })
+            .try_reduce(empty, merge)?;
+
         self.build_slow_result(&groups, &key_order, &group_key_values)
     }
 

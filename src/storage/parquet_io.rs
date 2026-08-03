@@ -271,6 +271,106 @@ pub fn read_parquet(path: &Path, table_name: &str) -> FalconResult<Vec<RecordBat
     read_parquet_projected(path, table_name, None)
 }
 
+/// Expand a `*`/`?` pattern into the matching files, sorted by name.
+///
+/// Only the final path component may contain wildcards — `data/*.parquet` works,
+/// `data/*/file.parquet` does not. Recursive matching would need a directory
+/// walk with its own symlink and permission questions; this covers the shape
+/// that actually gets typed.
+///
+/// A path with no wildcard is returned unchanged, so callers can pass either.
+/// Sorting makes the row order of a multi-file read reproducible, which
+/// filesystem enumeration order alone does not guarantee.
+pub fn expand_glob(pattern: &str) -> FalconResult<Vec<std::path::PathBuf>> {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return Ok(vec![std::path::PathBuf::from(pattern)]);
+    }
+
+    let path   = Path::new(pattern);
+    let dir    = path.parent().filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let needle = path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| FalconError::InvalidQuery(format!("bad glob pattern: {pattern}")))?;
+
+    if dir.to_string_lossy().contains('*') || dir.to_string_lossy().contains('?') {
+        return Err(FalconError::InvalidQuery(
+            "wildcards are only supported in the file name, not in directories".into(),
+        ));
+    }
+
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| FalconError::InvalidQuery(format!("cannot read {}: {e}", dir.display())))?;
+
+    let mut out: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter(|e| {
+            e.file_name().to_str().is_some_and(|n| glob_matches(n, needle))
+        })
+        .map(|e| e.path())
+        .collect();
+
+    if out.is_empty() {
+        return Err(FalconError::InvalidQuery(format!("no files match {pattern}")));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Match a file name against a `*`/`?` pattern.
+///
+/// `*` matches any run including empty, `?` matches exactly one character.
+fn glob_matches(name: &str, pattern: &str) -> bool {
+    let n: Vec<char> = name.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    glob_rec(&n, &p)
+}
+
+fn glob_rec(n: &[char], p: &[char]) -> bool {
+    match (n, p) {
+        (_, []) => n.is_empty(),
+        (_, ['*', rest @ ..]) => {
+            if glob_rec(n, rest) {
+                return true;
+            }
+            !n.is_empty() && glob_rec(&n[1..], p)
+        }
+        ([], _) => false,
+        ([_, nr @ ..], ['?', pr @ ..]) => glob_rec(nr, pr),
+        ([nc, nr @ ..], [pc, pr @ ..]) => nc == pc && glob_rec(nr, pr),
+    }
+}
+
+/// Read every file matching `pattern` into one batch list.
+///
+/// Files are read in sorted name order and concatenated, so a dataset split
+/// across `part-000.parquet`, `part-001.parquet`, … reads back in order. Every
+/// file must share the first one's schema.
+pub fn read_parquet_glob(pattern: &str, table_name: &str) -> FalconResult<Vec<RecordBatch>> {
+    let files = expand_glob(pattern)?;
+    let mut out = Vec::new();
+    let mut schema: Option<crate::storage::schema::Schema> = None;
+
+    for f in files {
+        let batches = read_parquet(&f, table_name)?;
+        if let Some(first) = batches.first() {
+            match &schema {
+                None => schema = Some(first.schema.clone()),
+                Some(s) if s != &first.schema => {
+                    return Err(FalconError::InvalidQuery(format!(
+                        "{} has a different schema from the first file matched",
+                        f.display()
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        out.extend(batches);
+    }
+    Ok(out)
+}
+
 /// Read a Parquet file, optionally reading only the named columns.
 ///
 /// Projection pushdown belongs here rather than after the load: a column the
