@@ -343,6 +343,89 @@ where
     indexed.into_iter().map(|(_, j)| j).collect()
 }
 
+/// Estimate how many *distinct* values a column holds, by sampling.
+///
+/// Row count is a poor proxy for join cost. A million-row table joined on a
+/// column with five distinct values produces a hash table of five entries and a
+/// huge fan-out; a million-row table with a million distinct keys produces a
+/// large table and at most one match per probe. Ordering joins by row count
+/// alone cannot tell those apart.
+///
+/// Sampling every `stride`-th row keeps this O(sample) rather than O(rows), so
+/// it can run during planning. The result is scaled back up by the sampling
+/// rate, which is the standard estimator and is deliberately rough: it informs
+/// an ordering decision, never a result.
+///
+/// Returns `None` when there is nothing useful to say — no rows, or a column the
+/// batch does not have.
+pub fn estimate_distinct(batches: &[RecordBatch], column: &str) -> Option<usize> {
+    use crate::query::hash::FastSet;
+
+    /// Enough to separate "a handful of groups" from "nearly unique" without
+    /// making planning itself expensive.
+    const SAMPLE_TARGET: usize = 2_048;
+
+    let total: usize = batches.iter().map(|b| b.row_count()).sum();
+    if total == 0 {
+        return None;
+    }
+    // Confirm the column exists before sampling.
+    batches.first()?.column_by_name(column).ok()?;
+
+    let mut seen: FastSet<u64> = FastSet::default();
+    let mut sampled = 0usize;
+
+    // Contiguous runs, not every k-th row. Systematic sampling aliases badly
+    // against periodic data: on a column cycling through 1000 values, a stride
+    // sharing a factor with 1000 only ever visits a fraction of them, and the
+    // estimate comes out wrong in a way that looks stable.
+    for batch in batches {
+        if sampled >= SAMPLE_TARGET {
+            break;
+        }
+        let Ok(col) = batch.column_by_name(column) else { continue };
+        let take = (SAMPLE_TARGET - sampled).min(batch.row_count());
+        for row in 0..take {
+            // Hashing the rendered value keeps this type-agnostic; the estimate
+            // does not need the exactness a join key would.
+            if let Ok(v) = col.get(row) {
+                use std::hash::{Hash, Hasher};
+                let mut h = crate::query::hash::FxHasher::default();
+                v.to_string().hash(&mut h);
+                seen.insert(h.finish());
+            }
+        }
+        sampled += take;
+    }
+
+    if sampled == 0 {
+        return None;
+    }
+
+    let d = seen.len();
+    let ratio = d as f64 / sampled as f64;
+
+    // Distinct counts saturate — they do not scale with sample size the way a
+    // sum does. Seeing five values in two thousand rows means the column has
+    // about five, not five times the sampling rate.
+    let estimate = if ratio >= 0.9 {
+        // Almost every sampled row was different: assume the column is a key.
+        total
+    } else if ratio <= 0.1 {
+        // Sampling more would turn up few new values.
+        d
+    } else {
+        // In between, scale sub-linearly. The exponent is the observed ratio, so
+        // a column that looks half-unique scales by the square root of the
+        // sampling factor rather than by all of it.
+        let scale = total as f64 / sampled as f64;
+        (d as f64 * scale.powf(ratio)).round() as usize
+    };
+
+    // A table cannot hold more distinct values than it has rows.
+    Some(estimate.clamp(1, total))
+}
+
 pub trait HasJoinTable {
     fn table_name(&self) -> &str;
 }
