@@ -97,12 +97,13 @@ impl RecordBatch {
 
     /// Packed-bit variant of filter_by_mask — 8× smaller mask, better cache behaviour.
     ///
-    /// The mask is expanded into row indices exactly once and shared across every
-    /// column; doing it per column made the filter O(columns × rows) instead of O(rows).
+    /// Drives gather directly from the bitmask without materialising an intermediate
+    /// index list. The popcount is computed once and shared across every column.
     pub fn filter_by_bitmask(&self, mask: &[u64]) -> FalconResult<RecordBatch> {
-        let indices = super::column::bitmask_to_indices(mask, self.row_count());
+        let row_count = self.row_count();
+        let selected: usize = mask.iter().map(|w| w.count_ones() as usize).sum();
         let filtered: FalconResult<Vec<Column>> = self.columns.iter()
-            .map(|col| col.filter_by_indices(&indices))
+            .map(|col| col.gather_by_bitmask(mask, row_count, selected))
             .collect();
         RecordBatch::new(self.schema.clone(), filtered?)
     }
@@ -121,14 +122,15 @@ impl RecordBatch {
         mask: &[u64],
         keep: &std::collections::HashSet<String>,
     ) -> FalconResult<RecordBatch> {
-        let indices = super::column::bitmask_to_indices(mask, self.row_count());
+        let row_count = self.row_count();
+        let selected: usize = mask.iter().map(|w| w.count_ones() as usize).sum();
 
         let mut fields  = Vec::with_capacity(keep.len());
         let mut columns = Vec::with_capacity(keep.len());
         for (i, field) in self.schema.fields.iter().enumerate() {
             if keep.contains(&field.name) {
                 fields.push(field.clone());
-                columns.push(self.column(i).filter_by_indices(&indices)?);
+                columns.push(self.column(i).gather_by_bitmask(mask, row_count, selected)?);
             }
         }
         RecordBatch::new(Schema::new(fields), columns)

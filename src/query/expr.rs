@@ -652,30 +652,80 @@ fn cmp_dense<T: Copy + PartialOrd>(
     Ok(())
 }
 
-/// Vectorised f64 comparison — two-pass design lets LLVM emit AVX2 instructions.
+/// Vectorised f64 comparison — writes directly to a u64 bitmask using AVX2 movemask.
 ///
-/// Pass 1: fill a `bool` buffer (LLVM vectorises the comparison over &[f64]).
-/// Pass 2: pack booleans into u64 words (bit-level, not vectorisable but tiny).
-/// This separation is faster than a combined loop at large N because pass 1
-/// runs as 4-wide or 8-wide SIMD on x86-64 with AVX2.
+/// Uses `_mm256_cmp_pd` (4-wide) + `_mm256_movemask_pd` to extract 4 comparison bits
+/// per instruction, accumulating directly into each u64 word. Eliminates the
+/// intermediate `Vec<bool>` allocation and the separate pack pass.
 fn cmp_dense_f64_simd(dense: &[f64], v: f64, op: &BinaryOp, mask: &mut [u64]) -> FalconResult<()> {
-    // Pass 1: vectorisable comparison into a contiguous bool array.
-    let bools = cmp_to_bools_f64(dense, v, op)?;
-    pack_bools_to_mask(&bools, mask);
-    Ok(())
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: we just checked for AVX2 above.
+        return unsafe { cmp_f64_avx2(dense, v, op, mask) };
+    }
+    // Scalar fallback (non-x86 or no AVX2).
+    cmp_f64_scalar(dense, v, op, mask)
 }
 
-/// Same two-pass trick for i64.
+/// Same approach for i64 (no AVX2 movemask for integers in the same way, so keep
+/// the two-pass approach but avoid the intermediate Vec allocation by writing inline).
 fn cmp_dense_i64_simd(dense: &[i64], v: i64, op: &BinaryOp, mask: &mut [u64]) -> FalconResult<()> {
-    let bools = cmp_to_bools_i64(dense, v, op)?;
-    pack_bools_to_mask(&bools, mask);
-    Ok(())
+    cmp_i64_scalar(dense, v, op, mask)
 }
 
-#[inline(always)]
-fn cmp_to_bools_f64(dense: &[f64], v: f64, op: &BinaryOp) -> FalconResult<Vec<bool>> {
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn cmp_f64_avx2(dense: &[f64], v: f64, op: &BinaryOp, mask: &mut [u64]) -> FalconResult<()> {
+    use std::arch::x86_64::*;
+    macro_rules! run_avx2 {
+        ($cmp_imm:expr, $scalar_pred:expr) => {{
+            let thresh = _mm256_set1_pd(v);
+            for (wi, chunk64) in dense.chunks(64).enumerate() {
+                let n = chunk64.len();
+                let n_full4 = n & !3;
+                let ptr = chunk64.as_ptr();
+                let mut word = 0u64;
+                let mut i = 0;
+                while i < n_full4 {
+                    let vals = _mm256_loadu_pd(ptr.add(i));
+                    let cmp  = _mm256_cmp_pd::<$cmp_imm>(vals, thresh);
+                    word |= (_mm256_movemask_pd(cmp) as u64) << i;
+                    i += 4;
+                }
+                // scalar tail (< 4 remaining elements)
+                for j in n_full4..n {
+                    if ($scalar_pred)(*ptr.add(j)) { word |= 1u64 << j; }
+                }
+                mask[wi] = word;
+            }
+            Ok(())
+        }};
+    }
+    match op {
+        BinaryOp::Gt    => run_avx2!({ _CMP_GT_OQ  as i32 }, |x: f64| x >  v),
+        BinaryOp::GtEq  => run_avx2!({ _CMP_GE_OQ  as i32 }, |x: f64| x >= v),
+        BinaryOp::Lt    => run_avx2!({ _CMP_LT_OQ  as i32 }, |x: f64| x <  v),
+        BinaryOp::LtEq  => run_avx2!({ _CMP_LE_OQ  as i32 }, |x: f64| x <= v),
+        BinaryOp::Eq    => run_avx2!({ _CMP_EQ_OQ  as i32 }, |x: f64| x == v),
+        BinaryOp::NotEq => run_avx2!({ _CMP_NEQ_UQ as i32 }, |x: f64| x != v),
+        _ => Err(FalconError::InvalidQuery("non-comparison op in WHERE".into())),
+    }
+}
+
+/// Scalar fallback: single-pass direct bitmask write, no Vec<bool> allocation.
+#[inline]
+fn cmp_f64_scalar(dense: &[f64], v: f64, op: &BinaryOp, mask: &mut [u64]) -> FalconResult<()> {
     macro_rules! run {
-        ($pred:expr) => { Ok(dense.iter().map(|&x| ($pred)(x)).collect()) };
+        ($pred:expr) => {{
+            for (wi, chunk) in dense.chunks(64).enumerate() {
+                let mut bits = 0u64;
+                for (j, &x) in chunk.iter().enumerate() {
+                    bits |= (($pred)(x) as u64) << j;
+                }
+                mask[wi] = bits;
+            }
+            Ok(())
+        }};
     }
     match op {
         BinaryOp::Gt    => run!(|x: f64| x >  v),
@@ -688,10 +738,20 @@ fn cmp_to_bools_f64(dense: &[f64], v: f64, op: &BinaryOp) -> FalconResult<Vec<bo
     }
 }
 
-#[inline(always)]
-fn cmp_to_bools_i64(dense: &[i64], v: i64, op: &BinaryOp) -> FalconResult<Vec<bool>> {
+/// i64 single-pass direct bitmask write, no Vec<bool> allocation.
+#[inline]
+fn cmp_i64_scalar(dense: &[i64], v: i64, op: &BinaryOp, mask: &mut [u64]) -> FalconResult<()> {
     macro_rules! run {
-        ($pred:expr) => { Ok(dense.iter().map(|&x| ($pred)(x)).collect()) };
+        ($pred:expr) => {{
+            for (wi, chunk) in dense.chunks(64).enumerate() {
+                let mut bits = 0u64;
+                for (j, &x) in chunk.iter().enumerate() {
+                    bits |= (($pred)(x) as u64) << j;
+                }
+                mask[wi] = bits;
+            }
+            Ok(())
+        }};
     }
     match op {
         BinaryOp::Gt    => run!(|x: i64| x >  v),
@@ -701,18 +761,6 @@ fn cmp_to_bools_i64(dense: &[i64], v: i64, op: &BinaryOp) -> FalconResult<Vec<bo
         BinaryOp::Eq    => run!(|x: i64| x == v),
         BinaryOp::NotEq => run!(|x: i64| x != v),
         _ => Err(FalconError::InvalidQuery("non-comparison op in WHERE".into())),
-    }
-}
-
-/// Pack a flat bool slice into u64 bitmask words.
-#[inline(always)]
-fn pack_bools_to_mask(bools: &[bool], mask: &mut [u64]) {
-    for (w, chunk) in bools.chunks(64).enumerate() {
-        let mut bits = 0u64;
-        for (j, &b) in chunk.iter().enumerate() {
-            bits |= (b as u64) << j;
-        }
-        mask[w] = bits;
     }
 }
 

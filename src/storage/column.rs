@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::types::{DataType, FalconError, FalconResult, ScalarValue};
 
 /// A column is a typed, contiguous array of values — the core unit of falconDB.
@@ -100,11 +102,34 @@ impl Column {
     /// Packed-bit variant: `mask` is `ceil(row_count/64)` words, LSB-first.
     /// Faster than `filter_by_mask` because the mask occupies 8× less cache.
     ///
-    /// When filtering a whole batch prefer `bitmask_to_indices` + `filter_by_indices`
-    /// so the index list is built once and shared across all columns.
+    /// When filtering a whole batch prefer `gather_by_bitmask` (no index list alloc)
+    /// or at minimum build indices once and share across columns.
     pub fn filter_by_bitmask(&self, mask: &[u64], row_count: usize) -> FalconResult<Column> {
         let indices = bitmask_to_indices(mask, row_count);
         self.filter_by_indices(&indices)
+    }
+
+    /// Gather rows from a packed bitmask without materialising an intermediate index list.
+    ///
+    /// `selected` is the popcount of `mask` — pass it in so the caller can compute it
+    /// once and share across all columns in a batch.
+    pub fn gather_by_bitmask(&self, mask: &[u64], row_count: usize, selected: usize) -> FalconResult<Column> {
+        Ok(match self {
+            Column::Int32(c)   => Column::Int32(c.gather_by_bitmask(mask, row_count, selected)),
+            Column::Int64(c)   => Column::Int64(c.gather_by_bitmask(mask, row_count, selected)),
+            Column::Float32(c) => Column::Float32(c.gather_by_bitmask(mask, row_count, selected)),
+            Column::Float64(c) => Column::Float64(c.gather_by_bitmask(mask, row_count, selected)),
+            Column::Date32(c)  => Column::Date32(c.gather_by_bitmask(mask, row_count, selected)),
+            Column::Timestamp(c) => Column::Timestamp(c.gather_by_bitmask(mask, row_count, selected)),
+            Column::Utf8(c)    => Column::Utf8(c.gather_by_bitmask(mask, row_count, selected)),
+            Column::Decimal128(c) => Column::Decimal128(Decimal128Column {
+                inner:     c.inner.gather_by_bitmask(mask, row_count, selected),
+                precision: c.precision,
+                scale:     c.scale,
+            }),
+            // BooleanColumn: fall back to index-based path (rare in analytical queries)
+            Column::Boolean(_) => self.filter_by_bitmask(mask, row_count)?,
+        })
     }
 
     pub fn slice(&self, offset: usize, length: usize) -> FalconResult<Column> {
@@ -880,6 +905,58 @@ impl<T: Copy + Default> PrimitiveColumn<T> {
         })
     }
 
+    /// Gather rows driven directly by a packed bitmask — no intermediate index list.
+    ///
+    /// `selected` must equal the popcount of `mask[..ceil(row_count/64)]`.
+    /// Uses `get_unchecked` because every bit position is guaranteed < row_count.
+    pub fn gather_by_bitmask(&self, mask: &[u64], row_count: usize, selected: usize) -> Self {
+        // Non-null fast path: straight gather into a dense vec.
+        if self.validity.is_none() {
+            let mut values = Vec::with_capacity(selected);
+            for (wi, &word) in mask.iter().enumerate() {
+                let base = wi << 6;
+                if base >= row_count { break; }
+                let mut bits = word;
+                while bits != 0 {
+                    let row = base + bits.trailing_zeros() as usize;
+                    if row >= row_count { break; }
+                    // SAFETY: row < row_count == self.values.len()
+                    values.push(unsafe { *self.values.get_unchecked(row) });
+                    bits &= bits - 1;
+                }
+            }
+            return Self::from_non_null(values);
+        }
+
+        // Nullable path: mirror the validity bitmap.
+        let validity_bits = self.validity.as_deref().unwrap();
+        let mut values   = Vec::with_capacity(selected);
+        let mut out_bits = vec![0u64; selected.div_ceil(64)];
+        let mut any_null = false;
+        let mut out_i    = 0usize;
+
+        for (wi, &word) in mask.iter().enumerate() {
+            let base = wi << 6;
+            if base >= row_count { break; }
+            let mut bits = word;
+            while bits != 0 {
+                let row = base + bits.trailing_zeros() as usize;
+                if row >= row_count { break; }
+                // SAFETY: row < row_count == self.values.len()
+                values.push(unsafe { *self.values.get_unchecked(row) });
+                if (validity_bits[row >> 6] >> (row & 63)) & 1 == 1 {
+                    out_bits[out_i >> 6] |= 1u64 << (out_i & 63);
+                } else {
+                    any_null = true;
+                }
+                out_i += 1;
+                bits &= bits - 1;
+            }
+        }
+
+        Self { values, validity: any_null.then_some(out_bits) }
+    }
+
     pub fn slice(&self, offset: usize, length: usize) -> FalconResult<Self> {
         if offset + length > self.values.len() {
             return Err(FalconError::IndexOutOfBounds {
@@ -1028,14 +1105,15 @@ const NULL_CODE: u32 = u32::MAX;
 /// - Equality against a literal resolves to one code lookup, then integer compares.
 #[derive(Debug, Clone)]
 pub struct Utf8Column {
-    dict:      Vec<String>,
+    // Arc-shared so filter/slice/gather clone the dict in O(1) instead of deep-copying.
+    dict:      Arc<Vec<String>>,
     codes:     Vec<u32>,
     has_nulls: bool,
 }
 
 impl Utf8Column {
     pub fn new(values: Vec<Option<String>>) -> Self {
-        let mut dict:      Vec<String> = Vec::new();
+        let mut dict_vec:  Vec<String> = Vec::new();
         let mut codes:     Vec<u32>    = Vec::with_capacity(values.len());
         let mut seen:      std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         let mut has_nulls: bool        = false;
@@ -1047,8 +1125,8 @@ impl Utf8Column {
                     let code = match seen.get(&s) {
                         Some(&c) => c,
                         None => {
-                            let c = dict.len() as u32;
-                            dict.push(s.clone());
+                            let c = dict_vec.len() as u32;
+                            dict_vec.push(s.clone());
                             seen.insert(s, c);
                             c
                         }
@@ -1058,12 +1136,12 @@ impl Utf8Column {
             }
         }
 
-        Self { dict, codes, has_nulls }
+        Self { dict: Arc::new(dict_vec), codes, has_nulls }
     }
 
-    /// Build directly from an existing dictionary. The caller guarantees every
+    /// Build directly from an existing Arc-shared dictionary. The caller guarantees every
     /// code is either `NULL_CODE` or a valid index into `dict`.
-    fn from_parts(dict: Vec<String>, codes: Vec<u32>) -> Self {
+    fn from_parts(dict: Arc<Vec<String>>, codes: Vec<u32>) -> Self {
         let has_nulls = codes.iter().any(|&c| c == NULL_CODE);
         Self { dict, codes, has_nulls }
     }
@@ -1094,7 +1172,7 @@ impl Utf8Column {
 
     /// The distinct strings, in first-seen order.
     pub fn dict(&self) -> &[String] {
-        &self.dict
+        self.dict.as_slice()
     }
 
     /// One code per row; `NULL_CODE` marks a NULL. Index into [`Utf8Column::dict`].
@@ -1151,6 +1229,27 @@ impl Utf8Column {
         Ok(Self::from_parts(self.dict.clone(), codes))
     }
 
+    /// Gather rows driven directly by a packed bitmask — no intermediate index list.
+    pub fn gather_by_bitmask(&self, mask: &[u64], row_count: usize, selected: usize) -> Self {
+        let mut codes    = Vec::with_capacity(selected);
+        let mut has_nulls = false;
+        for (wi, &word) in mask.iter().enumerate() {
+            let base = wi << 6;
+            if base >= row_count { break; }
+            let mut bits = word;
+            while bits != 0 {
+                let row = base + bits.trailing_zeros() as usize;
+                if row >= row_count { break; }
+                // SAFETY: row < row_count == self.codes.len()
+                let code = unsafe { *self.codes.get_unchecked(row) };
+                if code == NULL_CODE { has_nulls = true; }
+                codes.push(code);
+                bits &= bits - 1;
+            }
+        }
+        Self { dict: self.dict.clone(), codes, has_nulls }
+    }
+
     pub fn slice(&self, offset: usize, length: usize) -> FalconResult<Self> {
         if offset + length > self.codes.len() {
             return Err(FalconError::IndexOutOfBounds {
@@ -1170,9 +1269,9 @@ impl Utf8Column {
     /// batches costs one pass over the codes plus a handful of string lookups.
     pub fn concat_all(parts: &[&Self]) -> Self {
         let total: usize = parts.iter().map(|p| p.len()).sum();
-        let mut dict:  Vec<String> = Vec::new();
-        let mut seen:  std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        let mut codes: Vec<u32> = Vec::with_capacity(total);
+        let mut dict_vec: Vec<String> = Vec::new();
+        let mut seen:     std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut codes:    Vec<u32> = Vec::with_capacity(total);
 
         for p in parts {
             let remap: Vec<u32> = p
@@ -1181,8 +1280,8 @@ impl Utf8Column {
                 .map(|s| match seen.get(s) {
                     Some(&c) => c,
                     None => {
-                        let c = dict.len() as u32;
-                        dict.push(s.clone());
+                        let c = dict_vec.len() as u32;
+                        dict_vec.push(s.clone());
                         seen.insert(s.clone(), c);
                         c
                     }
@@ -1195,7 +1294,7 @@ impl Utf8Column {
         }
 
         let has_nulls = parts.iter().any(|p| p.has_nulls);
-        Self { dict, codes, has_nulls }
+        Self { dict: Arc::new(dict_vec), codes, has_nulls }
     }
 }
 
