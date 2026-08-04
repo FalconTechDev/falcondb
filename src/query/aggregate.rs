@@ -204,10 +204,11 @@ impl Accumulator {
 
 // в”Ђв”Ђв”Ђ Fast-path batch state (parallel arrays, no boxing) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
-// Inline capacity: most analytical GROUP BY queries have ≤ 16 groups per batch.
-// With SmallVec, states for n_groups ≤ 16 live on the stack — zero heap allocs
-// in the hot Rayon loop.
-const AGG_INLINE: usize = 16;
+// Inline capacity: most analytical GROUP BY queries have ≤ 8 groups per batch.
+// With SmallVec, states for n_groups ≤ 8 are fully inline — zero heap allocs.
+// AGG_INLINE=8 keeps BatchAggState at ~184 bytes (vs 320 bytes at 16), so 122
+// per-batch states fit in L2 cache.
+const AGG_INLINE: usize = 8;
 
 /// Per-aggregate typed accumulator arrays, indexed by group_id.
 struct BatchAggState {
