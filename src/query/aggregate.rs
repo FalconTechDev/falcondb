@@ -360,34 +360,41 @@ impl GroupByExec {
                 // NULL groups with the empty string, as the row-wise path did. The
                 // group is created only on first sight вЂ” allocating it up front
                 // would report an extra, empty group for null-free data.
-                let mut null_gid: Option<u32> = None;
-
-                let mut batch_gids: Vec<u32> = Vec::with_capacity(gb_dict.len());
-                for &code in gb_dict.codes() {
-                    let gid = if crate::storage::column::Utf8Column::is_null_code(code) {
-                        match null_gid {
-                            Some(g) => g,
-                            None => {
-                                let g = match local_keys.iter().position(|k| k.is_empty()) {
-                                    Some(i) => i as u32,
-                                    None => {
-                                        let id = local_keys.len() as u32;
-                                        local_keys.push(String::new());
-                                        for st in &mut local_states { st.push_group(); }
-                                        id
-                                    }
-                                };
-                                null_gid = Some(g);
-                                g
+                // No-null fast path: feed dict codes directly to the accumulator,
+                // skipping batch_gids materialisation (eliminates one full pass).
+                if !gb_dict.has_nulls() {
+                    self.accumulate_batch_from_codes(
+                        gb_dict.codes(), &code_to_gid, batch,
+                        &agg_col_indices, &mut local_states,
+                    )?;
+                } else {
+                    let mut null_gid: Option<u32> = None;
+                    let mut batch_gids: Vec<u32> = Vec::with_capacity(gb_dict.len());
+                    for &code in gb_dict.codes() {
+                        let gid = if crate::storage::column::Utf8Column::is_null_code(code) {
+                            match null_gid {
+                                Some(g) => g,
+                                None => {
+                                    let g = match local_keys.iter().position(|k| k.is_empty()) {
+                                        Some(i) => i as u32,
+                                        None => {
+                                            let id = local_keys.len() as u32;
+                                            local_keys.push(String::new());
+                                            for st in &mut local_states { st.push_group(); }
+                                            id
+                                        }
+                                    };
+                                    null_gid = Some(g);
+                                    g
+                                }
                             }
-                        }
-                    } else {
-                        code_to_gid[code as usize]
-                    };
-                    batch_gids.push(gid);
+                        } else {
+                            code_to_gid[code as usize]
+                        };
+                        batch_gids.push(gid);
+                    }
+                    self.accumulate_batch(&batch_gids, batch, &agg_col_indices, &mut local_states)?;
                 }
-
-                self.accumulate_batch(&batch_gids, batch, &agg_col_indices, &mut local_states)?;
                 Ok((local_keys, local_states))
             })
             .collect();
@@ -708,6 +715,195 @@ impl GroupByExec {
                                         state.sum[g] = v; state.has_val[g] = true;
                                     }
                                 }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Like `accumulate_batch`, but uses raw Utf8 dict `codes` + `code_to_gid`
+    /// mapping instead of a pre-materialised `batch_gids` slice.
+    ///
+    /// This eliminates the separate gid-building pass in `fast_utf8_gb` for
+    /// no-null GB columns: one pass over codes drives all agg scatter loops
+    /// instead of the previous four (build gids + 3 agg loops over gids).
+    fn accumulate_batch_from_codes(
+        &self,
+        codes:           &[u32],
+        code_to_gid:     &[u32],
+        batch:           &RecordBatch,
+        agg_col_indices: &[Option<usize>],
+        states:          &mut [BatchAggState],
+    ) -> FalconResult<()> {
+        for (agg_idx, (agg, &maybe_idx)) in self.aggs.iter().zip(agg_col_indices.iter()).enumerate() {
+            let state = &mut states[agg_idx];
+
+            if maybe_idx.is_none() {
+                for &code in codes {
+                    state.count[code_to_gid[code as usize] as usize] += 1;
+                }
+                continue;
+            }
+
+            let col = batch.column(maybe_idx.unwrap());
+
+            match (&agg.func, col) {
+                (AggFunc::Count, Column::Float64(c)) => {
+                    if !c.has_nulls() {
+                        for &code in codes { state.count[code_to_gid[code as usize] as usize] += 1; }
+                    } else {
+                        for (row, &code) in codes.iter().enumerate() {
+                            if c.is_valid(row) { state.count[code_to_gid[code as usize] as usize] += 1; }
+                        }
+                    }
+                }
+                (AggFunc::Count, Column::Int64(c)) => {
+                    if !c.has_nulls() {
+                        for &code in codes { state.count[code_to_gid[code as usize] as usize] += 1; }
+                    } else {
+                        for (row, &code) in codes.iter().enumerate() {
+                            if c.is_valid(row) { state.count[code_to_gid[code as usize] as usize] += 1; }
+                        }
+                    }
+                }
+                (AggFunc::Count, Column::Int32(c)) => {
+                    for (row, &code) in codes.iter().enumerate() {
+                        if c.is_valid(row) { state.count[code_to_gid[code as usize] as usize] += 1; }
+                    }
+                }
+                (AggFunc::Count, Column::Utf8(c)) => {
+                    for (row, &code) in codes.iter().enumerate() {
+                        if c.get_str(row).is_some() { state.count[code_to_gid[code as usize] as usize] += 1; }
+                    }
+                }
+                (AggFunc::Sum, Column::Float64(c)) => {
+                    if !c.has_nulls() {
+                        for (&code, &v) in codes.iter().zip(c.dense().iter()) {
+                            let g = code_to_gid[code as usize] as usize;
+                            state.sum[g] += v; state.has_val[g] = true;
+                        }
+                    } else {
+                        for (row, &code) in codes.iter().enumerate() {
+                            if let Some(v) = c.get(row) {
+                                let g = code_to_gid[code as usize] as usize;
+                                state.sum[g] += v; state.has_val[g] = true;
+                            }
+                        }
+                    }
+                }
+                (AggFunc::Sum, Column::Int64(c)) => {
+                    if !c.has_nulls() {
+                        for (&code, &v) in codes.iter().zip(c.dense().iter()) {
+                            let g = code_to_gid[code as usize] as usize;
+                            state.sum[g] += v as f64; state.has_val[g] = true;
+                        }
+                    } else {
+                        for (row, &code) in codes.iter().enumerate() {
+                            if let Some(v) = c.get(row) {
+                                let g = code_to_gid[code as usize] as usize;
+                                state.sum[g] += v as f64; state.has_val[g] = true;
+                            }
+                        }
+                    }
+                }
+                (AggFunc::Sum, Column::Int32(c)) => {
+                    for (row, &code) in codes.iter().enumerate() {
+                        if let Some(v) = c.get(row) {
+                            let g = code_to_gid[code as usize] as usize;
+                            state.sum[g] += v as f64; state.has_val[g] = true;
+                        }
+                    }
+                }
+                (AggFunc::Avg, Column::Float64(c)) => {
+                    if !c.has_nulls() {
+                        for (&code, &v) in codes.iter().zip(c.dense().iter()) {
+                            let g = code_to_gid[code as usize] as usize;
+                            state.sum[g] += v; state.count[g] += 1;
+                        }
+                    } else {
+                        for (row, &code) in codes.iter().enumerate() {
+                            if let Some(v) = c.get(row) {
+                                let g = code_to_gid[code as usize] as usize;
+                                state.sum[g] += v; state.count[g] += 1;
+                            }
+                        }
+                    }
+                }
+                (AggFunc::Avg, Column::Int64(c)) => {
+                    if !c.has_nulls() {
+                        for (&code, &v) in codes.iter().zip(c.dense().iter()) {
+                            let g = code_to_gid[code as usize] as usize;
+                            state.sum[g] += v as f64; state.count[g] += 1;
+                        }
+                    } else {
+                        for (row, &code) in codes.iter().enumerate() {
+                            if let Some(v) = c.get(row) {
+                                let g = code_to_gid[code as usize] as usize;
+                                state.sum[g] += v as f64; state.count[g] += 1;
+                            }
+                        }
+                    }
+                }
+                (AggFunc::Avg, Column::Int32(c)) => {
+                    for (row, &code) in codes.iter().enumerate() {
+                        if let Some(v) = c.get(row) {
+                            let g = code_to_gid[code as usize] as usize;
+                            state.sum[g] += v as f64; state.count[g] += 1;
+                        }
+                    }
+                }
+                (AggFunc::Min, Column::Float64(c)) => {
+                    for (row, &code) in codes.iter().enumerate() {
+                        if let Some(v) = c.get(row) {
+                            let g = code_to_gid[code as usize] as usize;
+                            if !state.has_val[g] || v < state.sum[g] { state.sum[g] = v; state.has_val[g] = true; }
+                        }
+                    }
+                }
+                (AggFunc::Min, Column::Int64(c)) => {
+                    for (row, &code) in codes.iter().enumerate() {
+                        if let Some(v) = c.get(row) {
+                            let g = code_to_gid[code as usize] as usize;
+                            let vf = v as f64;
+                            if !state.has_val[g] || vf < state.sum[g] { state.sum[g] = vf; state.has_val[g] = true; }
+                        }
+                    }
+                }
+                (AggFunc::Max, Column::Float64(c)) => {
+                    for (row, &code) in codes.iter().enumerate() {
+                        if let Some(v) = c.get(row) {
+                            let g = code_to_gid[code as usize] as usize;
+                            if !state.has_val[g] || v > state.sum[g] { state.sum[g] = v; state.has_val[g] = true; }
+                        }
+                    }
+                }
+                (AggFunc::Max, Column::Int64(c)) => {
+                    for (row, &code) in codes.iter().enumerate() {
+                        if let Some(v) = c.get(row) {
+                            let g = code_to_gid[code as usize] as usize;
+                            let vf = v as f64;
+                            if !state.has_val[g] || vf > state.sum[g] { state.sum[g] = vf; state.has_val[g] = true; }
+                        }
+                    }
+                }
+                _ => {
+                    let vals = col.as_float64_values().ok_or_else(|| {
+                        FalconError::InvalidQuery(format!(
+                            "Cannot aggregate '{}' as float", agg.alias
+                        ))
+                    })?;
+                    for (row, &code) in codes.iter().enumerate() {
+                        if let Some(v) = vals[row] {
+                            let g = code_to_gid[code as usize] as usize;
+                            match &agg.func {
+                                AggFunc::Sum => { state.sum[g] += v; state.has_val[g] = true; }
+                                AggFunc::Avg => { state.sum[g] += v; state.count[g] += 1; }
+                                AggFunc::Min => { if !state.has_val[g] || v < state.sum[g] { state.sum[g] = v; state.has_val[g] = true; } }
+                                AggFunc::Max => { if !state.has_val[g] || v > state.sum[g] { state.sum[g] = v; state.has_val[g] = true; } }
                                 _ => {}
                             }
                         }

@@ -1028,19 +1028,21 @@ const NULL_CODE: u32 = u32::MAX;
 /// - Equality against a literal resolves to one code lookup, then integer compares.
 #[derive(Debug, Clone)]
 pub struct Utf8Column {
-    dict:  Vec<String>,
-    codes: Vec<u32>,
+    dict:      Vec<String>,
+    codes:     Vec<u32>,
+    has_nulls: bool,
 }
 
 impl Utf8Column {
     pub fn new(values: Vec<Option<String>>) -> Self {
-        let mut dict:  Vec<String> = Vec::new();
-        let mut codes: Vec<u32>    = Vec::with_capacity(values.len());
-        let mut seen:  std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut dict:      Vec<String> = Vec::new();
+        let mut codes:     Vec<u32>    = Vec::with_capacity(values.len());
+        let mut seen:      std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut has_nulls: bool        = false;
 
         for v in values {
             match v {
-                None => codes.push(NULL_CODE),
+                None => { codes.push(NULL_CODE); has_nulls = true; }
                 Some(s) => {
                     let code = match seen.get(&s) {
                         Some(&c) => c,
@@ -1056,13 +1058,14 @@ impl Utf8Column {
             }
         }
 
-        Self { dict, codes }
+        Self { dict, codes, has_nulls }
     }
 
     /// Build directly from an existing dictionary. The caller guarantees every
     /// code is either `NULL_CODE` or a valid index into `dict`.
     fn from_parts(dict: Vec<String>, codes: Vec<u32>) -> Self {
-        Self { dict, codes }
+        let has_nulls = codes.iter().any(|&c| c == NULL_CODE);
+        Self { dict, codes, has_nulls }
     }
 
     pub fn len(&self) -> usize {
@@ -1102,6 +1105,11 @@ impl Utf8Column {
     #[inline]
     pub fn is_null_code(code: u32) -> bool {
         code == NULL_CODE
+    }
+
+    #[inline]
+    pub fn has_nulls(&self) -> bool {
+        self.has_nulls
     }
 
     /// Find the code for a string, if the dictionary holds it.
@@ -1186,7 +1194,8 @@ impl Utf8Column {
             }));
         }
 
-        Self { dict, codes }
+        let has_nulls = parts.iter().any(|p| p.has_nulls);
+        Self { dict, codes, has_nulls }
     }
 }
 
