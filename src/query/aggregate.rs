@@ -325,12 +325,77 @@ impl GroupByExec {
         let n_aggs = self.aggs.len();
 
         // в”Ђв”Ђ Per-batch aggregation (parallel) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-        let first_b = batches.first().ok_or_else(|| FalconError::InvalidQuery("no batches".into()))?;
-        let gb_col_idx = first_b.schema.column_index(gb_name)?;
+        let first_b      = batches.first().ok_or_else(|| FalconError::InvalidQuery("no batches".into()))?;
+        let gb_col_idx   = first_b.schema.column_index(gb_name)?;
         let agg_col_indices: Vec<Option<usize>> = agg_col_names.iter()
             .map(|&n| n.and_then(|name| first_b.schema.column_index(name).ok()))
             .collect();
 
+        // Determine whether every batch is null-free in the GB column.
+        // O(1) per batch (has_nulls is a stored flag), so negligible for 100-200 batches.
+        let all_no_nulls = batches.iter().all(|b| {
+            b.column(gb_col_idx)
+             .as_utf8_column()
+             .map(|c| !c.has_nulls())
+             .unwrap_or(false)
+        });
+
+        if all_no_nulls {
+            // FAST PATH — all batches are null-free.
+            //
+            // Key insight: dict codes are stable 0-indexed identifiers, so code == gid.
+            // We extract the global key list from the first batch once (O(1) per dict
+            // entry), then each Rayon task returns only its accumulated BatchAggState —
+            // no per-batch String clones, no per-task HashMap.
+            //
+            // For n_groups=5, 122 Rayon batches over 1M rows this eliminates:
+            //   • 610 String heap allocations (replaced by 5 one-time clones)
+            //   • 610 HashMap inserts/lookups in the merge phase
+            //   • 1 HashMap allocation per merge
+            let first_col = first_b.column(gb_col_idx).as_utf8_column()
+                .ok_or_else(|| FalconError::InvalidQuery(format!("Expected Utf8 column '{gb_name}'")))?;
+            let global_keys: Vec<String> = first_col.dict().to_vec();
+            let n_g = global_keys.len();
+
+            let partial_states: FalconResult<Vec<Vec<BatchAggState>>> = batches
+                .par_iter()
+                .map(|batch| {
+                    let gb_dict = batch.column(gb_col_idx).as_utf8_column()
+                        .ok_or_else(|| FalconError::InvalidQuery(
+                            format!("Expected Utf8 column '{gb_name}'")
+                        ))?;
+                    let mut local_states: Vec<BatchAggState> = (0..n_aggs).map(|_| BatchAggState {
+                        count:   vec![0i64;   n_g],
+                        sum:     vec![0.0f64; n_g],
+                        has_val: vec![false;  n_g],
+                    }).collect();
+                    // Codes are 0-indexed dict codes; code == gid for no-null columns.
+                    self.accumulate_batch(gb_dict.codes(), batch, &agg_col_indices, &mut local_states)?;
+                    Ok(local_states)
+                })
+                .collect();
+
+            // Merge: simple indexed array addition — no HashMap, no string comparison.
+            let mut final_states: Vec<BatchAggState> = (0..n_aggs).map(|_| BatchAggState {
+                count:   vec![0i64;   n_g],
+                sum:     vec![0.0f64; n_g],
+                has_val: vec![false;  n_g],
+            }).collect();
+            for local in partial_states? {
+                for (agg_idx, agg) in self.aggs.iter().enumerate() {
+                    for g in 0..n_g {
+                        merge_state_entry(
+                            &agg.func, &local[agg_idx], g,
+                            &mut final_states[agg_idx], g,
+                        );
+                    }
+                }
+            }
+            return self.build_fast_result_utf8(gb_name, global_keys, final_states);
+        }
+
+        // NULLABLE PATH — at least one batch has null GB values.
+        // Use per-batch key tracking and HashMap-based merge to handle the extra null group.
         let partials: FalconResult<Vec<(Vec<String>, Vec<BatchAggState>)>> = batches
             .par_iter()
             .map(|batch| {
@@ -339,66 +404,47 @@ impl GroupByExec {
                     .ok_or_else(|| FalconError::InvalidQuery(
                         format!("Expected Utf8 column '{gb_name}'")
                     ))?;
-
-                // The column is dictionary-encoded, so assign group ids per *distinct
-                // string* вЂ” a handful of times вЂ” instead of hashing a string on every
-                // row. Mapping a row to its group then costs one array index.
                 let dict = gb_dict.dict();
                 let n_g  = dict.len();
-
-                if !gb_dict.has_nulls() {
-                    // No nulls: pre-allocate with exact dict size (no reallocs).
-                    // Dict codes are 0-indexed so code == gid — pass directly.
-                    let local_keys: Vec<String> = dict.to_vec();
-                    let mut local_states: Vec<BatchAggState> = (0..n_aggs).map(|_| BatchAggState {
-                        count:   vec![0i64;   n_g],
-                        sum:     vec![0.0f64; n_g],
-                        has_val: vec![false;  n_g],
-                    }).collect();
-                    self.accumulate_batch(gb_dict.codes(), batch, &agg_col_indices, &mut local_states)?;
-                    Ok((local_keys, local_states))
-                } else {
-                    let mut local_keys: Vec<String> = Vec::with_capacity(n_g + 1);
-                    let mut local_states: Vec<BatchAggState> =
-                        (0..n_aggs).map(|_| BatchAggState::new()).collect();
-                    let mut code_to_gid: Vec<u32> = Vec::with_capacity(n_g);
-                    for s in dict {
-                        code_to_gid.push(local_keys.len() as u32);
-                        local_keys.push(s.clone());
-                        for st in &mut local_states { st.push_group(); }
-                    }
-                    let mut null_gid: Option<u32> = None;
-                    let mut batch_gids: Vec<u32> = Vec::with_capacity(gb_dict.len());
-                    for &code in gb_dict.codes() {
-                        let gid = if crate::storage::column::Utf8Column::is_null_code(code) {
-                            match null_gid {
-                                Some(g) => g,
-                                None => {
-                                    let g = match local_keys.iter().position(|k| k.is_empty()) {
-                                        Some(i) => i as u32,
-                                        None => {
-                                            let id = local_keys.len() as u32;
-                                            local_keys.push(String::new());
-                                            for st in &mut local_states { st.push_group(); }
-                                            id
-                                        }
-                                    };
-                                    null_gid = Some(g);
-                                    g
-                                }
-                            }
-                        } else {
-                            code_to_gid[code as usize]
-                        };
-                        batch_gids.push(gid);
-                    }
-                    self.accumulate_batch(&batch_gids, batch, &agg_col_indices, &mut local_states)?;
-                    Ok((local_keys, local_states))
+                let mut local_keys: Vec<String> = Vec::with_capacity(n_g + 1);
+                let mut local_states: Vec<BatchAggState> =
+                    (0..n_aggs).map(|_| BatchAggState::new()).collect();
+                let mut code_to_gid: Vec<u32> = Vec::with_capacity(n_g);
+                for s in dict {
+                    code_to_gid.push(local_keys.len() as u32);
+                    local_keys.push(s.clone());
+                    for st in &mut local_states { st.push_group(); }
                 }
+                let mut null_gid: Option<u32> = None;
+                let mut batch_gids: Vec<u32> = Vec::with_capacity(gb_dict.len());
+                for &code in gb_dict.codes() {
+                    let gid = if crate::storage::column::Utf8Column::is_null_code(code) {
+                        match null_gid {
+                            Some(g) => g,
+                            None => {
+                                let g = match local_keys.iter().position(|k| k.is_empty()) {
+                                    Some(i) => i as u32,
+                                    None => {
+                                        let id = local_keys.len() as u32;
+                                        local_keys.push(String::new());
+                                        for st in &mut local_states { st.push_group(); }
+                                        id
+                                    }
+                                };
+                                null_gid = Some(g);
+                                g
+                            }
+                        }
+                    } else {
+                        code_to_gid[code as usize]
+                    };
+                    batch_gids.push(gid);
+                }
+                self.accumulate_batch(&batch_gids, batch, &agg_col_indices, &mut local_states)?;
+                Ok((local_keys, local_states))
             })
             .collect();
 
-        // в”Ђв”Ђ Merge partial results (sequential, usually fast vs. accumulation) в”Ђ
         let mut final_keys:   Vec<String>          = Vec::new();
         let mut final_map:    FastMap<String, u32> = FastMap::default();
         let mut final_states: Vec<BatchAggState>   = (0..n_aggs).map(|_| BatchAggState::new()).collect();
@@ -714,195 +760,6 @@ impl GroupByExec {
                                         state.sum[g] = v; state.has_val[g] = true;
                                     }
                                 }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Like `accumulate_batch`, but uses raw Utf8 dict `codes` + `code_to_gid`
-    /// mapping instead of a pre-materialised `batch_gids` slice.
-    ///
-    /// This eliminates the separate gid-building pass in `fast_utf8_gb` for
-    /// no-null GB columns: one pass over codes drives all agg scatter loops
-    /// instead of the previous four (build gids + 3 agg loops over gids).
-    fn accumulate_batch_from_codes(
-        &self,
-        codes:           &[u32],
-        code_to_gid:     &[u32],
-        batch:           &RecordBatch,
-        agg_col_indices: &[Option<usize>],
-        states:          &mut [BatchAggState],
-    ) -> FalconResult<()> {
-        for (agg_idx, (agg, &maybe_idx)) in self.aggs.iter().zip(agg_col_indices.iter()).enumerate() {
-            let state = &mut states[agg_idx];
-
-            if maybe_idx.is_none() {
-                for &code in codes {
-                    state.count[code_to_gid[code as usize] as usize] += 1;
-                }
-                continue;
-            }
-
-            let col = batch.column(maybe_idx.unwrap());
-
-            match (&agg.func, col) {
-                (AggFunc::Count, Column::Float64(c)) => {
-                    if !c.has_nulls() {
-                        for &code in codes { state.count[code_to_gid[code as usize] as usize] += 1; }
-                    } else {
-                        for (row, &code) in codes.iter().enumerate() {
-                            if c.is_valid(row) { state.count[code_to_gid[code as usize] as usize] += 1; }
-                        }
-                    }
-                }
-                (AggFunc::Count, Column::Int64(c)) => {
-                    if !c.has_nulls() {
-                        for &code in codes { state.count[code_to_gid[code as usize] as usize] += 1; }
-                    } else {
-                        for (row, &code) in codes.iter().enumerate() {
-                            if c.is_valid(row) { state.count[code_to_gid[code as usize] as usize] += 1; }
-                        }
-                    }
-                }
-                (AggFunc::Count, Column::Int32(c)) => {
-                    for (row, &code) in codes.iter().enumerate() {
-                        if c.is_valid(row) { state.count[code_to_gid[code as usize] as usize] += 1; }
-                    }
-                }
-                (AggFunc::Count, Column::Utf8(c)) => {
-                    for (row, &code) in codes.iter().enumerate() {
-                        if c.get_str(row).is_some() { state.count[code_to_gid[code as usize] as usize] += 1; }
-                    }
-                }
-                (AggFunc::Sum, Column::Float64(c)) => {
-                    if !c.has_nulls() {
-                        for (&code, &v) in codes.iter().zip(c.dense().iter()) {
-                            let g = code_to_gid[code as usize] as usize;
-                            state.sum[g] += v; state.has_val[g] = true;
-                        }
-                    } else {
-                        for (row, &code) in codes.iter().enumerate() {
-                            if let Some(v) = c.get(row) {
-                                let g = code_to_gid[code as usize] as usize;
-                                state.sum[g] += v; state.has_val[g] = true;
-                            }
-                        }
-                    }
-                }
-                (AggFunc::Sum, Column::Int64(c)) => {
-                    if !c.has_nulls() {
-                        for (&code, &v) in codes.iter().zip(c.dense().iter()) {
-                            let g = code_to_gid[code as usize] as usize;
-                            state.sum[g] += v as f64; state.has_val[g] = true;
-                        }
-                    } else {
-                        for (row, &code) in codes.iter().enumerate() {
-                            if let Some(v) = c.get(row) {
-                                let g = code_to_gid[code as usize] as usize;
-                                state.sum[g] += v as f64; state.has_val[g] = true;
-                            }
-                        }
-                    }
-                }
-                (AggFunc::Sum, Column::Int32(c)) => {
-                    for (row, &code) in codes.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
-                            let g = code_to_gid[code as usize] as usize;
-                            state.sum[g] += v as f64; state.has_val[g] = true;
-                        }
-                    }
-                }
-                (AggFunc::Avg, Column::Float64(c)) => {
-                    if !c.has_nulls() {
-                        for (&code, &v) in codes.iter().zip(c.dense().iter()) {
-                            let g = code_to_gid[code as usize] as usize;
-                            state.sum[g] += v; state.count[g] += 1;
-                        }
-                    } else {
-                        for (row, &code) in codes.iter().enumerate() {
-                            if let Some(v) = c.get(row) {
-                                let g = code_to_gid[code as usize] as usize;
-                                state.sum[g] += v; state.count[g] += 1;
-                            }
-                        }
-                    }
-                }
-                (AggFunc::Avg, Column::Int64(c)) => {
-                    if !c.has_nulls() {
-                        for (&code, &v) in codes.iter().zip(c.dense().iter()) {
-                            let g = code_to_gid[code as usize] as usize;
-                            state.sum[g] += v as f64; state.count[g] += 1;
-                        }
-                    } else {
-                        for (row, &code) in codes.iter().enumerate() {
-                            if let Some(v) = c.get(row) {
-                                let g = code_to_gid[code as usize] as usize;
-                                state.sum[g] += v as f64; state.count[g] += 1;
-                            }
-                        }
-                    }
-                }
-                (AggFunc::Avg, Column::Int32(c)) => {
-                    for (row, &code) in codes.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
-                            let g = code_to_gid[code as usize] as usize;
-                            state.sum[g] += v as f64; state.count[g] += 1;
-                        }
-                    }
-                }
-                (AggFunc::Min, Column::Float64(c)) => {
-                    for (row, &code) in codes.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
-                            let g = code_to_gid[code as usize] as usize;
-                            if !state.has_val[g] || v < state.sum[g] { state.sum[g] = v; state.has_val[g] = true; }
-                        }
-                    }
-                }
-                (AggFunc::Min, Column::Int64(c)) => {
-                    for (row, &code) in codes.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
-                            let g = code_to_gid[code as usize] as usize;
-                            let vf = v as f64;
-                            if !state.has_val[g] || vf < state.sum[g] { state.sum[g] = vf; state.has_val[g] = true; }
-                        }
-                    }
-                }
-                (AggFunc::Max, Column::Float64(c)) => {
-                    for (row, &code) in codes.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
-                            let g = code_to_gid[code as usize] as usize;
-                            if !state.has_val[g] || v > state.sum[g] { state.sum[g] = v; state.has_val[g] = true; }
-                        }
-                    }
-                }
-                (AggFunc::Max, Column::Int64(c)) => {
-                    for (row, &code) in codes.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
-                            let g = code_to_gid[code as usize] as usize;
-                            let vf = v as f64;
-                            if !state.has_val[g] || vf > state.sum[g] { state.sum[g] = vf; state.has_val[g] = true; }
-                        }
-                    }
-                }
-                _ => {
-                    let vals = col.as_float64_values().ok_or_else(|| {
-                        FalconError::InvalidQuery(format!(
-                            "Cannot aggregate '{}' as float", agg.alias
-                        ))
-                    })?;
-                    for (row, &code) in codes.iter().enumerate() {
-                        if let Some(v) = vals[row] {
-                            let g = code_to_gid[code as usize] as usize;
-                            match &agg.func {
-                                AggFunc::Sum => { state.sum[g] += v; state.has_val[g] = true; }
-                                AggFunc::Avg => { state.sum[g] += v; state.count[g] += 1; }
-                                AggFunc::Min => { if !state.has_val[g] || v < state.sum[g] { state.sum[g] = v; state.has_val[g] = true; } }
-                                AggFunc::Max => { if !state.has_val[g] || v > state.sum[g] { state.sum[g] = v; state.has_val[g] = true; } }
                                 _ => {}
                             }
                         }

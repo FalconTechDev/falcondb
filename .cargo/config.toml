@@ -1,2 +1,5 @@
 [env]
 DUCKDB_LIB_DIR = { value = "lib/duckdb", relative = true }
+
+[build]
+rustflags = ["-C", "target-cpu=native"]

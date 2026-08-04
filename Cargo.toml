@@ -53,9 +53,7 @@ name    = "query_bench"
 harness = false
 
 [profile.bench]
-opt-level = 3
-# Debug info is deliberately off. It does not affect codegen or the measured
-# timings, but combined with the inherited `lto = "fat"` and
-# `codegen-units = 1` it pushed the final link past 45 minutes and 29 GB of
-# RAM. Turn it back on only when a profiler needs symbols.
-debug     = false
+opt-level     = 3
+lto           = "thin"
+codegen-units = 4
+debug         = false
