@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 
 use super::hash::FastMap;
 
@@ -325,10 +325,16 @@ impl GroupByExec {
         let n_aggs = self.aggs.len();
 
         // в”Ђв”Ђ Per-batch aggregation (parallel) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+        let first_b = batches.first().ok_or_else(|| FalconError::InvalidQuery("no batches".into()))?;
+        let gb_col_idx = first_b.schema.column_index(gb_name)?;
+        let agg_col_indices: Vec<Option<usize>> = agg_col_names.iter()
+            .map(|&n| n.and_then(|name| first_b.schema.column_index(name).ok()))
+            .collect();
+
         let partials: FalconResult<Vec<(Vec<String>, Vec<BatchAggState>)>> = batches
             .par_iter()
             .map(|batch| {
-                let gb_col = batch.column_by_name(gb_name)?;
+                let gb_col = batch.column(gb_col_idx);
                 let gb_dict = gb_col.as_utf8_column()
                     .ok_or_else(|| FalconError::InvalidQuery(
                         format!("Expected Utf8 column '{gb_name}'")
@@ -381,7 +387,7 @@ impl GroupByExec {
                     batch_gids.push(gid);
                 }
 
-                self.accumulate_batch(&batch_gids, batch, agg_col_names, &mut local_states)?;
+                self.accumulate_batch(&batch_gids, batch, &agg_col_indices, &mut local_states)?;
                 Ok((local_keys, local_states))
             })
             .collect();
@@ -423,11 +429,17 @@ impl GroupByExec {
         let n_aggs = self.aggs.len();
 
         // в”Ђв”Ђ Per-batch aggregation (parallel) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+        let first_i = batches.first().ok_or_else(|| FalconError::InvalidQuery("no batches".into()))?;
+        let gb_col_idx_i = first_i.schema.column_index(gb_name)?;
+        let agg_col_indices_i: Vec<Option<usize>> = agg_col_names.iter()
+            .map(|&n| n.and_then(|name| first_i.schema.column_index(name).ok()))
+            .collect();
+
         let partials: FalconResult<Vec<(Vec<i64>, Vec<BatchAggState>)>> = batches
             .par_iter()
             .map(|batch| {
                 let n_rows = batch.row_count();
-                let gb_col = batch.column_by_name(gb_name)?;
+                let gb_col = batch.column(gb_col_idx_i);
                 let gb_i64 = gb_col.as_int64_values()
                     .ok_or_else(|| FalconError::InvalidQuery(
                         format!("Expected Int64 column '{gb_name}'")
@@ -452,7 +464,7 @@ impl GroupByExec {
                     batch_gids.push(gid);
                 }
 
-                self.accumulate_batch(&batch_gids, batch, agg_col_names, &mut local_states)?;
+                self.accumulate_batch(&batch_gids, batch, &agg_col_indices_i, &mut local_states)?;
                 Ok((local_keys, local_states))
             })
             .collect();
@@ -484,39 +496,46 @@ impl GroupByExec {
     }
 
     /// The hot inner loop: typed, branch-free per agg type.
-    /// `agg_col_names[i] = None` means COUNT(*) вЂ” count every row without reading a column.
+    /// `agg_col_indices[i] = None` means COUNT(*) вЂ” count every row without reading a column.
     fn accumulate_batch(
         &self,
-        batch_gids:    &[u32],
-        batch:         &RecordBatch,
-        agg_col_names: &[Option<&str>],
-        states:        &mut [BatchAggState],
+        batch_gids:      &[u32],
+        batch:           &RecordBatch,
+        agg_col_indices: &[Option<usize>],
+        states:          &mut [BatchAggState],
     ) -> FalconResult<()> {
-        for (agg_idx, (agg, &maybe_name)) in self.aggs.iter().zip(agg_col_names.iter()).enumerate() {
+        for (agg_idx, (agg, &maybe_idx)) in self.aggs.iter().zip(agg_col_indices.iter()).enumerate() {
             let state = &mut states[agg_idx];
 
             // COUNT(*): count every row without touching a column.
-            if maybe_name.is_none() {
+            if maybe_idx.is_none() {
                 for &gid in batch_gids {
                     state.count[gid as usize] += 1;
                 }
                 continue;
             }
 
-            let agg_name = maybe_name.unwrap();
-            let col   = batch.column_by_name(agg_name)?;
+            let col = batch.column(maybe_idx.unwrap());
 
             // Dispatch once per batch (not per row) on (func, column type).
             match (&agg.func, col) {
                 // в”Ђв”Ђ COUNT в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
                 (AggFunc::Count, Column::Float64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if c.is_valid(row) { state.count[gid as usize] += 1; }
+                    if !c.has_nulls() {
+                        for &gid in batch_gids { state.count[gid as usize] += 1; }
+                    } else {
+                        for (row, &gid) in batch_gids.iter().enumerate() {
+                            if c.is_valid(row) { state.count[gid as usize] += 1; }
+                        }
                     }
                 }
                 (AggFunc::Count, Column::Int64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if c.is_valid(row) { state.count[gid as usize] += 1; }
+                    if !c.has_nulls() {
+                        for &gid in batch_gids { state.count[gid as usize] += 1; }
+                    } else {
+                        for (row, &gid) in batch_gids.iter().enumerate() {
+                            if c.is_valid(row) { state.count[gid as usize] += 1; }
+                        }
                     }
                 }
                 (AggFunc::Count, Column::Int32(c)) => {
@@ -532,20 +551,36 @@ impl GroupByExec {
 
                 // в”Ђв”Ђ SUM в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
                 (AggFunc::Sum, Column::Float64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    if !c.has_nulls() {
+                        for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
                             let g = gid as usize;
                             state.sum[g] += v;
                             state.has_val[g] = true;
                         }
+                    } else {
+                        for (row, &gid) in batch_gids.iter().enumerate() {
+                            if let Some(v) = c.get(row) {
+                                let g = gid as usize;
+                                state.sum[g] += v;
+                                state.has_val[g] = true;
+                            }
+                        }
                     }
                 }
                 (AggFunc::Sum, Column::Int64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    if !c.has_nulls() {
+                        for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
                             let g = gid as usize;
                             state.sum[g] += v as f64;
                             state.has_val[g] = true;
+                        }
+                    } else {
+                        for (row, &gid) in batch_gids.iter().enumerate() {
+                            if let Some(v) = c.get(row) {
+                                let g = gid as usize;
+                                state.sum[g] += v as f64;
+                                state.has_val[g] = true;
+                            }
                         }
                     }
                 }
@@ -561,20 +596,36 @@ impl GroupByExec {
 
                 // в”Ђв”Ђ AVG в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
                 (AggFunc::Avg, Column::Float64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    if !c.has_nulls() {
+                        for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
                             let g = gid as usize;
                             state.sum[g]   += v;
                             state.count[g] += 1;
                         }
+                    } else {
+                        for (row, &gid) in batch_gids.iter().enumerate() {
+                            if let Some(v) = c.get(row) {
+                                let g = gid as usize;
+                                state.sum[g]   += v;
+                                state.count[g] += 1;
+                            }
+                        }
                     }
                 }
                 (AggFunc::Avg, Column::Int64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    if !c.has_nulls() {
+                        for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
                             let g = gid as usize;
                             state.sum[g]   += v as f64;
                             state.count[g] += 1;
+                        }
+                    } else {
+                        for (row, &gid) in batch_gids.iter().enumerate() {
+                            if let Some(v) = c.get(row) {
+                                let g = gid as usize;
+                                state.sum[g]   += v as f64;
+                                state.count[g] += 1;
+                            }
                         }
                     }
                 }
@@ -638,7 +689,7 @@ impl GroupByExec {
                 _ => {
                     let vals = col.as_float64_values().ok_or_else(|| {
                         FalconError::InvalidQuery(format!(
-                            "Cannot aggregate '{}' as float", agg_name
+                            "Cannot aggregate '{}' as float", agg.alias
                         ))
                     })?;
                     for (row, &gid) in batch_gids.iter().enumerate() {
@@ -894,34 +945,39 @@ pub fn execute_agg_only(
         return RecordBatch::new(Schema::new(fields), columns);
     }
 
+    // Pre-resolve column indices once per query (column_by_name is a linear scan).
+    let schema = batches.first()
+        .ok_or_else(|| FalconError::InvalidQuery("no batches".into()))?
+        .schema.clone();
+    let col_indices: Vec<Option<usize>> = aggs.iter().map(|agg| {
+        if is_count_star(agg) { return None; }
+        if let Expr::Column(name) = &agg.input {
+            schema.column_index(name).ok()
+        } else { None }
+    }).collect();
+
     // Accumulate each batch independently, then merge. Aggregates are associative
     // over disjoint row ranges, so this is safe and lets every core work.
-    //
-    // The previous version was serial and built a `Vec<ScalarValue>` — 48 bytes a
-    // row — for every batch before touching a single value. On a million rows that
-    // was 40x slower than DuckDB at the same query.
     let accumulators = batches
         .par_iter()
         .try_fold(
             || aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
             |mut accs, batch| -> FalconResult<Vec<Accumulator>> {
-                for (acc, agg) in accs.iter_mut().zip(aggs.iter()) {
-                    // COUNT(*): count rows without reading a column at all.
+                for ((acc, agg), &maybe_idx) in
+                    accs.iter_mut().zip(aggs.iter()).zip(col_indices.iter())
+                {
                     if is_count_star(agg) {
                         if let Accumulator::Count { n } = acc {
                             *n += batch.row_count() as i64;
                         }
                         continue;
                     }
-                    // Typed path: read the column's raw slice, no ScalarValue.
-                    if let Expr::Column(name) = &agg.input {
-                        if let Ok(col) = batch.column_by_name(name) {
-                            if accumulate_typed(acc, col) {
-                                continue;
-                            }
+                    if let Some(idx) = maybe_idx {
+                        let col = batch.column(idx);
+                        if accumulate_typed(acc, col) {
+                            continue;
                         }
                     }
-                    // Anything computed still goes through the general path.
                     let vals = agg.input.eval_batch(batch)?;
                     for val in &vals {
                         acc.update(val);
@@ -1008,6 +1064,34 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             true
         }
         Accumulator::Sum { total, valid } => {
+            // Fast paths for no-null columns: a single reduction without branches.
+            if let C::Float64(c) = col {
+                if !c.has_nulls() {
+                    if !c.dense().is_empty() {
+                        *total += c.dense().iter().copied().sum::<f64>();
+                        *valid = true;
+                    }
+                    return true;
+                }
+            }
+            if let C::Int64(c) = col {
+                if !c.has_nulls() {
+                    if !c.dense().is_empty() {
+                        *total += c.dense().iter().map(|&v| v as f64).sum::<f64>();
+                        *valid = true;
+                    }
+                    return true;
+                }
+            }
+            if let C::Int32(c) = col {
+                if !c.has_nulls() {
+                    if !c.dense().is_empty() {
+                        *total += c.dense().iter().map(|&v| v as f64).sum::<f64>();
+                        *valid = true;
+                    }
+                    return true;
+                }
+            }
             let mut t = 0.0f64;
             let mut any = false;
             over_primitives!(v, {
@@ -1019,6 +1103,14 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             true
         }
         Accumulator::Avg { total, count } => {
+            if let C::Float64(c) = col {
+                if !c.has_nulls() {
+                    let dense = c.dense();
+                    *total += dense.iter().copied().sum::<f64>();
+                    *count += dense.len() as i64;
+                    return true;
+                }
+            }
             let mut t = 0.0f64;
             let mut n = 0i64;
             over_primitives!(v, {
@@ -1030,6 +1122,14 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             true
         }
         Accumulator::Min { value, .. } => {
+            if let C::Float64(c) = col {
+                if !c.has_nulls() {
+                    if let Some(chunk_min) = c.dense().iter().copied().reduce(f64::min) {
+                        *value = Some(value.map_or(chunk_min, |v: f64| v.min(chunk_min)));
+                    }
+                    return true;
+                }
+            }
             let mut cur = f64::INFINITY;
             let mut any = false;
             over_primitives!(v, {
@@ -1042,6 +1142,14 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             true
         }
         Accumulator::Max { value, .. } => {
+            if let C::Float64(c) = col {
+                if !c.has_nulls() {
+                    if let Some(chunk_max) = c.dense().iter().copied().reduce(f64::max) {
+                        *value = Some(value.map_or(chunk_max, |v: f64| v.max(chunk_max)));
+                    }
+                    return true;
+                }
+            }
             let mut cur = f64::NEG_INFINITY;
             let mut any = false;
             over_primitives!(v, {
