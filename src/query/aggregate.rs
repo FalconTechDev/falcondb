@@ -568,7 +568,40 @@ impl GroupByExec {
         agg_col_indices: &[Option<usize>],
         states:          &mut [BatchAggState],
     ) -> FalconResult<()> {
+        let n_aggs = self.aggs.len();
+
+        // Fuse SUM + AVG pairs on the same no-null Float64 column into a single pass,
+        // eliminating a redundant scan of the value column and its loop overhead.
+        // Bitmask: zero alloc, supports up to 64 agg expressions (typical n <= 8).
+        let mut fused: u64 = 0;
+        for i in 0..n_aggs.min(64) {
+            if fused & (1u64 << i) != 0 { continue; }
+            let Some(col_i) = agg_col_indices[i] else { continue };
+            if !matches!(self.aggs[i].func, AggFunc::Sum) { continue; }
+            let Column::Float64(c) = batch.column(col_i) else { continue };
+            if c.has_nulls() { continue; }
+            for j in (i + 1)..n_aggs.min(64) {
+                if fused & (1u64 << j) != 0 { continue; }
+                if !matches!(self.aggs[j].func, AggFunc::Avg) { continue; }
+                if agg_col_indices[j] != Some(col_i) { continue; }
+                // i < j by construction; split_at_mut(j) gives left[..j] and right[j..].
+                let (left, right) = states.split_at_mut(j);
+                let sum_st = &mut left[i];
+                let avg_st = &mut right[0];  // right[0] == states[j]
+                for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
+                    let g = gid as usize;
+                    sum_st.sum[g]    += v;
+                    sum_st.has_val[g] = true;
+                    avg_st.sum[g]    += v;
+                    avg_st.count[g]  += 1;
+                }
+                fused |= (1u64 << i) | (1u64 << j);
+                break;
+            }
+        }
+
         for (agg_idx, (agg, &maybe_idx)) in self.aggs.iter().zip(agg_col_indices.iter()).enumerate() {
+            if agg_idx < 64 && fused & (1u64 << agg_idx) != 0 { continue; }
             let state = &mut states[agg_idx];
 
             // COUNT(*): count every row without touching a column.
