@@ -25,12 +25,22 @@ pub trait Index: Send + Sync {
 // ─── Shared key type ─────────────────────────────────────────────────────────
 
 /// Normalized, orderable key derived from a ScalarValue.
-/// We store i64 bits for integers, f64 bits for floats (IEEE order), raw string for Utf8.
+///
+/// All numeric types (integer, float, date, timestamp, decimal) map to the
+/// same `Num` variant via their f64 representation. This is the only safe
+/// choice: a SQL literal is typed by the parser independently of the column
+/// type, so `WHERE score = 5` on a DOUBLE column produces an Int64 probe key.
+/// If integers and floats lived in separate enum variants the probe would be
+/// a different key than every entry in the tree and the lookup would silently
+/// return zero rows.
+///
+/// f64 has 53 bits of mantissa, so integers up to 2^53 round-trip exactly.
+/// Larger i64 values lose precision; those columns should not be indexed on
+/// equality in SQL that uses floating-point literals anyway.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum IndexKey {
     Null,
-    Int(i64),
-    Float(u64),  // f64 bits — ordered by IEEE 754 bit pattern after sign fix
+    Num(u64),   // all numeric types — f64 bit-pattern ordered by f64_to_ord_bits
     Str(String),
     Bool(u8),
 }
@@ -42,21 +52,21 @@ impl IndexKey {
             ScalarValue::Boolean(None)      => Self::Null,
             ScalarValue::Boolean(Some(b))   => Self::Bool(*b as u8),
             ScalarValue::Int32(None)        => Self::Null,
-            ScalarValue::Int32(Some(n))     => Self::Int(*n as i64),
+            ScalarValue::Int32(Some(n))     => Self::Num(f64_to_ord_bits(*n as f64)),
             ScalarValue::Int64(None)        => Self::Null,
-            ScalarValue::Int64(Some(n))     => Self::Int(*n),
+            ScalarValue::Int64(Some(n))     => Self::Num(f64_to_ord_bits(*n as f64)),
             ScalarValue::Float32(None)      => Self::Null,
-            ScalarValue::Float32(Some(f))   => Self::Float(f64_to_ord_bits(*f as f64)),
+            ScalarValue::Float32(Some(f))   => Self::Num(f64_to_ord_bits(*f as f64)),
             ScalarValue::Float64(None)      => Self::Null,
-            ScalarValue::Float64(Some(f))   => Self::Float(f64_to_ord_bits(*f)),
+            ScalarValue::Float64(Some(f))   => Self::Num(f64_to_ord_bits(*f)),
             ScalarValue::Utf8(None)              => Self::Null,
             ScalarValue::Utf8(Some(s))           => Self::Str(s.clone()),
             ScalarValue::Date32(None)            => Self::Null,
-            ScalarValue::Date32(Some(d))         => Self::Int(*d as i64),
+            ScalarValue::Date32(Some(d))         => Self::Num(f64_to_ord_bits(*d as f64)),
             ScalarValue::Timestamp(None)         => Self::Null,
-            ScalarValue::Timestamp(Some(ts))     => Self::Int(*ts),
-            ScalarValue::Decimal128(d) if d.value.is_none()  => Self::Null,
-            ScalarValue::Decimal128(d) => Self::Float(f64_to_ord_bits(
+            ScalarValue::Timestamp(Some(ts))     => Self::Num(f64_to_ord_bits(*ts as f64)),
+            ScalarValue::Decimal128(d) if d.value.is_none() => Self::Null,
+            ScalarValue::Decimal128(d) => Self::Num(f64_to_ord_bits(
                 d.value.unwrap_or(0) as f64 / 10f64.powi(d.scale as i32),
             )),
         }

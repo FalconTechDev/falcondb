@@ -48,7 +48,7 @@ impl ChunkedScanner {
             if batch.row_count() <= self.chunk_rows {
                 out.extend(filter_batch(batch, &query)?);
             } else {
-                for chunk in split_batch(batch, self.chunk_rows) {
+                for chunk in split_batch(batch, self.chunk_rows)? {
                     out.extend(filter_batch(&chunk, &query)?);
                 }
             }
@@ -66,19 +66,25 @@ impl ChunkedScanner {
         let exec = GroupByExec::new(keys.clone(), aggs.clone());
 
         // Phase 1: one partial aggregate per batch (parallel).
+        // Using try_fold/try_reduce so any chunk error propagates instead of
+        // silently dropping the chunk and undercounting.
         let partials: Vec<RecordBatch> = table.batches
             .par_iter()
-            .flat_map(|batch| {
-                let chunks = if batch.row_count() <= self.chunk_rows {
-                    vec![batch.clone()]
-                } else {
-                    split_batch(batch, self.chunk_rows)
-                };
-                chunks.into_par_iter()
-                    .filter_map(|c| exec.execute(std::slice::from_ref(&c)).ok())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+            .try_fold(
+                Vec::new,
+                |mut acc, batch| -> FalconResult<Vec<RecordBatch>> {
+                    let chunks = if batch.row_count() <= self.chunk_rows {
+                        vec![batch.clone()]
+                    } else {
+                        split_batch(batch, self.chunk_rows)?
+                    };
+                    for c in chunks {
+                        acc.push(exec.execute(std::slice::from_ref(&c))?);
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(Vec::new, |mut a, b| { a.extend(b); Ok(a) })?;
 
         if partials.is_empty() {
             return Err(FalconError::InvalidQuery("empty table".into()));
@@ -96,19 +102,17 @@ fn filter_batch(batch: &RecordBatch, query: &SelectQuery) -> FalconResult<Vec<Re
 }
 
 /// Split a RecordBatch into chunks of at most `chunk_rows` rows.
-pub fn split_batch(batch: &RecordBatch, chunk_rows: usize) -> Vec<RecordBatch> {
+pub fn split_batch(batch: &RecordBatch, chunk_rows: usize) -> FalconResult<Vec<RecordBatch>> {
     let n = batch.row_count();
-    if n == 0 { return vec![]; }
+    if n == 0 { return Ok(vec![]); }
     let mut out = Vec::with_capacity((n + chunk_rows - 1) / chunk_rows);
     let mut start = 0;
     while start < n {
         let end = (start + chunk_rows).min(n);
-        if let Ok(sliced) = batch.slice(start, end - start) {
-            out.push(sliced);
-        }
+        out.push(batch.slice(start, end - start)?);
         start = end;
     }
-    out
+    Ok(out)
 }
 
 // ─── ParquetStream ───────────────────────────────────────────────────────────
@@ -182,10 +186,12 @@ impl StreamingAgg {
         let batches = read_parquet(&self.stream.path, &self.stream.table_name)?;
 
         // Phase 1: partial aggregation per row group (parallel).
+        // collect into Result so any per-batch error propagates instead of
+        // silently dropping the batch and undercounting.
         let partials: Vec<RecordBatch> = batches
             .par_iter()
-            .filter_map(|b| exec.execute(std::slice::from_ref(b)).ok())
-            .collect();
+            .map(|b| exec.execute(std::slice::from_ref(b)))
+            .collect::<FalconResult<Vec<_>>>()?;
 
         if partials.is_empty() {
             return Err(FalconError::InvalidQuery("empty file".into()));
@@ -247,7 +253,7 @@ mod tests {
     #[test]
     fn split_batch_correctness() {
         let table  = make_table(500);
-        let chunks = split_batch(&table.batches[0], 128);
+        let chunks = split_batch(&table.batches[0], 128).unwrap();
         assert_eq!(chunks.len(), 4); // 128+128+128+116
         let total: usize = chunks.iter().map(|b| b.row_count()).sum();
         assert_eq!(total, 500);
