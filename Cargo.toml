@@ -30,6 +30,7 @@ tokio              = { version = "1", features = ["full"] }
 arrow              = { version = "53", features = ["ipc"] }
 parquet            = { version = "53", features = ["arrow"] }
 wide               = "0.7"
+smallvec           = { version = "1", features = ["union"] }
 
 actix-web  = "4"
 

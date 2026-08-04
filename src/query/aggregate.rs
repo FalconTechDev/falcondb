@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use smallvec::SmallVec;
 use super::hash::FastMap;
 
 use rayon::prelude::*;
@@ -203,18 +204,33 @@ impl Accumulator {
 
 // в”Ђв”Ђв”Ђ Fast-path batch state (parallel arrays, no boxing) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
+// Inline capacity: most analytical GROUP BY queries have ≤ 16 groups per batch.
+// With SmallVec, states for n_groups ≤ 16 live on the stack — zero heap allocs
+// in the hot Rayon loop.
+const AGG_INLINE: usize = 16;
+
 /// Per-aggregate typed accumulator arrays, indexed by group_id.
-/// All three fields are valid for all agg types вЂ” unused ones are zero-sized
-/// conceptually but kept uniform to avoid conditional field access in hot loops.
 struct BatchAggState {
-    count:   Vec<i64>,   // COUNT / AVG denominator
-    sum:     Vec<f64>,   // SUM / AVG numerator / MIN value / MAX value
-    has_val: Vec<bool>,  // SUM validity / MIN-MAX "first seen"
+    count:   SmallVec<[i64;  AGG_INLINE]>,
+    sum:     SmallVec<[f64;  AGG_INLINE]>,
+    has_val: SmallVec<[bool; AGG_INLINE]>,
 }
 
 impl BatchAggState {
     fn new() -> Self {
-        Self { count: Vec::new(), sum: Vec::new(), has_val: Vec::new() }
+        Self {
+            count:   SmallVec::new(),
+            sum:     SmallVec::new(),
+            has_val: SmallVec::new(),
+        }
+    }
+
+    fn with_capacity(n: usize) -> Self {
+        let mut s = Self::new();
+        s.count.resize(n, 0);
+        s.sum.resize(n, 0.0);
+        s.has_val.resize(n, false);
+        s
     }
 
     fn push_group(&mut self) {
@@ -364,11 +380,9 @@ impl GroupByExec {
                         .ok_or_else(|| FalconError::InvalidQuery(
                             format!("Expected Utf8 column '{gb_name}'")
                         ))?;
-                    let mut local_states: Vec<BatchAggState> = (0..n_aggs).map(|_| BatchAggState {
-                        count:   vec![0i64;   n_g],
-                        sum:     vec![0.0f64; n_g],
-                        has_val: vec![false;  n_g],
-                    }).collect();
+                    let mut local_states: Vec<BatchAggState> = (0..n_aggs)
+                        .map(|_| BatchAggState::with_capacity(n_g))
+                        .collect();
                     // Codes are 0-indexed dict codes; code == gid for no-null columns.
                     self.accumulate_batch(gb_dict.codes(), batch, &agg_col_indices, &mut local_states)?;
                     Ok(local_states)
@@ -376,11 +390,9 @@ impl GroupByExec {
                 .collect();
 
             // Merge: simple indexed array addition — no HashMap, no string comparison.
-            let mut final_states: Vec<BatchAggState> = (0..n_aggs).map(|_| BatchAggState {
-                count:   vec![0i64;   n_g],
-                sum:     vec![0.0f64; n_g],
-                has_val: vec![false;  n_g],
-            }).collect();
+            let mut final_states: Vec<BatchAggState> = (0..n_aggs)
+                .map(|_| BatchAggState::with_capacity(n_g))
+                .collect();
             for local in partial_states? {
                 for (agg_idx, agg) in self.aggs.iter().enumerate() {
                     for g in 0..n_g {
