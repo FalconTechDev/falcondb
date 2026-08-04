@@ -344,30 +344,29 @@ impl GroupByExec {
                 // string* вЂ” a handful of times вЂ” instead of hashing a string on every
                 // row. Mapping a row to its group then costs one array index.
                 let dict = gb_dict.dict();
-                let mut local_keys: Vec<String> = Vec::with_capacity(dict.len() + 1);
-                let mut local_states: Vec<BatchAggState> =
-                    (0..n_aggs).map(|_| BatchAggState::new()).collect();
+                let n_g  = dict.len();
 
-                // code в†’ group id. One extra slot maps NULL onto the empty-string
-                // group, matching the previous behaviour.
-                let mut code_to_gid: Vec<u32> = Vec::with_capacity(dict.len());
-                for s in dict {
-                    code_to_gid.push(local_keys.len() as u32);
-                    local_keys.push(s.clone());
-                    for st in &mut local_states { st.push_group(); }
-                }
-
-                // NULL groups with the empty string, as the row-wise path did. The
-                // group is created only on first sight вЂ” allocating it up front
-                // would report an extra, empty group for null-free data.
-                // No-null fast path: feed dict codes directly to the accumulator,
-                // skipping batch_gids materialisation (eliminates one full pass).
                 if !gb_dict.has_nulls() {
-                    self.accumulate_batch_from_codes(
-                        gb_dict.codes(), &code_to_gid, batch,
-                        &agg_col_indices, &mut local_states,
-                    )?;
+                    // No nulls: pre-allocate with exact dict size (no reallocs).
+                    // Dict codes are 0-indexed so code == gid — pass directly.
+                    let local_keys: Vec<String> = dict.to_vec();
+                    let mut local_states: Vec<BatchAggState> = (0..n_aggs).map(|_| BatchAggState {
+                        count:   vec![0i64;   n_g],
+                        sum:     vec![0.0f64; n_g],
+                        has_val: vec![false;  n_g],
+                    }).collect();
+                    self.accumulate_batch(gb_dict.codes(), batch, &agg_col_indices, &mut local_states)?;
+                    Ok((local_keys, local_states))
                 } else {
+                    let mut local_keys: Vec<String> = Vec::with_capacity(n_g + 1);
+                    let mut local_states: Vec<BatchAggState> =
+                        (0..n_aggs).map(|_| BatchAggState::new()).collect();
+                    let mut code_to_gid: Vec<u32> = Vec::with_capacity(n_g);
+                    for s in dict {
+                        code_to_gid.push(local_keys.len() as u32);
+                        local_keys.push(s.clone());
+                        for st in &mut local_states { st.push_group(); }
+                    }
                     let mut null_gid: Option<u32> = None;
                     let mut batch_gids: Vec<u32> = Vec::with_capacity(gb_dict.len());
                     for &code in gb_dict.codes() {
@@ -394,8 +393,8 @@ impl GroupByExec {
                         batch_gids.push(gid);
                     }
                     self.accumulate_batch(&batch_gids, batch, &agg_col_indices, &mut local_states)?;
+                    Ok((local_keys, local_states))
                 }
-                Ok((local_keys, local_states))
             })
             .collect();
 
