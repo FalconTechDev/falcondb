@@ -811,6 +811,63 @@ impl<T: Copy + Default> PrimitiveColumn<T> {
         Self { values, validity: None }
     }
 
+    /// Gather rows by `u32` index, where `u32::MAX` means "emit a NULL here".
+    ///
+    /// The join records its matches as index pairs, one per output row. Holding
+    /// those as `Option<usize>` costs 16 bytes an entry against 4 here, and the
+    /// join then made a second dense copy of them to reach a fast gather. At 100k
+    /// matches that bookkeeping measured around 60 ns per matched row — more than
+    /// building the output columns it feeds.
+    pub fn gather_u32(&self, idx: &[u32]) -> Self {
+        const NULL_IDX: u32 = u32::MAX;
+
+        let mut values = Vec::with_capacity(idx.len());
+        let mut bits = vec![0u64; idx.len().div_ceil(64)];
+        let mut any_null = false;
+
+        for (out_i, &i) in idx.iter().enumerate() {
+            if i != NULL_IDX && self.is_valid(i as usize) {
+                bits[out_i >> 6] |= 1u64 << (out_i & 63);
+                values.push(self.values[i as usize]);
+            } else {
+                // NULL slots still occupy a position so indexing stays O(1).
+                any_null = true;
+                values.push(T::default());
+            }
+        }
+
+        Self { values, validity: any_null.then_some(bits) }
+    }
+
+    /// Gather rows by index, where `None` means "emit a NULL here".
+    ///
+    /// This is the outer-join shape: a LEFT join's right-hand indices carry a
+    /// `None` for every unmatched row. Routing that through `Vec<Option<T>>` and
+    /// back cost a 16-byte slot per output row plus a second repacking pass, and it
+    /// is why LEFT JOIN measured 6x slower than INNER on the same data — the dense
+    /// path only ran when every index was present.
+    pub fn gather_opt(&self, indices: &[Option<usize>]) -> Self {
+        let mut values = Vec::with_capacity(indices.len());
+        let mut bits = vec![0u64; indices.len().div_ceil(64)];
+        let mut any_null = false;
+
+        for (out_i, idx) in indices.iter().enumerate() {
+            match idx {
+                Some(i) if self.is_valid(*i) => {
+                    bits[out_i >> 6] |= 1u64 << (out_i & 63);
+                    values.push(self.values[*i]);
+                }
+                // NULL slots still occupy a position so indexing stays O(1).
+                _ => {
+                    any_null = true;
+                    values.push(T::default());
+                }
+            }
+        }
+
+        Self { values, validity: any_null.then_some(bits) }
+    }
+
     pub fn len(&self) -> usize {
         self.values.len()
     }
@@ -872,6 +929,12 @@ impl<T: Copy + Default> PrimitiveColumn<T> {
     /// dense representation directly. Collecting into `Vec<Option<T>>` and handing
     /// that to `new` would allocate a doubled-width temporary, then re-scan it for
     /// NULLs and repack — three passes where one will do.
+    ///
+    /// Left serial and unprefetched on purpose. This gather is bound by memory
+    /// latency, so it looks like an easy target, but both obvious fixes measured
+    /// worse: parallelising across columns (see `query::sort::gather`) and
+    /// software-prefetching `indices[i + 16]`, which cost ORDER BY 18% at 10k
+    /// rows and 7% at 100k.
     pub fn filter(&self, indices: &[usize]) -> FalconResult<Self> {
         let len = self.values.len();
         if let Some(&bad) = indices.iter().find(|&&i| i >= len) {
@@ -1141,6 +1204,54 @@ impl Utf8Column {
 
     /// Build directly from an existing Arc-shared dictionary. The caller guarantees every
     /// code is either `NULL_CODE` or a valid index into `dict`.
+    /// Gather rows by `u32` index, where `u32::MAX` means "emit a NULL here".
+    ///
+    /// Carries the dictionary over, so this copies codes rather than strings.
+    pub fn gather_u32(&self, idx: &[u32]) -> Self {
+        const NULL_IDX: u32 = u32::MAX;
+
+        let mut codes = Vec::with_capacity(idx.len());
+        let mut has_nulls = false;
+        for &i in idx {
+            if i == NULL_IDX {
+                has_nulls = true;
+                codes.push(NULL_CODE);
+            } else {
+                let code = self.codes[i as usize];
+                if code == NULL_CODE {
+                    has_nulls = true;
+                }
+                codes.push(code);
+            }
+        }
+        Self { dict: Arc::clone(&self.dict), codes, has_nulls }
+    }
+
+    /// Gather rows by index, where `None` means "emit a NULL here".
+    ///
+    /// Carries the dictionary over rather than rebuilding it, so an outer join
+    /// copies `u32` codes instead of cloning every string.
+    pub fn gather_opt(&self, indices: &[Option<usize>]) -> Self {
+        let mut codes = Vec::with_capacity(indices.len());
+        let mut has_nulls = false;
+        for idx in indices {
+            match idx {
+                Some(i) => {
+                    let code = self.codes[*i];
+                    if code == NULL_CODE {
+                        has_nulls = true;
+                    }
+                    codes.push(code);
+                }
+                None => {
+                    has_nulls = true;
+                    codes.push(NULL_CODE);
+                }
+            }
+        }
+        Self { dict: Arc::clone(&self.dict), codes, has_nulls }
+    }
+
     fn from_parts(dict: Arc<Vec<String>>, codes: Vec<u32>) -> Self {
         let has_nulls = codes.iter().any(|&c| c == NULL_CODE);
         Self { dict, codes, has_nulls }
@@ -1268,7 +1379,35 @@ impl Utf8Column {
     /// Each input's dictionary is remapped **once**, not once per row, so joining
     /// batches costs one pass over the codes plus a handful of string lookups.
     pub fn concat_all(parts: &[&Self]) -> Self {
+        if parts.is_empty() {
+            return Self { dict: Arc::new(vec![]), codes: vec![], has_nulls: false };
+        }
+        if parts.len() == 1 {
+            return (*parts[0]).clone();
+        }
+
         let total: usize = parts.iter().map(|p| p.len()).sum();
+
+        // Fast path: all parts share the same Arc pointer — just concatenate codes.
+        let first_dict = &parts[0].dict;
+        if parts.iter().all(|p| Arc::ptr_eq(&p.dict, first_dict)) {
+            let mut codes = Vec::with_capacity(total);
+            for p in parts { codes.extend_from_slice(&p.codes); }
+            let has_nulls = parts.iter().any(|p| p.has_nulls);
+            return Self { dict: Arc::clone(first_dict), codes, has_nulls };
+        }
+
+        // Medium path: all dicts have identical entries (common after Parquet load).
+        // Codes are already compatible — no remapping needed.
+        let first_dict_content: &[String] = first_dict.as_ref();
+        if parts.iter().skip(1).all(|p| p.dict.as_ref().as_slice() == first_dict_content) {
+            let mut codes = Vec::with_capacity(total);
+            for p in parts { codes.extend_from_slice(&p.codes); }
+            let has_nulls = parts.iter().any(|p| p.has_nulls);
+            return Self { dict: Arc::clone(first_dict), codes, has_nulls };
+        }
+
+        // Slow path: dicts differ — merge via HashMap.
         let mut dict_vec: Vec<String> = Vec::new();
         let mut seen:     std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         let mut codes:    Vec<u32> = Vec::with_capacity(total);

@@ -7,7 +7,7 @@ use std::{
 use crate::{
     query::{
         aggregate::execute_agg_only,
-        join::execute_hash_join,
+
         select::{apply_offset_limit, display_results, execute_select, project_batch, Projection},
         sql::parse_sql,
     },
@@ -347,9 +347,10 @@ impl Database {
                 })
                 .collect::<FalconResult<_>>()?;
             resolved_stmt = crate::query::dml::InsertStmt {
-                table:   stmt.table.clone(),
-                columns: stmt.columns.clone(),
-                source:  InsertSource::Values(rows),
+                table:     stmt.table.clone(),
+                columns:   stmt.columns.clone(),
+                source:    InsertSource::Values(rows),
+                returning: stmt.returning.clone(),
             };
             &resolved_stmt
         } else {
@@ -357,51 +358,62 @@ impl Database {
         };
 
         let mut tables = self.tables.write().unwrap();
-        let (updated, n) = {
+        let (updated, n, ret) = {
             let table = tables.get(&stmt.table).ok_or_else(|| {
                 FalconError::InvalidQuery(format!("table '{}' not found", stmt.table))
             })?;
             crate::query::dml::execute_insert(table, stmt)?
         };
         enforce_constraints(&updated)?;
+        enforce_foreign_keys(&updated, &tables)?;
         let table_name = stmt.table.clone();
         tables.insert(table_name.clone(), Arc::new(updated));
         drop(tables);
         self.rebuild_table_indices(&table_name)?;
-        Ok(rows_affected(n))
+        Ok(match ret {
+            Some(batch) => QueryResult { batches: vec![batch] },
+            None        => rows_affected(n),
+        })
     }
 
     fn run_update(&self, stmt: &crate::query::dml::UpdateStmt) -> FalconResult<QueryResult> {
-        let (updated, n) = {
+        let (table_name, n, ret) = {
             let mut tables = self.tables.write().unwrap();
-            let (updated, n) = {
+            let (updated, n, ret) = {
                 let table = tables.get(&stmt.table).ok_or_else(|| {
                     FalconError::InvalidQuery(format!("table '{}' not found", stmt.table))
                 })?;
                 crate::query::dml::execute_update(table, stmt)?
             };
             enforce_constraints(&updated)?;
+            enforce_foreign_keys(&updated, &tables)?;
             tables.insert(stmt.table.clone(), Arc::new(updated));
-            (stmt.table.clone(), n)
+            (stmt.table.clone(), n, ret)
         };
-        self.rebuild_table_indices(&updated)?;
-        Ok(rows_affected(n))
+        self.rebuild_table_indices(&table_name)?;
+        Ok(match ret {
+            Some(batch) => QueryResult { batches: vec![batch] },
+            None        => rows_affected(n),
+        })
     }
 
     fn run_delete(&self, stmt: &crate::query::dml::DeleteStmt) -> FalconResult<QueryResult> {
-        let (updated, n) = {
+        let (table_name, n, ret) = {
             let mut tables = self.tables.write().unwrap();
-            let (tbl, n) = {
+            let (tbl, n, ret) = {
                 let table = tables.get(&stmt.table).ok_or_else(|| {
                     FalconError::InvalidQuery(format!("table '{}' not found", stmt.table))
                 })?;
                 crate::query::dml::execute_delete(table, stmt)?
             };
             tables.insert(stmt.table.clone(), Arc::new(tbl));
-            (stmt.table.clone(), n)
+            (stmt.table.clone(), n, ret)
         };
-        self.rebuild_table_indices(&updated)?;
-        Ok(rows_affected(n))
+        self.rebuild_table_indices(&table_name)?;
+        Ok(match ret {
+            Some(batch) => QueryResult { batches: vec![batch] },
+            None        => rows_affected(n),
+        })
     }
 
     // ─── Durability ───────────────────────────────────────────────────────────
@@ -417,6 +429,11 @@ impl Database {
         if self.replaying.load(Ordering::Relaxed) {
             return Ok(());
         }
+        // Substitute NOW()/CURRENT_TIMESTAMP with literal values so replaying the
+        // WAL is deterministic regardless of when the replay happens.
+        let frozen = freeze_now_calls(sql);
+        let sql = frozen.as_deref().unwrap_or(sql);
+
         // Inside a transaction: buffer instead of writing immediately.
         {
             let mut txn = self.transaction.lock().unwrap();
@@ -672,6 +689,7 @@ impl Database {
                 new_table.constraints.push(tc.clone());
                 // Validate existing data against the new constraint immediately.
                 enforce_constraints(&new_table)?;
+                enforce_foreign_keys(&new_table, &tables)?;
                 tables.insert(stmt.table.clone(), Arc::new(new_table));
             }
 
@@ -1077,9 +1095,128 @@ fn enforce_constraints(table: &crate::storage::table::Table) -> FalconResult<()>
                     }
                 }
             }
+
+            // FK enforcement requires the referenced table — handled separately in
+            // enforce_foreign_keys(), which receives the full tables map.
+            ConstraintKind::ForeignKey { .. } => {}
         }
     }
     Ok(())
+}
+
+/// Verify all FOREIGN KEY constraints on `table`, looking up referenced tables in `tables`.
+/// NULLs in the FK columns are exempt (SQL standard — partial NULL keys do not violate FK).
+fn enforce_foreign_keys(
+    table:  &crate::storage::table::Table,
+    tables: &HashMap<String, Arc<crate::storage::table::Table>>,
+) -> FalconResult<()> {
+    use std::collections::HashSet;
+    use crate::storage::table::ConstraintKind;
+    use crate::storage::types::FalconError;
+
+    for tc in &table.constraints {
+        let ConstraintKind::ForeignKey { columns, ref_table, ref_columns } = &tc.kind else {
+            continue;
+        };
+
+        let ref_tbl = tables.get(ref_table).ok_or_else(|| {
+            FalconError::ConstraintViolation(format!(
+                "FOREIGN KEY references unknown table '{ref_table}'"
+            ))
+        })?;
+
+        // Build the set of valid (ref_col) tuples from the referenced table.
+        let ref_indices: Vec<usize> = ref_columns.iter()
+            .map(|c| ref_tbl.schema.column_index(c))
+            .collect::<FalconResult<_>>()?;
+
+        let mut valid: HashSet<Vec<String>> = HashSet::new();
+        for batch in &ref_tbl.batches {
+            for row in 0..batch.row_count() {
+                let key: Vec<String> = ref_indices.iter()
+                    .map(|&ci| batch.column(ci).get(row).map(|v| v.to_string()))
+                    .collect::<FalconResult<_>>()?;
+                valid.insert(key);
+            }
+        }
+
+        // Check every row in the mutated table.
+        let col_indices: Vec<usize> = columns.iter()
+            .map(|c| table.schema.column_index(c))
+            .collect::<FalconResult<_>>()?;
+
+        for batch in &table.batches {
+            for row in 0..batch.row_count() {
+                let key: Vec<String> = col_indices.iter()
+                    .map(|&ci| batch.column(ci).get(row).map(|v| v.to_string()))
+                    .collect::<FalconResult<_>>()?;
+
+                // Any NULL in the FK → row is exempt.
+                let is_null = key.iter().any(|v| matches!(
+                    v.as_str(), "NULL" | "null"
+                ));
+                if is_null {
+                    continue;
+                }
+
+                if !valid.contains(&key) {
+                    let cname = tc.name.as_deref()
+                        .unwrap_or_else(|| columns.first().map(|s| s.as_str()).unwrap_or("?"));
+                    return Err(FalconError::ConstraintViolation(format!(
+                        "FOREIGN KEY constraint '{cname}' violated: ({}) not found in {ref_table}",
+                        key.join(", ")
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE` with literal values so the
+/// SQL logged to the WAL is deterministic on replay.
+///
+/// Returns `None` when the SQL contains none of these tokens (fast path).
+fn freeze_now_calls(sql: &str) -> Option<String> {
+    let upper = sql.to_ascii_uppercase();
+    if !upper.contains("NOW()") &&
+       !upper.contains("CURRENT_TIMESTAMP") &&
+       !upper.contains("CURRENT_DATE") {
+        return None;
+    }
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let day = micros.div_euclid(1_000_000 * 86_400) as i32;
+    let ts_literal  = format!("TIMESTAMP '{micros}'");
+    let date_literal = format!("DATE '{day}'");
+
+    // Case-insensitive replacement, preserving rest of SQL.
+    // We scan the original SQL and replace matches case-insensitively.
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut rest = sql;
+    while !rest.is_empty() {
+        let up = rest.to_ascii_uppercase();
+        if up.starts_with("NOW()") {
+            out.push_str(&ts_literal);
+            rest = &rest["NOW()".len()..];
+        } else if up.starts_with("CURRENT_TIMESTAMP") {
+            out.push_str(&ts_literal);
+            rest = &rest["CURRENT_TIMESTAMP".len()..];
+        } else if up.starts_with("CURRENT_DATE") {
+            out.push_str(&date_literal);
+            rest = &rest["CURRENT_DATE".len()..];
+        } else {
+            // Advance by one char.
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    Some(out)
 }
 
 /// Run one plan against a set of tables plus any in-scope CTE bindings.
@@ -1097,9 +1234,82 @@ fn execute_plan(
     // Materialise each CTE in declaration order so a later one can reference an
     // earlier one, then make them visible to this query only.
     let mut scope: HashMap<String, Arc<Table>> = ctes.clone();
-    for (name, cte_plan) in &parsed.ctes {
-        let cte_batches = execute_plan(cte_plan, tables, &scope, indices)?;
-        scope.insert(name.clone(), Arc::new(table_from_batches(name, cte_batches)));
+    for (name, cte_plan, recursive) in &parsed.ctes {
+        if !recursive {
+            let cte_batches = execute_plan(cte_plan, tables, &scope, indices)?;
+            scope.insert(name.clone(), Arc::new(table_from_batches(name, cte_batches)));
+        } else {
+            // WITH RECURSIVE: iterative evaluation.
+            // The CTE plan's set_ops should be [(UnionAll|Distinct, recursive_part)].
+            // We run the anchor first, then iterate the recursive part until no new rows.
+            let (anchor_plan, rec_plan, is_union_all) = match cte_plan.set_ops.first() {
+                Some((op, rec)) => {
+                    let anchor = crate::query::sql::ParsedQuery {
+                        set_ops: vec![],
+                        ctes:    vec![],
+                        ..cte_plan.clone()
+                    };
+                    (anchor, rec.clone(), matches!(op, crate::query::sql::SetOp::UnionAll))
+                }
+                None => {
+                    // No UNION — just a non-recursive CTE marked recursive (harmless)
+                    let cte_batches = execute_plan(cte_plan, tables, &scope, indices)?;
+                    scope.insert(name.clone(), Arc::new(table_from_batches(name, cte_batches)));
+                    continue;
+                }
+            };
+
+            // 1. Execute anchor.
+            let anchor_batches = execute_plan(&anchor_plan, tables, &scope, indices)?;
+            let mut all_batches: Vec<RecordBatch> = anchor_batches.clone();
+            let mut prev_batches = anchor_batches;
+
+            const MAX_RECURSIVE_ITERS: usize = 1_000_000;
+            for _iter in 0..MAX_RECURSIVE_ITERS {
+                if prev_batches.is_empty() || prev_batches.iter().all(|b| b.row_count() == 0) {
+                    break;
+                }
+                // Expose the previous result as the CTE for this iteration.
+                scope.insert(name.clone(), Arc::new(table_from_batches(name, prev_batches.clone())));
+
+                let new_batches = execute_plan(&rec_plan, tables, &scope, indices)?;
+                if new_batches.is_empty() || new_batches.iter().all(|b| b.row_count() == 0) {
+                    break;
+                }
+
+                if !is_union_all {
+                    use crate::storage::types::ScalarValue;
+                    // UNION (distinct): filter out rows already in all_batches.
+                    // Use string-key dedup — same approach as UNION DISTINCT in set ops.
+                    let seen: std::collections::HashSet<String> = all_batches.iter()
+                        .flat_map(|b| (0..b.row_count()).map(move |r| {
+                            (0..b.schema.fields.len())
+                                .map(|c| b.column(c).get(r).unwrap_or(ScalarValue::Null).to_string())
+                                .collect::<Vec<_>>().join("\x00")
+                        }))
+                        .collect();
+                    let fresh: Vec<RecordBatch> = new_batches.into_iter().filter_map(|b| {
+                        let keep: Vec<bool> = (0..b.row_count()).map(|r| {
+                            let key: String = (0..b.schema.fields.len())
+                                .map(|c| b.column(c).get(r).unwrap_or(ScalarValue::Null).to_string())
+                                .collect::<Vec<_>>().join("\x00");
+                            !seen.contains(&key)
+                        }).collect();
+                        filter_batch_by_mask(&b, &keep)
+                    }).collect();
+                    if fresh.is_empty() || fresh.iter().all(|b| b.row_count() == 0) {
+                        break;
+                    }
+                    all_batches.extend(fresh.clone());
+                    prev_batches = fresh;
+                } else {
+                    all_batches.extend(new_batches.clone());
+                    prev_batches = new_batches;
+                }
+            }
+
+            scope.insert(name.clone(), Arc::new(table_from_batches(name, all_batches)));
+        }
     }
 
     let resolve = |name: &str| -> FalconResult<Arc<Table>> {
@@ -1215,6 +1425,31 @@ fn execute_plan(
         // If we have an index for the filter column, use it to skip unneeded batches.
         let mut scan = SelectQuery::scan_all();
 
+        // Projection pruning for the join's *output*, computed here because `filter`
+        // and `correlated_filter` are consumed further down.
+        //
+        // The scan-level pushdown below is skipped whenever a join is present, since
+        // the join needs key columns this analysis does not see. The output is a
+        // different question: once the join has matched, only what later stages read
+        // has to be built, and building a column costs a cache miss per output row
+        // against the larger side. `SELECT COUNT(*)` over a join reads none of them.
+        //
+        // Applied to the last join only — earlier ones feed the next join's keys,
+        // and proving which those are is the analysis that is missing here.
+        let join_output_keep: Option<HashSet<String>> = if joins.len() == 1 {
+            analyse_needed_columns(
+                &projection,
+                filter.as_ref(),
+                group_by.as_ref(),
+                having.as_ref(),
+                &sort,
+                &windows,
+                correlated_filter.as_ref(),
+            )
+        } else {
+            None
+        };
+
         // Projection pushdown: rebuild only the columns some later stage reads.
         // Skipped entirely when a join is involved, because the join needs columns
         // this analysis does not see, and when anything opaque (a subquery, or
@@ -1273,7 +1508,9 @@ fn execute_plan(
         }
 
         // Step 1b — JOINs.
-        for join_clause in joins {
+        //
+        let last_join = joins.len().saturating_sub(1);
+        for (join_idx, join_clause) in joins.iter().enumerate() {
             use crate::query::join::JoinType;
             let right_table = resolve(&join_clause.table)?;
             let right_batches = execute_select(&right_table, &SelectQuery::scan_all())?;
@@ -1288,12 +1525,22 @@ fn execute_plan(
                     )?;
                     batches = if joined.row_count() > 0 { vec![joined] } else { vec![] };
                 }
+                JoinType::Cross => {
+                    let joined = crate::query::join::execute_cross_join(
+                        &batches, &right_batches,
+                    )?;
+                    batches = if joined.row_count() > 0 { vec![joined] } else { vec![] };
+                }
                 _ => {
                     let (lk, rk) = extract_join_keys(&join_clause.on)?;
                     let left_keys:  Vec<&str> = lk.iter().map(|s| s.as_str()).collect();
                     let right_keys: Vec<&str> = rk.iter().map(|s| s.as_str()).collect();
-                    let joined = execute_hash_join(
-                        &batches, &right_batches, &left_keys, &right_keys, join_clause.join_type,
+                    let keep = (join_idx == last_join)
+                        .then_some(join_output_keep.as_ref())
+                        .flatten();
+                    let joined = crate::query::join::execute_hash_join_projected(
+                        &batches, &right_batches, &left_keys, &right_keys,
+                        join_clause.join_type.clone(), keep,
                     )?;
                     batches = if joined.row_count() > 0 { vec![joined] } else { vec![] };
                 }
@@ -1407,7 +1654,8 @@ fn execute_plan(
 /// references cannot be enumerated. Returning a partial set instead would prune a
 /// column a later stage needs.
 #[allow(clippy::too_many_arguments)]
-fn needed_columns(
+#[allow(clippy::too_many_arguments)]
+fn analyse_needed_columns(
     projection: &crate::query::select::Projection,
     filter:     Option<&crate::query::expr::Expr>,
     group_by:   Option<&crate::query::aggregate::GroupByExec>,
@@ -1418,14 +1666,24 @@ fn needed_columns(
 ) -> Option<HashSet<String>> {
     use crate::query::select::Projection;
 
-    // SELECT * returns whatever the table has, so nothing can be pruned.
-    let Projection::Columns(exprs) = projection else { return None };
-
     let mut cols = HashSet::new();
     let mut ok = true;
 
-    for e in exprs {
-        ok &= e.expr.collect_columns(&mut cols);
+    match projection {
+        Projection::Columns(exprs) => {
+            for e in exprs {
+                ok &= e.expr.collect_columns(&mut cols);
+            }
+        }
+        // With GROUP BY (or a bare aggregate) the projection describes the
+        // *aggregate's* output, not its input: the result batch is built from the
+        // group keys and the aggregate arguments, both walked below. So `SELECT
+        // COUNT(*) FROM a JOIN b` reads no column of the join at all — which is the
+        // case this exists for.
+        _ if group_by.is_some() => {}
+        // Otherwise the projection is a wildcard over the input and returns whatever
+        // the table has, so nothing can be pruned.
+        _ => return None,
     }
     if let Some(f) = filter {
         ok &= f.collect_columns(&mut cols);
@@ -1460,12 +1718,34 @@ fn needed_columns(
         }
     }
 
-    // An empty set would prune everything; a query like `SELECT 1 FROM t` reads no
-    // column but still needs rows, so fall back to a full scan.
-    if !ok || cols.is_empty() {
+    // `None` means "could not be proven", which is not the same as "reads nothing".
+    if !ok {
         return None;
     }
     Some(cols)
+}
+
+/// Needed columns for a *scan*.
+///
+/// Same analysis, but an empty set is turned into `None`: pruning a scan to zero
+/// columns would leave a batch that reports no rows, and `SELECT 1 FROM t` reads no
+/// column while still needing them. Callers that can handle "reads nothing" — the
+/// join output, which keeps one column so the row count survives — use
+/// [`analyse_needed_columns`] directly.
+#[allow(clippy::too_many_arguments)]
+fn needed_columns(
+    projection: &crate::query::select::Projection,
+    filter:     Option<&crate::query::expr::Expr>,
+    group_by:   Option<&crate::query::aggregate::GroupByExec>,
+    having:     Option<&crate::query::expr::Expr>,
+    sort:       &[crate::query::sort::SortExpr],
+    windows:    &[crate::query::window::WindowExpr],
+    correlated: Option<&crate::query::expr::Expr>,
+) -> Option<HashSet<String>> {
+    let cols = analyse_needed_columns(
+        projection, filter, group_by, having, sort, windows, correlated,
+    )?;
+    (!cols.is_empty()).then_some(cols)
 }
 
 /// An index of every distinct row in `batches`, for membership tests.
@@ -1596,6 +1876,42 @@ fn table_from_batches(name: &str, batches: Vec<RecordBatch>) -> Table {
     table
 }
 
+/// Keep only the rows where `mask[i] == true`.
+fn filter_batch_by_mask(batch: &RecordBatch, mask: &[bool]) -> Option<RecordBatch> {
+    let indices: Vec<usize> = mask.iter().enumerate()
+        .filter_map(|(i, &keep)| if keep { Some(i) } else { None })
+        .collect();
+    if indices.is_empty() { return None; }
+    let columns: Vec<_> = batch.columns.iter().map(|col| {
+        use crate::storage::column::Column;
+        use crate::storage::types::ScalarValue;
+        let vals: Vec<_> = indices.iter().map(|&r| col.get(r).unwrap_or(ScalarValue::Null)).collect();
+        std::sync::Arc::new(match col.as_ref() {
+            Column::Int64(_) | Column::Int32(_) =>
+                Column::Int64(crate::storage::column::PrimitiveColumn::new(
+                    vals.iter().map(|v| v.as_i64()).collect()
+                )),
+            Column::Float64(_) | Column::Float32(_) =>
+                Column::Float64(crate::storage::column::PrimitiveColumn::new(
+                    vals.iter().map(|v| v.as_f64()).collect()
+                )),
+            Column::Utf8(_) =>
+                Column::Utf8(crate::storage::column::Utf8Column::new(
+                    vals.iter().map(|v| match v { ScalarValue::Utf8(s) => s.clone(), _ => None }).collect()
+                )),
+            Column::Boolean(_) =>
+                Column::Boolean(crate::storage::column::BooleanColumn::new(
+                    vals.iter().map(|v| v.as_bool()).collect()
+                )),
+            _ =>
+                Column::Int64(crate::storage::column::PrimitiveColumn::new(
+                    vals.iter().map(|v| v.as_i64()).collect()
+                )),
+        })
+    }).collect();
+    RecordBatch::from_shared(batch.schema.clone(), columns).ok()
+}
+
 /// Replace every `Expr::Subquery` with the scalar it evaluates to.
 ///
 /// A scalar subquery must yield exactly one row and one column; anything else is
@@ -1721,7 +2037,7 @@ fn plan_scope_columns(
     for j in &plan.joins {
         add(&j.table, None);
     }
-    for (cte_name, _) in &plan.ctes {
+    for (cte_name, _, _) in &plan.ctes {
         out.quals.insert(cte_name.clone());
     }
 
@@ -2414,7 +2730,7 @@ fn explain_query(q: &crate::query::sql::ParsedQuery) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     // CTEs
-    for (name, _) in &q.ctes {
+    for (name, _, _) in &q.ctes {
         lines.push(format!("CTE: {name}"));
     }
 
@@ -2427,6 +2743,8 @@ fn explain_query(q: &crate::query::sql::ParsedQuery) -> String {
                 JoinType::Inner => "INNER JOIN",
                 JoinType::Left  => "LEFT JOIN",
                 JoinType::Right => "RIGHT JOIN",
+                JoinType::Full  => "FULL OUTER JOIN",
+                JoinType::Cross => "CROSS JOIN",
                 JoinType::Semi  => "SEMI JOIN",
                 JoinType::Anti  => "ANTI JOIN",
             };
@@ -2444,15 +2762,25 @@ fn explain_query(q: &crate::query::sql::ParsedQuery) -> String {
     if let Some(gb) = &q.group_by {
         let key_count = gb.group_by.len();
         let agg_parts: Vec<_> = gb.aggs.iter().map(|a| {
-            let func = match a.func {
-                AggFunc::Count         => "COUNT",
-                AggFunc::CountDistinct => "COUNT(DISTINCT)",
-                AggFunc::Sum           => "SUM",
-                AggFunc::Avg           => "AVG",
-                AggFunc::Min           => "MIN",
-                AggFunc::Max           => "MAX",
+            let func = match &a.func {
+                AggFunc::Count         => "COUNT".to_string(),
+                AggFunc::CountDistinct => "COUNT(DISTINCT)".to_string(),
+                AggFunc::Sum           => "SUM".to_string(),
+                AggFunc::Avg           => "AVG".to_string(),
+                AggFunc::Min           => "MIN".to_string(),
+                AggFunc::Max           => "MAX".to_string(),
+                AggFunc::StringAgg { separator } => format!("STRING_AGG('{separator}')"),
+                AggFunc::BoolAnd       => "BOOL_AND".to_string(),
+                AggFunc::BoolOr        => "BOOL_OR".to_string(),
+                AggFunc::Stddev { population: true  } => "STDDEV_POP".to_string(),
+                AggFunc::Stddev { population: false } => "STDDEV".to_string(),
+                AggFunc::Variance { population: true  } => "VAR_POP".to_string(),
+                AggFunc::Variance { population: false } => "VARIANCE".to_string(),
+                AggFunc::First         => "FIRST".to_string(),
+                AggFunc::Last          => "LAST".to_string(),
             };
             format!("{func}({}) as {}", a.input, a.alias)
+
         }).collect();
         lines.push(format!(
             "GroupBy: {} key(s) | {}",

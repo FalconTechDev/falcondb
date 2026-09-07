@@ -10,6 +10,7 @@
 //   db.sql("INSERT INTO t VALUES (1, 'alice')")
 //   result = db.sql("SELECT * FROM t")
 //   print(result.rows())
+//   df = result.to_pandas()   # requires pandas
 
 #![cfg(feature = "python")]
 
@@ -34,7 +35,7 @@ impl PyDatabase {
     }
 
     /// Execute any SQL statement. Returns a QueryResult object.
-    fn sql(&self, py: Python<'_>, query: &str) -> PyResult<PyQueryResult> {
+    fn sql(&self, _py: Python<'_>, query: &str) -> PyResult<PyQueryResult> {
         self.inner
             .sql(query)
             .map(|r| PyQueryResult { columns: r.column_names(), rows: r.to_rows() })
@@ -45,6 +46,13 @@ impl PyDatabase {
     fn load_csv(&self, path: &str, table: &str) -> PyResult<usize> {
         self.inner
             .load_csv(path, table)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Load a Parquet file into a named table. Returns the number of rows loaded.
+    fn load_parquet(&self, path: &str, table: &str) -> PyResult<usize> {
+        self.inner
+            .load_parquet(path, table)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -81,15 +89,26 @@ impl PyQueryResult {
 
     /// Return rows as a list of dicts (column name → value).
     fn to_dicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let list = PyList::empty(py);
+        let list = PyList::empty_bound(py);
         for row in &self.rows {
-            let d = PyDict::new(py);
+            let d = PyDict::new_bound(py);
             for (col, val) in self.columns.iter().zip(row.iter()) {
                 d.set_item(col, val)?;
             }
-            list.append(d)?;
+            list.append(&d)?;
         }
         Ok(list)
+    }
+
+    /// Convert to a pandas DataFrame. Requires pandas to be installed.
+    fn to_pandas<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pd = py.import_bound("pandas")?;
+        let data = PyDict::new_bound(py);
+        for (i, col) in self.columns.iter().enumerate() {
+            let vals: Vec<&str> = self.rows.iter().map(|r| r[i].as_str()).collect();
+            data.set_item(col, vals)?;
+        }
+        pd.call_method1("DataFrame", (data,))
     }
 
     fn __repr__(&self) -> String {

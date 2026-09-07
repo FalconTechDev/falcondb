@@ -1,0 +1,8 @@
+﻿cargo :     Blocking waiting for file lock on build directory
+At line:1 char:453
++ ... ib\duckdb;" + $env:PATH; cargo bench --bench query_bench 2>&1 | Tee-O ...
++                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Blocking wa...build directory:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+   Compiling falcondb v0.1.0 (.)

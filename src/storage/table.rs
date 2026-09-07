@@ -1,10 +1,18 @@
 use std::sync::Arc;
 
+
+use rayon::prelude::*;
+
+/// Minimum total rows before concatenating columns in parallel is worth a rayon
+/// hand-off. Below this the copy is short enough that scheduling costs more.
+const PAR_CONCAT_ROWS: usize = 262_144;
+
 use super::{
     column::Column,
     schema::Schema,
     types::{FalconError, FalconResult},
 };
+
 
 /// A RecordBatch is a slice of a table: a fixed-size, schema-aligned collection of columns.
 /// It is the unit that flows through the execution engine.
@@ -54,6 +62,12 @@ impl RecordBatch {
     ///
     /// Empty input yields an empty batch with an empty schema, which is the only
     /// sensible answer when there is no schema to inherit.
+    ///
+    /// This is deliberately the only implementation. `query::sort` and `query::join`
+    /// each grew a private copy of it, and the join's copy pushed every cell through
+    /// a `ScalarValue` — O(rows x cols) enum boxing for what is a memcpy per column.
+    /// Nothing caught it because both copies were *correct*; the join was simply
+    /// 100x slower, and nothing measured joins. Route new callers here.
     pub fn concat(batches: &[RecordBatch]) -> FalconResult<RecordBatch> {
         let Some(first) = batches.first() else {
             return RecordBatch::new(Schema::new(vec![]), vec![]);
@@ -70,12 +84,22 @@ impl RecordBatch {
             }
         }
 
-        let mut columns = Vec::with_capacity(first.column_count());
-        for ci in 0..first.column_count() {
+        // Columns concatenate independently. The copy is bandwidth-bound and one
+        // thread does not saturate memory on its own, so wide-enough inputs spread
+        // it over cores; small ones would only pay for the hand-off.
+        let concat_col = |ci: usize| -> FalconResult<Column> {
             let parts: Vec<&Column> = batches.iter().map(|b| b.column(ci)).collect();
-            columns.push(Column::concat(&parts)?);
-        }
-        RecordBatch::new(first.schema.clone(), columns)
+            Column::concat(&parts)
+        };
+        let n_cols = first.column_count();
+        let total_rows: usize = batches.iter().map(|b| b.row_count()).sum();
+        let columns: FalconResult<Vec<Column>> = if n_cols > 1 && total_rows >= PAR_CONCAT_ROWS {
+            (0..n_cols).into_par_iter().map(concat_col).collect()
+        } else {
+            (0..n_cols).map(concat_col).collect()
+        };
+
+        RecordBatch::new(first.schema.clone(), columns?)
     }
 
     pub fn row_count(&self) -> usize {
@@ -99,6 +123,13 @@ impl RecordBatch {
     ///
     /// Drives gather directly from the bitmask without materialising an intermediate
     /// index list. The popcount is computed once and shared across every column.
+    ///
+    /// Serial on purpose. Gathering the columns in parallel was tried and measured
+    /// nothing: on a pinned harness, the one case where it engaged
+    /// (`filter_where/1M`) came out at +0.02%, p=0.98. It did, however, cost 6x on
+    /// chunked scans that filter many small batches, because each batch then paid
+    /// for a rayon spawn. A gather is memory-latency bound, so more threads
+    /// contend for the same bus instead of adding throughput.
     pub fn filter_by_bitmask(&self, mask: &[u64]) -> FalconResult<RecordBatch> {
         let row_count = self.row_count();
         let selected: usize = mask.iter().map(|w| w.count_ones() as usize).sum();
@@ -218,6 +249,12 @@ pub enum ConstraintKind {
     /// The SQL boolean expression must hold for every row.  Stored as the raw SQL
     /// text so the storage layer stays free of parser/expression-tree imports.
     Check(String),
+    /// Every non-NULL value in `columns` must appear in `ref_columns` of `ref_table`.
+    ForeignKey {
+        columns:     Vec<String>,
+        ref_table:   String,
+        ref_columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -103,22 +103,39 @@ impl SelectQuery {
 
 /// Execute a SELECT query over a table and return a flat list of result batches.
 pub fn execute_select(table: &Table, query: &SelectQuery) -> FalconResult<Vec<RecordBatch>> {
-    // Each batch is processed independently вЂ” parallelism here is safe.
-    let processed: FalconResult<Vec<Option<RecordBatch>>> = table
-        .batches
-        .par_iter()
-        .enumerate()
-        .map(|(i, batch)| {
-            // Zone-map pruning: if the batch's precomputed bounds prove no row can
-            // match, skip it without reading a single value.
-            if let Some(filter) = &query.filter {
-                if table.stats.get(i).is_some_and(|s| s.can_skip(filter)) {
-                    return Ok(None);
+    // Each batch is processed independently — parallelism here is safe.
+    // For small tables (< 32 batches) Rayon scheduling overhead dominates; use serial.
+    let processed: FalconResult<Vec<Option<RecordBatch>>> = if table.batches.len() < 32 {
+        table
+            .batches
+            .iter()
+            .enumerate()
+            .map(|(i, batch)| {
+                if let Some(filter) = &query.filter {
+                    if table.stats.get(i).is_some_and(|s| s.can_skip(filter)) {
+                        return Ok(None);
+                    }
                 }
-            }
-            process_batch(batch, query)
-        })
-        .collect();
+                process_batch(batch, query)
+            })
+            .collect()
+    } else {
+        table
+            .batches
+            .par_iter()
+            .enumerate()
+            .map(|(i, batch)| {
+                // Zone-map pruning: if the batch's precomputed bounds prove no row can
+                // match, skip it without reading a single value.
+                if let Some(filter) = &query.filter {
+                    if table.stats.get(i).is_some_and(|s| s.can_skip(filter)) {
+                        return Ok(None);
+                    }
+                }
+                process_batch(batch, query)
+            })
+            .collect()
+    };
 
     // Filter out empty batches, then apply global offset + limit.
     let mut result: Vec<RecordBatch> = processed?
@@ -217,6 +234,10 @@ pub(crate) fn row_eq(a: &RecordBatch, ra: usize, b: &RecordBatch, rb: usize) -> 
 pub fn dedup_batches(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
     use super::hash::FastMap;
 
+    if let Some(keeps) = dedup_single_primitive(&batches) {
+        return apply_keeps(&batches, keeps);
+    }
+
     // hash -> positions in the *input* batches that hashed there. Recording input
     // positions rather than output ones matters: a row has to be comparable
     // against earlier rows of the batch currently being scanned, which has not
@@ -244,6 +265,11 @@ pub fn dedup_batches(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
         keeps.push(keep);
     }
 
+    apply_keeps(&batches, keeps)
+}
+
+/// Materialise the surviving rows of each batch.
+fn apply_keeps(batches: &[RecordBatch], keeps: Vec<Vec<bool>>) -> Vec<RecordBatch> {
     let mut result = Vec::with_capacity(batches.len());
     for (batch, keep) in batches.iter().zip(keeps) {
         if keep.iter().any(|&k| k) {
@@ -253,6 +279,125 @@ pub fn dedup_batches(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
         }
     }
     result
+}
+
+/// Minimum rows before splitting the dedup scan across cores.
+///
+/// At 131_072 a 100k-row DISTINCT fell just under the line and ran serially, which
+/// left it about 2x behind Polars while the 1M case — which did split — led every
+/// rival. The merge pass costs one hash per distinct value per chunk, so it stays
+/// cheap well below this.
+const PAR_DEDUP_ROWS: usize = 32_768;
+
+/// DISTINCT over a single primitive column, without per-row type dispatch.
+///
+/// The general path matches on the column enum, calls a validity-checking getter
+/// and consults a `FastMap<u64, Vec<(usize, usize)>>` — for *every row*. At a
+/// million rows that measured 20.5 ms against DuckDB's 4.7 ms, and it grew exactly
+/// linearly where the rivals grew sub-linearly. Here the type is resolved once per
+/// batch and the raw value goes straight into a typed set.
+///
+/// Returns `None` for anything it does not handle — several columns, NULLs, or a
+/// type not listed — so the caller falls back rather than this having to restate
+/// the general semantics. First occurrence wins, exactly as before, so the output
+/// and its order are unchanged.
+fn dedup_single_primitive(batches: &[RecordBatch]) -> Option<Vec<Vec<bool>>> {
+    use super::hash::FastSet;
+    use crate::storage::column::Column;
+
+    let first = batches.first()?;
+    if first.column_count() != 1 {
+        return None;
+    }
+    if batches.iter().any(|b| b.column(0).null_count() > 0) {
+        return None;
+    }
+
+    let total_rows: usize = batches.iter().map(|b| b.row_count()).sum();
+
+    macro_rules! run {
+        ($variant:ident, $key:expr) => {{
+            // Hashing every row is the bulk of the work and each row is independent,
+            // so it splits over cores. What cannot be split is *which* occurrence
+            // wins: DISTINCT keeps the first, which is a global fact.
+            //
+            // So each chunk marks the rows that are first *within the chunk*, then a
+            // short serial pass walks those in chunk order and clears any that an
+            // earlier chunk already had. The second pass touches only locally-kept
+            // rows — at most one per distinct value per chunk — rather than all of
+            // them, so the serial part shrinks with cardinality instead of row count.
+            let par = total_rows >= PAR_DEDUP_ROWS && batches.len() > 1;
+            if par {
+                let per_chunk: Vec<(FastSet<u64>, Vec<Vec<bool>>)> = batches
+                    .par_chunks(batches.len().div_ceil(rayon::current_num_threads().max(1)).max(1))
+                    .map(|chunk| {
+                        let mut seen: FastSet<u64> = FastSet::default();
+                        let mut keeps = Vec::with_capacity(chunk.len());
+                        for batch in chunk {
+                            let mut keep = Vec::with_capacity(batch.row_count());
+                            if let Column::$variant(c) = batch.column(0) {
+                                for &v in c.dense() {
+                                    keep.push(seen.insert($key(v)));
+                                }
+                            }
+                            keeps.push(keep);
+                        }
+                        (seen, keeps)
+                    })
+                    .collect();
+
+                // A chunk that saw no rows of the expected type produced no keeps;
+                // that only happens on a mixed-type input, which the caller rejects.
+                if per_chunk.iter().map(|(_, k)| k.iter().map(|v| v.len()).sum::<usize>()).sum::<usize>()
+                    != total_rows
+                {
+                    return None;
+                }
+
+                let mut global: FastSet<u64> = FastSet::default();
+                let mut keeps: Vec<Vec<bool>> = Vec::with_capacity(batches.len());
+                let mut bi = 0usize;
+                for (_, chunk_keeps) in per_chunk {
+                    for mut keep in chunk_keeps {
+                        let Column::$variant(c) = batches[bi].column(0) else { return None };
+                        let dense = c.dense();
+                        for (row, k) in keep.iter_mut().enumerate() {
+                            if *k && !global.insert($key(dense[row])) {
+                                *k = false;
+                            }
+                        }
+                        keeps.push(keep);
+                        bi += 1;
+                    }
+                }
+                return Some(keeps);
+            }
+
+            let mut seen: FastSet<u64> = FastSet::default();
+            let mut keeps = Vec::with_capacity(batches.len());
+            for batch in batches {
+                let Column::$variant(c) = batch.column(0) else { return None };
+                let dense = c.dense();
+                let mut keep = Vec::with_capacity(dense.len());
+                for &v in dense {
+                    keep.push(seen.insert($key(v)));
+                }
+                keeps.push(keep);
+            }
+            Some(keeps)
+        }};
+    }
+
+    match first.column(0) {
+        Column::Int64(_)  => run!(Int64, |v: i64| v as u64),
+        Column::Int32(_)  => run!(Int32, |v: i32| v as i64 as u64),
+        Column::Date32(_) => run!(Date32, |v: i32| v as i64 as u64),
+        // Normalised the same way `row_hash` does it, so NaN and -0.0 behave as
+        // they did on the general path.
+        Column::Float64(_) => run!(Float64, |v: f64| norm_f64(v)),
+        Column::Float32(_) => run!(Float32, |v: f32| norm_f32(v) as u64),
+        _ => None,
+    }
 }
 
 fn process_batch(batch: &RecordBatch, query: &SelectQuery) -> FalconResult<Option<RecordBatch>> {
@@ -500,6 +645,156 @@ mod tests {
             types::{DataType, ScalarValue},
         },
     };
+
+    /// The typed DISTINCT path must agree with the general one.
+    ///
+    /// Two implementations of the same semantics is how a 100x-slow join went
+    /// unnoticed in this codebase, so the fast path is pinned to the slow one
+    /// rather than just to a hand-written expectation.
+    #[test]
+    fn typed_distinct_agrees_with_the_general_path() {
+        let schema = Schema::new(vec![Field::required("v", DataType::Int64)]);
+        // Split across batches so a duplicate must be caught against an earlier one.
+        let batches: Vec<RecordBatch> = [vec![3i64, 1, 3, 2], vec![1, 4, 2], vec![5, 5]]
+            .iter()
+            .map(|vals| {
+                RecordBatch::new(
+                    schema.clone(),
+                    vec![ColumnBuilder::int64(vals.iter().map(|&v| Some(v)).collect())],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let fast = dedup_single_primitive(&batches).expect("Int64 should take the typed path");
+        let fast_rows: Vec<i64> = collect_kept(&batches, &fast);
+
+        // First occurrence wins, in scan order.
+        assert_eq!(fast_rows, vec![3, 1, 2, 4, 5]);
+
+        let out = dedup_batches(batches.clone());
+        let via_dedup: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                (0..b.row_count()).map(move |r| match b.column(0).get(r).unwrap() {
+                    ScalarValue::Int64(Some(v)) => v,
+                    other => panic!("unexpected {other:?}"),
+                })
+            })
+            .collect();
+        assert_eq!(via_dedup, fast_rows);
+    }
+
+    /// The parallel dedup must keep the same rows, in the same order, as the serial one.
+    ///
+    /// Every other DISTINCT test here is a handful of rows, so none of them reach
+    /// PAR_DEDUP_ROWS and the chunked path went unexercised. Which occurrence
+    /// survives is a global fact, so a chunk boundary falling between two copies of
+    /// a value is exactly the case that can go wrong.
+    #[test]
+    fn parallel_dedup_matches_the_serial_result() {
+        let schema = Schema::new(vec![Field::required("v", DataType::Int64)]);
+        // Well over PAR_DEDUP_ROWS, split into many batches so chunks land mid-run.
+        const BATCHES: usize = 200;
+        const PER_BATCH: usize = 1_000;
+        const DISTINCT: i64 = 97; // coprime with the batch size, so repeats straddle chunks
+
+        let batches: Vec<RecordBatch> = (0..BATCHES)
+            .map(|b| {
+                let vals: Vec<Option<i64>> = (0..PER_BATCH)
+                    .map(|i| Some(((b * PER_BATCH + i) as i64) % DISTINCT))
+                    .collect();
+                RecordBatch::new(schema.clone(), vec![ColumnBuilder::int64(vals)]).unwrap()
+            })
+            .collect();
+        assert!(BATCHES * PER_BATCH > PAR_DEDUP_ROWS, "test must reach the parallel path");
+
+        let parallel = dedup_single_primitive(&batches).expect("Int64 takes the typed path");
+
+        // Same computation, forced through one chunk by handing it a single batch.
+        let flat: Vec<Option<i64>> = (0..BATCHES * PER_BATCH)
+            .map(|i| Some((i as i64) % DISTINCT))
+            .collect();
+        let single = vec![RecordBatch::new(
+            schema,
+            vec![ColumnBuilder::int64(flat)],
+        )
+        .unwrap()];
+        let serial = dedup_single_primitive(&single).expect("Int64 takes the typed path");
+
+        let kept_parallel: Vec<bool> = parallel.into_iter().flatten().collect();
+        let kept_serial: Vec<bool> = serial.into_iter().flatten().collect();
+        assert_eq!(
+            kept_parallel, kept_serial,
+            "chunked dedup kept different rows than the single-chunk one"
+        );
+        assert_eq!(
+            kept_serial.iter().filter(|&&k| k).count(),
+            DISTINCT as usize,
+            "wrong number of distinct values"
+        );
+    }
+
+    /// Floats need the same NaN and signed-zero handling the general path has.
+    #[test]
+    fn typed_distinct_normalises_floats_like_row_hash() {
+        let schema = Schema::new(vec![Field::required("v", DataType::Float64)]);
+        let batch = RecordBatch::new(
+            schema,
+            vec![ColumnBuilder::float64(vec![
+                Some(0.0),
+                Some(-0.0),      // same value as 0.0
+                Some(f64::NAN),
+                Some(f64::NAN),  // NaN must dedupe against itself here
+                Some(1.5),
+            ])],
+        )
+        .unwrap();
+        let batches = vec![batch];
+        let keeps = dedup_single_primitive(&batches).expect("Float64 should take the typed path");
+        assert_eq!(keeps[0], vec![true, false, true, false, true]);
+    }
+
+    /// NULLs and multi-column inputs stay on the general path.
+    #[test]
+    fn typed_distinct_declines_what_it_cannot_handle() {
+        let nullable = Schema::new(vec![Field::nullable("v", DataType::Int64)]);
+        let with_null = vec![RecordBatch::new(
+            nullable,
+            vec![ColumnBuilder::int64(vec![Some(1), None, Some(1)])],
+        )
+        .unwrap()];
+        assert!(dedup_single_primitive(&with_null).is_none());
+
+        let two_cols = Schema::new(vec![
+            Field::required("a", DataType::Int64),
+            Field::required("b", DataType::Int64),
+        ]);
+        let wide = vec![RecordBatch::new(
+            two_cols,
+            vec![
+                ColumnBuilder::int64(vec![Some(1)]),
+                ColumnBuilder::int64(vec![Some(2)]),
+            ],
+        )
+        .unwrap()];
+        assert!(dedup_single_primitive(&wide).is_none());
+    }
+
+    fn collect_kept(batches: &[RecordBatch], keeps: &[Vec<bool>]) -> Vec<i64> {
+        let mut out = Vec::new();
+        for (b, keep) in batches.iter().zip(keeps) {
+            for (r, &k) in keep.iter().enumerate() {
+                if k {
+                    match b.column(0).get(r).unwrap() {
+                        ScalarValue::Int64(Some(v)) => out.push(v),
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+            }
+        }
+        out
+    }
 
     fn make_table() -> Table {
         let schema = Schema::new(vec![

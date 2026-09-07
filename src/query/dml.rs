@@ -14,7 +14,7 @@ use crate::storage::{
     types::{DataType, FalconError, FalconResult, ScalarValue},
 };
 
-use super::expr::Expr;
+use super::{expr::Expr, select::SelectExpr};
 
 // ─── Statements ──────────────────────────────────────────────────────────────
 
@@ -30,10 +30,12 @@ pub enum InsertSource {
 
 #[derive(Debug, Clone)]
 pub struct InsertStmt {
-    pub table:   String,
+    pub table:     String,
     /// Target columns. Empty means "every column, in schema order".
-    pub columns: Vec<String>,
-    pub source:  InsertSource,
+    pub columns:   Vec<String>,
+    pub source:    InsertSource,
+    /// `RETURNING` expressions; empty if not present.
+    pub returning: Vec<SelectExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,21 +43,31 @@ pub struct UpdateStmt {
     pub table:       String,
     pub assignments: Vec<(String, Expr)>,
     pub filter:      Option<Expr>,
+    /// `RETURNING` expressions; empty if not present.
+    pub returning:   Vec<SelectExpr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DeleteStmt {
-    pub table:  String,
-    pub filter: Option<Expr>,
+    pub table:     String,
+    pub filter:    Option<Expr>,
+    /// `RETURNING` expressions; empty if not present.
+    pub returning: Vec<SelectExpr>,
 }
 
 // ─── INSERT ──────────────────────────────────────────────────────────────────
 
-/// Append rows to `table`, returning the new table and the number of rows inserted.
+/// Append rows to `table`.
+///
+/// Returns the new table, the number of rows inserted, and (when RETURNING is
+/// present) the inserted batch projected through the RETURNING expressions.
 ///
 /// Only `InsertSource::Values` is handled here.  `InsertSource::Select` must be
 /// resolved to a `Values` insert by the caller before this is called.
-pub fn execute_insert(table: &Table, stmt: &InsertStmt) -> FalconResult<(Table, usize)> {
+pub fn execute_insert(
+    table: &Table,
+    stmt:  &InsertStmt,
+) -> FalconResult<(Table, usize, Option<RecordBatch>)> {
     let rows = match &stmt.source {
         InsertSource::Values(rows) => rows,
         InsertSource::Select(_) => {
@@ -66,7 +78,7 @@ pub fn execute_insert(table: &Table, stmt: &InsertStmt) -> FalconResult<(Table, 
     };
 
     if rows.is_empty() {
-        return Ok((clone_table(table), 0));
+        return Ok((clone_table(table), 0, None));
     }
 
     let schema = &table.schema;
@@ -113,29 +125,58 @@ pub fn execute_insert(table: &Table, stmt: &InsertStmt) -> FalconResult<(Table, 
 
     let batch = RecordBatch::new(schema.clone(), new_columns?)?;
 
+    let returning = if stmt.returning.is_empty() {
+        None
+    } else if is_wildcard_returning(&stmt.returning) {
+        Some(batch.clone())
+    } else {
+        use crate::query::select::project_batch;
+        Some(project_batch(&batch, &stmt.returning)?)
+    };
+
     let mut out = clone_table(table);
     out.append_batch(batch)?;
-    Ok((out, n_new))
+    Ok((out, n_new, returning))
 }
 
 // ─── DELETE ──────────────────────────────────────────────────────────────────
 
-/// Remove rows matching `stmt.filter`, returning the new table and rows removed.
+/// Remove rows matching `stmt.filter`.
+///
+/// Returns the new table, rows removed, and (when RETURNING is present) the
+/// deleted rows projected through the RETURNING expressions.
 /// A statement with no filter empties the table.
-pub fn execute_delete(table: &Table, stmt: &DeleteStmt) -> FalconResult<(Table, usize)> {
+pub fn execute_delete(
+    table: &Table,
+    stmt:  &DeleteStmt,
+) -> FalconResult<(Table, usize, Option<RecordBatch>)> {
+    use crate::query::select::project_batch;
+
     let mut out = clone_table_empty(table);
     let mut removed = 0usize;
+    let mut deleted_batches: Vec<RecordBatch> = Vec::new();
+    let need_returning = !stmt.returning.is_empty();
 
     for batch in &table.batches {
         match &stmt.filter {
             None => {
                 removed += batch.row_count();
+                if need_returning {
+                    deleted_batches.push(batch.clone());
+                }
             }
             Some(filter) => {
-                // Keep rows where the predicate is *not* true, so NULLs survive —
-                // matching SQL's three-valued logic for DELETE.
                 let mask = filter.eval_mask_bits(batch)?;
                 let keep = invert_mask(&mask, batch.row_count());
+
+                if need_returning {
+                    // Collect the deleted rows (the ones we do NOT keep).
+                    let deleted = batch.filter_by_bitmask(&mask)?;
+                    if deleted.row_count() > 0 {
+                        deleted_batches.push(deleted);
+                    }
+                }
+
                 let kept = batch.filter_by_bitmask(&keep)?;
                 removed += batch.row_count() - kept.row_count();
                 if kept.row_count() > 0 {
@@ -145,14 +186,32 @@ pub fn execute_delete(table: &Table, stmt: &DeleteStmt) -> FalconResult<(Table, 
         }
     }
 
-    Ok((out, removed))
+    let returning = if need_returning && !deleted_batches.is_empty() {
+        let merged = merge_batches_simple(&deleted_batches, table)?;
+        if is_wildcard_returning(&stmt.returning) {
+            Some(merged)
+        } else {
+            Some(project_batch(&merged, &stmt.returning)?)
+        }
+    } else {
+        None
+    };
+
+    Ok((out, removed, returning))
 }
 
 // ─── UPDATE ──────────────────────────────────────────────────────────────────
 
 /// Apply `stmt.assignments` to rows matching `stmt.filter`.
-/// Returns the new table and the number of rows changed.
-pub fn execute_update(table: &Table, stmt: &UpdateStmt) -> FalconResult<(Table, usize)> {
+///
+/// Returns the new table, rows changed, and (when RETURNING is present) the
+/// updated rows (post-update values) projected through the RETURNING expressions.
+pub fn execute_update(
+    table: &Table,
+    stmt:  &UpdateStmt,
+) -> FalconResult<(Table, usize, Option<RecordBatch>)> {
+    use crate::query::select::project_batch;
+
     let schema = &table.schema;
 
     // Resolve assignment targets up front so a bad column name fails before any work.
@@ -164,6 +223,8 @@ pub fn execute_update(table: &Table, stmt: &UpdateStmt) -> FalconResult<(Table, 
 
     let mut out = clone_table_empty(table);
     let mut changed = 0usize;
+    let mut updated_batches: Vec<RecordBatch> = Vec::new();
+    let need_returning = !stmt.returning.is_empty();
 
     for batch in &table.batches {
         let n_rows = batch.row_count();
@@ -189,23 +250,76 @@ pub fn execute_update(table: &Table, stmt: &UpdateStmt) -> FalconResult<(Table, 
         // values only at the selected rows.
         let mut columns: Vec<Arc<Column>> = batch.columns.clone();
         for (col_idx, expr) in &targets {
-            let computed = expr.eval_batch(batch)?;
-            let mut values: Vec<ScalarValue> = (0..n_rows)
-                .map(|r| batch.column(*col_idx).get(r))
-                .collect::<FalconResult<_>>()?;
-            for (r, keep) in selected.iter().enumerate() {
-                if *keep {
-                    values[r] = computed[r].clone();
+            // Fully typed path: the assignment evaluates straight into f64s and is
+            // spliced into a dense copy, so neither side boxes a value per row.
+            if schema.fields[*col_idx].data_type == DataType::Float64 {
+                if let Some(vals) = expr.eval_dense_f64(batch) {
+                    if let Column::Float64(src) = batch.column(*col_idx) {
+                        if src.null_count() == 0 {
+                            let mut dense = src.dense().to_vec();
+                            for (r, keep) in selected.iter().enumerate() {
+                                if *keep {
+                                    dense[r] = vals[r];
+                                }
+                            }
+                            columns[*col_idx] = Arc::new(Column::Float64(
+                                crate::storage::column::PrimitiveColumn::from_non_null(dense),
+                            ));
+                            continue;
+                        }
+                    }
                 }
             }
+
+            let computed = expr.eval_batch(batch)?;
             let dt = &schema.fields[*col_idx].data_type;
-            columns[*col_idx] = Arc::new(scalars_to_column(&values, dt)?);
+            let src = batch.column(*col_idx);
+            columns[*col_idx] = Arc::new(match splice_typed(src, &computed, &selected) {
+                Some(c) => c,
+                None => {
+                    let mut values: Vec<ScalarValue> = (0..n_rows)
+                        .map(|r| src.get(r))
+                        .collect::<FalconResult<_>>()?;
+                    for (r, keep) in selected.iter().enumerate() {
+                        if *keep {
+                            values[r] = computed[r].clone();
+                        }
+                    }
+                    scalars_to_column(&values, dt)?
+                }
+            });
         }
 
-        out.append_batch(RecordBatch::from_shared(schema.clone(), columns)?)?;
+        let new_batch = RecordBatch::from_shared(schema.clone(), columns)?;
+
+        if need_returning {
+            // Collect only the rows that were updated.
+            let mask: Vec<u64> = selected.chunks(64).map(|chunk| {
+                chunk.iter().enumerate().fold(0u64, |acc, (i, &sel)| {
+                    if sel { acc | (1u64 << i) } else { acc }
+                })
+            }).collect();
+            let updated_rows = new_batch.filter_by_bitmask(&mask)?;
+            if updated_rows.row_count() > 0 {
+                updated_batches.push(updated_rows);
+            }
+        }
+
+        out.append_batch(new_batch)?;
     }
 
-    Ok((out, changed))
+    let returning = if need_returning && !updated_batches.is_empty() {
+        let merged = merge_batches_simple(&updated_batches, table)?;
+        if is_wildcard_returning(&stmt.returning) {
+            Some(merged)
+        } else {
+            Some(project_batch(&merged, &stmt.returning)?)
+        }
+    } else {
+        None
+    };
+
+    Ok((out, changed, returning))
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -348,6 +462,93 @@ fn scalars_to_column(vals: &[ScalarValue], dt: &DataType) -> FalconResult<Column
     })
 }
 
+/// Merge multiple batches into one by concatenating row-by-row (scalar slow-path).
+/// Used only for RETURNING result sets, which are typically small.
+
+/// Overwrite the selected rows of a primitive column in place, densely.
+///
+/// The general path boxes *every* row of the target column into a `ScalarValue` —
+/// the untouched ones included — and rebuilds the column from that. It is the same
+/// shape that made joins 100x slow, and here it is paid per updated column: at 100k
+/// rows UPDATE measured 7.5 ms against DuckDB's 3.8 ms.
+///
+/// Returns `None` for anything it cannot handle — a nullable source, a type it does
+/// not list, or a computed value that is NULL or of another type — so the caller
+/// falls back and the semantics stay in one place. A NULL assignment is rare and
+/// changes the column's validity, which the dense copy here does not model.
+fn splice_typed(
+    src:      &Column,
+    computed: &[ScalarValue],
+    selected: &[bool],
+) -> Option<Column> {
+    use crate::storage::column::PrimitiveColumn;
+
+    if src.null_count() > 0 {
+        return None;
+    }
+
+    macro_rules! splice {
+        ($col:expr, $variant:ident, $extract:expr) => {{
+            let mut values = $col.dense().to_vec();
+            for (r, keep) in selected.iter().enumerate() {
+                if *keep {
+                    values[r] = $extract(&computed[r])?;
+                }
+            }
+            Some(Column::$variant(PrimitiveColumn::from_non_null(values)))
+        }};
+    }
+
+    match src {
+        Column::Int64(c) => splice!(c, Int64, |v: &ScalarValue| match v {
+            ScalarValue::Int64(Some(x)) => Some(*x),
+            _ => None,
+        }),
+        Column::Float64(c) => splice!(c, Float64, |v: &ScalarValue| match v {
+            ScalarValue::Float64(Some(x)) => Some(*x),
+            _ => None,
+        }),
+        Column::Int32(c) => splice!(c, Int32, |v: &ScalarValue| match v {
+            ScalarValue::Int32(Some(x)) => Some(*x),
+            _ => None,
+        }),
+        Column::Float32(c) => splice!(c, Float32, |v: &ScalarValue| match v {
+            ScalarValue::Float32(Some(x)) => Some(*x),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn merge_batches_simple(batches: &[RecordBatch], table: &Table) -> FalconResult<RecordBatch> {
+    if batches.len() == 1 {
+        return Ok(batches[0].clone());
+    }
+    let schema = &table.schema;
+    let total = batches.iter().map(|b| b.row_count()).sum::<usize>();
+    let mut per_col: Vec<Vec<ScalarValue>> = (0..schema.field_count())
+        .map(|_| Vec::with_capacity(total))
+        .collect();
+    for batch in batches {
+        for row in 0..batch.row_count() {
+            for col in 0..schema.field_count() {
+                per_col[col].push(batch.column(col).get(row)?);
+            }
+        }
+    }
+    let columns: FalconResult<Vec<Column>> = per_col
+        .iter()
+        .enumerate()
+        .map(|(i, vals)| scalars_to_column(vals, &schema.fields[i].data_type))
+        .collect();
+    RecordBatch::new(schema.clone(), columns?)
+}
+
+/// True when `returning` is a single `RETURNING *` wildcard sentinel.
+fn is_wildcard_returning(returning: &[SelectExpr]) -> bool {
+    matches!(returning, [se] if se.alias == "*")
+}
+
 /// Build an empty table that keeps the given schema.
 pub fn empty_like(name: &str, schema: &Schema) -> Table {
     Table::new(name, schema.clone())
@@ -366,6 +567,61 @@ mod tests {
             types::{DataType, ScalarValue},
         },
     };
+
+    /// The typed splice must produce exactly what the boxed path produces.
+    ///
+    /// It is a second implementation of the same operation, and this codebase has
+    /// already paid for two of those drifting apart, so it is pinned to the general
+    /// path rather than to a hand-written expectation.
+    #[test]
+    fn typed_splice_agrees_with_the_boxed_path() {
+        let src = ColumnBuilder::float64((0..64).map(|i| Some(i as f64)).collect());
+        let computed: Vec<ScalarValue> =
+            (0..64).map(|i| ScalarValue::Float64(Some(i as f64 * 10.0))).collect();
+        let selected: Vec<bool> = (0..64).map(|i| i % 3 == 0).collect();
+
+        let typed = splice_typed(&src, &computed, &selected)
+            .expect("a null-free Float64 column should take the typed path");
+
+        let mut values: Vec<ScalarValue> = (0..64).map(|r| src.get(r).unwrap()).collect();
+        for (r, keep) in selected.iter().enumerate() {
+            if *keep {
+                values[r] = computed[r].clone();
+            }
+        }
+        let boxed = scalars_to_column(&values, &DataType::Float64).unwrap();
+
+        assert_eq!(typed.len(), boxed.len());
+        for r in 0..typed.len() {
+            assert_eq!(typed.get(r).unwrap(), boxed.get(r).unwrap(), "row {r} differs");
+        }
+    }
+
+    /// Cases the typed splice must decline rather than guess at.
+    #[test]
+    fn typed_splice_declines_what_it_cannot_model() {
+        let selected = vec![true, false];
+
+        // Assigning NULL changes the column's validity, which the dense copy does
+        // not model — it has to fall back, not write a placeholder.
+        let src = ColumnBuilder::int64(vec![Some(1), Some(2)]);
+        let to_null = vec![ScalarValue::Int64(None), ScalarValue::Int64(Some(9))];
+        assert!(splice_typed(&src, &to_null, &selected).is_none());
+
+        // A source that already has NULLs, for the same reason.
+        let nullable = ColumnBuilder::int64(vec![None, Some(2)]);
+        let vals = vec![ScalarValue::Int64(Some(7)), ScalarValue::Int64(Some(9))];
+        assert!(splice_typed(&nullable, &vals, &selected).is_none());
+
+        // A computed value of another type must not be silently coerced.
+        let mismatched = vec![ScalarValue::Utf8(Some("x".into())), ScalarValue::Int64(Some(9))];
+        assert!(splice_typed(&src, &mismatched, &selected).is_none());
+
+        // Text is not a primitive dense column here.
+        let text = ColumnBuilder::utf8_from_str(vec![Some("a"), Some("b")]);
+        let text_vals = vec![ScalarValue::Utf8(Some("z".into())), ScalarValue::Utf8(Some("b".into()))];
+        assert!(splice_typed(&text, &text_vals, &selected).is_none());
+    }
 
     fn make_table() -> Table {
         let schema = Schema::new(vec![
@@ -405,11 +661,12 @@ mod tests {
     fn insert_appends_rows() {
         let t = make_table();
         let stmt = InsertStmt {
-            table:   "t".into(),
-            columns: vec![],
-            source:  crate::query::dml::InsertSource::Values(vec![vec![lit_i(4), lit_s("dave"), lit_f(6.0)]]),
+            table:     "t".into(),
+            columns:   vec![],
+            source:    crate::query::dml::InsertSource::Values(vec![vec![lit_i(4), lit_s("dave"), lit_f(6.0)]]),
+            returning: vec![],
         };
-        let (out, n) = execute_insert(&t, &stmt).unwrap();
+        let (out, n, _) = execute_insert(&t, &stmt).unwrap();
         assert_eq!(n, 1);
         assert_eq!(out.row_count(), 4);
     }
@@ -418,11 +675,12 @@ mod tests {
     fn insert_named_columns_fills_rest_with_null() {
         let t = make_table();
         let stmt = InsertStmt {
-            table:   "t".into(),
-            columns: vec!["id".into()],
-            source:  crate::query::dml::InsertSource::Values(vec![vec![lit_i(9)]]),
+            table:     "t".into(),
+            columns:   vec!["id".into()],
+            source:    crate::query::dml::InsertSource::Values(vec![vec![lit_i(9)]]),
+            returning: vec![],
         };
-        let (out, n) = execute_insert(&t, &stmt).unwrap();
+        let (out, n, _) = execute_insert(&t, &stmt).unwrap();
         assert_eq!(n, 1);
         assert_eq!(out.row_count(), 4);
 
@@ -435,9 +693,10 @@ mod tests {
     fn insert_arity_mismatch_errors() {
         let t = make_table();
         let stmt = InsertStmt {
-            table:   "t".into(),
-            columns: vec!["id".into(), "name".into()],
-            source:  crate::query::dml::InsertSource::Values(vec![vec![lit_i(4)]]),
+            table:     "t".into(),
+            columns:   vec!["id".into(), "name".into()],
+            source:    crate::query::dml::InsertSource::Values(vec![vec![lit_i(4)]]),
+            returning: vec![],
         };
         assert!(execute_insert(&t, &stmt).is_err());
     }
@@ -446,9 +705,10 @@ mod tests {
     fn insert_rejects_non_literal() {
         let t = make_table();
         let stmt = InsertStmt {
-            table:   "t".into(),
-            columns: vec!["id".into()],
-            source:  crate::query::dml::InsertSource::Values(vec![vec![Expr::Column("id".into())]]),
+            table:     "t".into(),
+            columns:   vec!["id".into()],
+            source:    crate::query::dml::InsertSource::Values(vec![vec![Expr::Column("id".into())]]),
+            returning: vec![],
         };
         assert!(execute_insert(&t, &stmt).is_err());
     }
@@ -458,8 +718,8 @@ mod tests {
     #[test]
     fn delete_with_filter_removes_matching() {
         let t = make_table();
-        let stmt = DeleteStmt { table: "t".into(), filter: Some(gt("score", 8.0)) };
-        let (out, n) = execute_delete(&t, &stmt).unwrap();
+        let stmt = DeleteStmt { table: "t".into(), filter: Some(gt("score", 8.0)), returning: vec![] };
+        let (out, n, _) = execute_delete(&t, &stmt).unwrap();
         assert_eq!(n, 2, "9.5 and 8.5 should go");
         assert_eq!(out.row_count(), 1);
         assert_eq!(
@@ -471,8 +731,8 @@ mod tests {
     #[test]
     fn delete_without_filter_empties_table() {
         let t = make_table();
-        let stmt = DeleteStmt { table: "t".into(), filter: None };
-        let (out, n) = execute_delete(&t, &stmt).unwrap();
+        let stmt = DeleteStmt { table: "t".into(), filter: None, returning: vec![] };
+        let (out, n, _) = execute_delete(&t, &stmt).unwrap();
         assert_eq!(n, 3);
         assert_eq!(out.row_count(), 0);
     }
@@ -480,8 +740,8 @@ mod tests {
     #[test]
     fn delete_matching_nothing_keeps_all() {
         let t = make_table();
-        let stmt = DeleteStmt { table: "t".into(), filter: Some(gt("score", 1000.0)) };
-        let (out, n) = execute_delete(&t, &stmt).unwrap();
+        let stmt = DeleteStmt { table: "t".into(), filter: Some(gt("score", 1000.0)), returning: vec![] };
+        let (out, n, _) = execute_delete(&t, &stmt).unwrap();
         assert_eq!(n, 0);
         assert_eq!(out.row_count(), 3);
     }
@@ -495,8 +755,9 @@ mod tests {
             table:       "t".into(),
             assignments: vec![("score".into(), lit_f(0.0))],
             filter:      Some(gt("score", 8.0)),
+            returning:   vec![],
         };
-        let (out, n) = execute_update(&t, &stmt).unwrap();
+        let (out, n, _) = execute_update(&t, &stmt).unwrap();
         assert_eq!(n, 2);
 
         let scores = out.batches[0].column_by_name("score").unwrap();
@@ -512,8 +773,9 @@ mod tests {
             table:       "t".into(),
             assignments: vec![("name".into(), lit_s("x"))],
             filter:      None,
+            returning:   vec![],
         };
-        let (out, n) = execute_update(&t, &stmt).unwrap();
+        let (out, n, _) = execute_update(&t, &stmt).unwrap();
         assert_eq!(n, 3);
         let names = out.batches[0].column_by_name("name").unwrap();
         for row in 0..3 {
@@ -524,7 +786,6 @@ mod tests {
     #[test]
     fn update_can_reference_other_columns() {
         let t = make_table();
-        // SET score = score + 1
         let stmt = UpdateStmt {
             table:       "t".into(),
             assignments: vec![(
@@ -535,9 +796,10 @@ mod tests {
                     right: Box::new(lit_f(1.0)),
                 },
             )],
-            filter: None,
+            filter:    None,
+            returning: vec![],
         };
-        let (out, n) = execute_update(&t, &stmt).unwrap();
+        let (out, n, _) = execute_update(&t, &stmt).unwrap();
         assert_eq!(n, 3);
         let scores = out.batches[0].column_by_name("score").unwrap();
         assert_eq!(scores.get(0).unwrap(), ScalarValue::Float64(Some(10.5)));
@@ -551,6 +813,7 @@ mod tests {
             table:       "t".into(),
             assignments: vec![("nope".into(), lit_i(1))],
             filter:      None,
+            returning:   vec![],
         };
         assert!(execute_update(&t, &stmt).is_err());
     }

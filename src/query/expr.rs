@@ -1,9 +1,15 @@
 use std::fmt;
 
+use rayon::prelude::*;
+
 use crate::storage::{
     table::RecordBatch,
     types::{FalconError, FalconResult, ScalarValue},
 };
+
+/// Minimum number of u64 mask words (= rows / 64) to justify parallel mask computation.
+/// 4096 words = 262,144 rows — below this, rayon scheduling overhead dominates.
+const PAR_MASK_WORDS: usize = 4096;
 
 /// Wrapper so `Expr` can keep deriving `Debug`/`PartialEq` without requiring the
 /// whole plan tree to implement them.
@@ -197,6 +203,71 @@ impl fmt::Display for Expr {
 
 impl Expr {
     /// Evaluate this expression against a batch, returning one ScalarValue per row.
+    /// Evaluate into a dense column, without a `ScalarValue` per row.
+    ///
+    /// `eval_batch` boxes every value into a 48-byte enum. That has turned up as the
+    /// dominant cost in four separate operators — the join, DISTINCT, window ORDER
+    /// BY and UPDATE — each of which grew its own local workaround. This is the
+    /// shared version.
+    ///
+    /// Returns `None` for anything it does not cover, so callers keep `eval_batch`
+    /// as the fallback and there is exactly one definition of what an expression
+    /// means. Handled here: a plain column reference, a literal, and arithmetic over
+    /// two f64 operands — the shapes that actually appear in hot paths.
+    ///
+    /// NULLs bail out rather than being modelled: arithmetic on a NULL yields NULL,
+    /// which needs a validity mask the dense form here does not carry, and guessing
+    /// at it would change query results rather than just timings.
+    pub fn eval_dense_f64(&self, batch: &RecordBatch) -> Option<Vec<f64>> {
+        use crate::storage::column::Column;
+
+        match self {
+            Expr::Column(name) => {
+                let col = batch.column_by_name(name).ok()?;
+                if col.null_count() > 0 {
+                    return None;
+                }
+                match col {
+                    Column::Float64(c) => Some(c.dense().to_vec()),
+                    Column::Int64(c) => Some(c.dense().iter().map(|&v| v as f64).collect()),
+                    Column::Int32(c) => Some(c.dense().iter().map(|&v| v as f64).collect()),
+                    Column::Float32(c) => Some(c.dense().iter().map(|&v| v as f64).collect()),
+                    _ => None,
+                }
+            }
+
+            Expr::Literal(ScalarValue::Float64(Some(v))) => {
+                Some(vec![*v; batch.row_count()])
+            }
+            Expr::Literal(ScalarValue::Int64(Some(v))) => {
+                Some(vec![*v as f64; batch.row_count()])
+            }
+
+            Expr::BinaryOp { left, op, right } => {
+                let f: fn(f64, f64) -> f64 = match op {
+                    BinaryOp::Add => |a, b| a + b,
+                    BinaryOp::Sub => |a, b| a - b,
+                    BinaryOp::Mul => |a, b| a * b,
+                    // Division by zero gives an infinity here, matching what the
+                    // boxed path produces for f64 rather than inventing an error.
+                    BinaryOp::Div => |a, b| a / b,
+                    _ => return None,
+                };
+                let mut l = left.eval_dense_f64(batch)?;
+                let r = right.eval_dense_f64(batch)?;
+                if l.len() != r.len() {
+                    return None;
+                }
+                for (a, b) in l.iter_mut().zip(r) {
+                    *a = f(*a, b);
+                }
+                Some(l)
+            }
+
+            _ => None,
+        }
+    }
+
     pub fn eval_batch(&self, batch: &RecordBatch) -> FalconResult<Vec<ScalarValue>> {
         match self {
             Expr::Literal(val) => {
@@ -787,6 +858,36 @@ fn zip_bits(dst: &mut [u64], src: &[u64], f: impl Fn(u64, u64) -> u64) {
     for (d, &s) in dst.iter_mut().zip(src.iter()) { *d = f(*d, s); }
 }
 
+/// Parallel version of `cmp_dense_f64_simd` — splits mask into N coarse chunks
+/// (one per rayon thread, minimum 1024 words = 65,536 rows per chunk) and runs
+/// each chunk with the existing AVX2 function. One rayon task per chunk.
+fn par_cmp_dense_f64(dense: &[f64], v: f64, op: &BinaryOp, mask: &mut [u64]) -> FalconResult<()> {
+    let n_words    = mask.len();
+    let chunk_words = (n_words / 8).max(1024); // ≤ 8 tasks, each ≥ 65k rows
+    mask.par_chunks_mut(chunk_words)
+        .enumerate()
+        .try_for_each(|(ci, word_chunk)| {
+            let start_row = ci * chunk_words * 64;
+            let end_row   = (start_row + word_chunk.len() * 64).min(dense.len());
+            if start_row >= dense.len() { return Ok(()); }
+            cmp_dense_f64_simd(&dense[start_row..end_row], v, op, word_chunk)
+        })
+}
+
+/// Parallel version of `cmp_dense_i64_simd`.
+fn par_cmp_dense_i64(dense: &[i64], v: i64, op: &BinaryOp, mask: &mut [u64]) -> FalconResult<()> {
+    let n_words     = mask.len();
+    let chunk_words = (n_words / 8).max(1024);
+    mask.par_chunks_mut(chunk_words)
+        .enumerate()
+        .try_for_each(|(ci, word_chunk)| {
+            let start_row = ci * chunk_words * 64;
+            let end_row   = (start_row + word_chunk.len() * 64).min(dense.len());
+            if start_row >= dense.len() { return Ok(()); }
+            cmp_dense_i64_simd(&dense[start_row..end_row], v, op, word_chunk)
+        })
+}
+
 fn swap_cmp_op(op: &BinaryOp) -> Option<BinaryOp> {
     Some(match op {
         BinaryOp::Gt    => BinaryOp::Lt,
@@ -817,34 +918,44 @@ fn fast_cmp_mask(
         }};
     }
 
+    macro_rules! cmp_f64 {
+        ($c:expr, $v:expr) => {{
+            if n_words >= PAR_MASK_WORDS {
+                par_cmp_dense_f64($c.dense(), $v, op, &mut mask)?;
+            } else {
+                cmp_dense_f64_simd($c.dense(), $v, op, &mut mask)?;
+            }
+            clear_null_bits($c, &mut mask);
+        }};
+    }
+    macro_rules! cmp_i64 {
+        ($c:expr, $v:expr) => {{
+            if n_words >= PAR_MASK_WORDS {
+                par_cmp_dense_i64($c.dense(), $v, op, &mut mask)?;
+            } else {
+                cmp_dense_i64_simd($c.dense(), $v, op, &mut mask)?;
+            }
+            clear_null_bits($c, &mut mask);
+        }};
+    }
+
     match (col, lit) {
-        // Float64 — SIMD path via wide::f64x4
-        (Column::Float64(c), ScalarValue::Float64(Some(v))) => {
-            cmp_dense_f64_simd(c.dense(), *v, op, &mut mask)?;
-            clear_null_bits(c, &mut mask);
-        }
-        (Column::Float64(c), ScalarValue::Int64(Some(v))) => {
-            cmp_dense_f64_simd(c.dense(), *v as f64, op, &mut mask)?;
-            clear_null_bits(c, &mut mask);
-        }
-        (Column::Float64(c), ScalarValue::Int32(Some(v))) => {
-            cmp_dense_f64_simd(c.dense(), *v as f64, op, &mut mask)?;
-            clear_null_bits(c, &mut mask);
-        }
-        // Int64 — SIMD path via wide::i64x4
-        (Column::Int64(c), ScalarValue::Int64(Some(v))) => {
-            cmp_dense_i64_simd(c.dense(), *v, op, &mut mask)?;
-            clear_null_bits(c, &mut mask);
-        }
-        (Column::Int64(c), ScalarValue::Int32(Some(v))) => {
-            cmp_dense_i64_simd(c.dense(), *v as i64, op, &mut mask)?;
-            clear_null_bits(c, &mut mask);
-        }
+        // Float64 — SIMD path, optionally parallel for large batches
+        (Column::Float64(c), ScalarValue::Float64(Some(v))) => { cmp_f64!(c, *v); }
+        (Column::Float64(c), ScalarValue::Int64(Some(v)))   => { cmp_f64!(c, *v as f64); }
+        (Column::Float64(c), ScalarValue::Int32(Some(v)))   => { cmp_f64!(c, *v as f64); }
+        // Int64 — SIMD path, optionally parallel
+        (Column::Int64(c), ScalarValue::Int64(Some(v)))  => { cmp_i64!(c, *v); }
+        (Column::Int64(c), ScalarValue::Int32(Some(v)))  => { cmp_i64!(c, *v as i64); }
         (Column::Int64(c), ScalarValue::Float64(Some(v))) => {
             // Widen i64 → f64, then use SIMD f64 comparison.
             let dense = c.dense();
             let widened: Vec<f64> = dense.iter().map(|&x| x as f64).collect();
-            cmp_dense_f64_simd(&widened, *v, op, &mut mask)?;
+            if n_words >= PAR_MASK_WORDS {
+                par_cmp_dense_f64(&widened, *v, op, &mut mask)?;
+            } else {
+                cmp_dense_f64_simd(&widened, *v, op, &mut mask)?;
+            }
             clear_null_bits(c, &mut mask);
         }
         (Column::Int32(c),     ScalarValue::Int32(Some(v)))     => cmp_loop!(c, *v, i32),
@@ -1133,6 +1244,276 @@ fn eval_function(name: &str, args: &[&ScalarValue]) -> FalconResult<ScalarValue>
                 _ => Ok(ScalarValue::Null),
             }
         }
+        "GREATEST" => {
+            let non_null: Vec<_> = args.iter().filter(|v| !v.is_null()).collect();
+            if non_null.is_empty() { return Ok(ScalarValue::Null); }
+            Ok(non_null.into_iter()
+                .max_by(|a, b| {
+                    let fa = a.as_f64().unwrap_or(f64::NEG_INFINITY);
+                    let fb = b.as_f64().unwrap_or(f64::NEG_INFINITY);
+                    fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|v| (*v).clone())
+                .unwrap_or(ScalarValue::Null))
+        }
+        "LEAST" => {
+            let non_null: Vec<_> = args.iter().filter(|v| !v.is_null()).collect();
+            if non_null.is_empty() { return Ok(ScalarValue::Null); }
+            Ok(non_null.into_iter()
+                .min_by(|a, b| {
+                    let fa = a.as_f64().unwrap_or(f64::INFINITY);
+                    let fb = b.as_f64().unwrap_or(f64::INFINITY);
+                    fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|v| (*v).clone())
+                .unwrap_or(ScalarValue::Null))
+        }
+        "REPLACE" => {
+            let s    = str_arg(args, 0)?;
+            let from = str_arg(args, 1)?;
+            let to   = str_arg(args, 2)?;
+            Ok(match (s, from, to) {
+                (Some(s), Some(f), Some(t)) => ScalarValue::Utf8(Some(s.replace(f, t))),
+                _ => ScalarValue::Null,
+            })
+        }
+        "LPAD" => {
+            let s   = str_arg(args, 0)?;
+            let len = if args.len() > 1 { num_arg(args, 1)? as usize } else { 0 };
+            let pad = if args.len() > 2 { str_arg(args, 2)? } else { Some(" ") };
+            Ok(match (s, pad) {
+                (Some(s), Some(p)) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() >= len {
+                        ScalarValue::Utf8(Some(chars[..len].iter().collect()))
+                    } else {
+                        let deficit = len - chars.len();
+                        let pad_chars: Vec<char> = p.chars().collect();
+                        if pad_chars.is_empty() {
+                            ScalarValue::Utf8(Some(s.to_string()))
+                        } else {
+                            let prefix: String = pad_chars.iter().cycle().take(deficit).collect();
+                            ScalarValue::Utf8(Some(format!("{prefix}{s}")))
+                        }
+                    }
+                }
+                _ => ScalarValue::Null,
+            })
+        }
+        "RPAD" => {
+            let s   = str_arg(args, 0)?;
+            let len = if args.len() > 1 { num_arg(args, 1)? as usize } else { 0 };
+            let pad = if args.len() > 2 { str_arg(args, 2)? } else { Some(" ") };
+            Ok(match (s, pad) {
+                (Some(s), Some(p)) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() >= len {
+                        ScalarValue::Utf8(Some(chars[..len].iter().collect()))
+                    } else {
+                        let deficit = len - chars.len();
+                        let pad_chars: Vec<char> = p.chars().collect();
+                        if pad_chars.is_empty() {
+                            ScalarValue::Utf8(Some(s.to_string()))
+                        } else {
+                            let suffix: String = pad_chars.iter().cycle().take(deficit).collect();
+                            ScalarValue::Utf8(Some(format!("{s}{suffix}")))
+                        }
+                    }
+                }
+                _ => ScalarValue::Null,
+            })
+        }
+        "REPEAT" => {
+            let s = str_arg(args, 0)?;
+            let n = num_arg(args, 1)? as usize;
+            Ok(match s {
+                Some(v) => ScalarValue::Utf8(Some(v.repeat(n))),
+                None => ScalarValue::Null,
+            })
+        }
+        "STRPOS" | "POSITION" => {
+            // STRPOS(string, substring) — returns 1-based position, 0 if not found
+            let s   = str_arg(args, 0)?;
+            let sub = str_arg(args, 1)?;
+            Ok(match (s, sub) {
+                (Some(s), Some(sub)) => {
+                    let pos = s.find(sub).map(|b| s[..b].chars().count() + 1).unwrap_or(0);
+                    ScalarValue::Int64(Some(pos as i64))
+                }
+                _ => ScalarValue::Null,
+            })
+        }
+        "REVERSE" => {
+            let s = str_arg(args, 0)?;
+            Ok(match s {
+                Some(v) => ScalarValue::Utf8(Some(v.chars().rev().collect())),
+                None => ScalarValue::Null,
+            })
+        }
+        "LN" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.ln()))).unwrap_or(ScalarValue::Null))
+        }
+        "LOG" | "LOG10" => {
+            let base = if name.eq_ignore_ascii_case("log") && args.len() > 1 {
+                float_arg(args, 0)?
+            } else {
+                Some(10.0f64)
+            };
+            let v = if name.eq_ignore_ascii_case("log") && args.len() > 1 {
+                float_arg(args, 1)?
+            } else {
+                float_arg(args, 0)?
+            };
+            Ok(match (base, v) {
+                (Some(b), Some(x)) => ScalarValue::Float64(Some(x.log(b))),
+                _ => ScalarValue::Null,
+            })
+        }
+        "LOG2" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.log2()))).unwrap_or(ScalarValue::Null))
+        }
+        "EXP" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.exp()))).unwrap_or(ScalarValue::Null))
+        }
+        "MOD" => {
+            let a = float_arg(args, 0)?;
+            let b = float_arg(args, 1)?;
+            Ok(match (a, b) {
+                (Some(x), Some(y)) if y != 0.0 => ScalarValue::Float64(Some(x % y)),
+                _ => ScalarValue::Null,
+            })
+        }
+        "CHR" => {
+            let n = num_arg(args, 0)?;
+            let c = char::from_u32(n as u32).unwrap_or('?');
+            Ok(ScalarValue::Utf8(Some(c.to_string())))
+        }
+        "ASCII" => {
+            let s = str_arg(args, 0)?;
+            Ok(match s {
+                Some(v) => ScalarValue::Int64(Some(v.chars().next().map(|c| c as i64).unwrap_or(0))),
+                None => ScalarValue::Null,
+            })
+        }
+        "SPLIT_PART" => {
+            let s   = str_arg(args, 0)?;
+            let sep = str_arg(args, 1)?;
+            let n   = num_arg(args, 2)? as usize;
+            Ok(match (s, sep) {
+                (Some(s), Some(sep)) => {
+                    let part = s.split(sep).nth(n.saturating_sub(1))
+                        .map(|p| ScalarValue::Utf8(Some(p.to_string())))
+                        .unwrap_or(ScalarValue::Utf8(Some(String::new())));
+                    part
+                }
+                _ => ScalarValue::Null,
+            })
+        }
+        "PI" => Ok(ScalarValue::Float64(Some(std::f64::consts::PI))),
+        "E"  => Ok(ScalarValue::Float64(Some(std::f64::consts::E))),
+        "SIN" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.sin()))).unwrap_or(ScalarValue::Null))
+        }
+        "COS" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.cos()))).unwrap_or(ScalarValue::Null))
+        }
+        "TAN" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.tan()))).unwrap_or(ScalarValue::Null))
+        }
+        "ASIN" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.asin()))).unwrap_or(ScalarValue::Null))
+        }
+        "ACOS" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.acos()))).unwrap_or(ScalarValue::Null))
+        }
+        "ATAN" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.atan()))).unwrap_or(ScalarValue::Null))
+        }
+        "ATAN2" => {
+            let y = float_arg(args, 0)?;
+            let x = float_arg(args, 1)?;
+            Ok(match (y, x) {
+                (Some(y), Some(x)) => ScalarValue::Float64(Some(y.atan2(x))),
+                _ => ScalarValue::Null,
+            })
+        }
+        "DEGREES" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.to_degrees()))).unwrap_or(ScalarValue::Null))
+        }
+        "RADIANS" => {
+            let v = float_arg(args, 0)?;
+            Ok(v.map(|x| ScalarValue::Float64(Some(x.to_radians()))).unwrap_or(ScalarValue::Null))
+        }
+        "TRUNC" | "TRUNCATE" => {
+            let v = float_arg(args, 0)?;
+            let decimals = if args.len() > 1 { num_arg(args, 1)? as i32 } else { 0 };
+            Ok(match v {
+                None => ScalarValue::Null,
+                Some(x) => {
+                    let factor = 10f64.powi(decimals);
+                    ScalarValue::Float64(Some((x * factor).trunc() / factor))
+                }
+            })
+        }
+        "INITCAP" => {
+            let s = str_arg(args, 0)?;
+            Ok(match s {
+                Some(v) => {
+                    let result: String = v.split_whitespace()
+                        .map(|word| {
+                            let mut c = word.chars();
+                            match c.next() {
+                                None => String::new(),
+                                Some(f) => f.to_uppercase().to_string() + &c.as_str().to_lowercase(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ScalarValue::Utf8(Some(result))
+                }
+                None => ScalarValue::Null,
+            })
+        }
+        "LEFT" => {
+            let s = str_arg(args, 0)?;
+            let n = num_arg(args, 1)? as usize;
+            Ok(match s {
+                Some(v) => ScalarValue::Utf8(Some(v.chars().take(n).collect())),
+                None => ScalarValue::Null,
+            })
+        }
+        "RIGHT" => {
+            let s = str_arg(args, 0)?;
+            let n = num_arg(args, 1)? as usize;
+            Ok(match s {
+                Some(v) => {
+                    let chars: Vec<char> = v.chars().collect();
+                    let start = chars.len().saturating_sub(n);
+                    ScalarValue::Utf8(Some(chars[start..].iter().collect()))
+                }
+                None => ScalarValue::Null,
+            })
+        }
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+            let s = str_arg(args, 0)?;
+            Ok(s.map(|v| ScalarValue::Int64(Some(v.chars().count() as i64)))
+               .unwrap_or(ScalarValue::Null))
+        }
+        "OCTET_LENGTH" | "BYTE_LENGTH" => {
+            let s = str_arg(args, 0)?;
+            Ok(s.map(|v| ScalarValue::Int64(Some(v.len() as i64)))
+               .unwrap_or(ScalarValue::Null))
+        }
         // Not a built-in — try the user-defined function registry before giving up.
         other => match crate::query::udf::call(other, args) {
             Some(result) => result,
@@ -1278,6 +1659,76 @@ fn apply_binary_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dense evaluator must agree with `eval_batch`, value for value.
+    ///
+    /// It is a second definition of what an expression means, and this codebase has
+    /// already paid twice for two implementations of one thing drifting apart, so it
+    /// is pinned to the original rather than to a hand-written expectation.
+    #[test]
+    fn dense_eval_agrees_with_eval_batch() {
+        use crate::storage::{column::ColumnBuilder, schema::{Field, Schema}, types::DataType};
+
+        let schema = Schema::new(vec![
+            Field::required("a", DataType::Float64),
+            Field::required("b", DataType::Int64),
+        ]);
+        let batch = RecordBatch::new(schema, vec![
+            ColumnBuilder::float64((0..97).map(|i| Some(i as f64 - 40.0)).collect()),
+            ColumnBuilder::int64((0..97).map(|i| Some(i as i64 * 3)).collect()),
+        ]).unwrap();
+
+        let exprs = vec![
+            Expr::Column("a".into()),
+            Expr::Column("b".into()),
+            Expr::BinaryOp {
+                left:  Box::new(Expr::Column("a".into())),
+                op:    BinaryOp::Add,
+                right: Box::new(Expr::Literal(ScalarValue::Float64(Some(1.5)))),
+            },
+            Expr::BinaryOp {
+                left:  Box::new(Expr::Column("a".into())),
+                op:    BinaryOp::Mul,
+                right: Box::new(Expr::Column("b".into())),
+            },
+        ];
+
+        for e in &exprs {
+            let dense = e.eval_dense_f64(&batch).expect("should take the dense path");
+            let boxed = e.eval_batch(&batch).unwrap();
+            assert_eq!(dense.len(), boxed.len());
+            for (i, (d, b)) in dense.iter().zip(&boxed).enumerate() {
+                let bv = b.as_f64().expect("numeric");
+                assert!((d - bv).abs() < 1e-9, "row {i}: dense {d} vs boxed {bv} for {e:?}");
+            }
+        }
+    }
+
+    /// Shapes the dense evaluator must decline instead of approximating.
+    #[test]
+    fn dense_eval_declines_nulls_and_non_numeric() {
+        use crate::storage::{column::ColumnBuilder, schema::{Field, Schema}, types::DataType};
+
+        let schema = Schema::new(vec![
+            Field::nullable("a", DataType::Float64),
+            Field::required("s", DataType::Utf8),
+        ]);
+        let batch = RecordBatch::new(schema, vec![
+            ColumnBuilder::float64(vec![Some(1.0), None, Some(3.0)]),
+            ColumnBuilder::utf8_from_str(vec![Some("x"), Some("y"), Some("z")]),
+        ]).unwrap();
+
+        // A NULL makes the result NULL, which needs a validity mask this form has not got.
+        assert!(Expr::Column("a".into()).eval_dense_f64(&batch).is_none());
+        // Text is not numeric.
+        assert!(Expr::Column("s".into()).eval_dense_f64(&batch).is_none());
+        // A comparison is not arithmetic; predicates have their own mask evaluator.
+        assert!(Expr::BinaryOp {
+            left:  Box::new(Expr::Column("s".into())),
+            op:    BinaryOp::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Float64(Some(0.0)))),
+        }.eval_dense_f64(&batch).is_none());
+    }
     use crate::storage::{
         column::ColumnBuilder,
         schema::{Field, Schema},

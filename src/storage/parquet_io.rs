@@ -7,10 +7,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::{
-    array::{
-        Array, ArrayRef, BooleanArray, Float32Array, Float64Array,
-        Int32Array, Int64Array, StringArray,
-    },
+    array::{Array, ArrayRef, BooleanArray, Float32Array, Float64Array,
+            Int32Array, Int64Array, StringArray},
     datatypes::{DataType as ArrowDT, Field as ArrowField, Schema as ArrowSchema},
     record_batch::RecordBatch as ArrowBatch,
 };
@@ -118,8 +116,12 @@ pub(crate) fn batch_to_arrow(batch: &RecordBatch) -> FalconResult<ArrowBatch> {
 fn arrow_dt_to_falcon(dt: &ArrowDT) -> FalconResult<DataType> {
     Ok(match dt {
         ArrowDT::Boolean   => DataType::Boolean,
-        ArrowDT::Int32     => DataType::Int32,
-        ArrowDT::Int64     => DataType::Int64,
+        // Narrow integer types widen to Int32/Int64 (no data loss for stored values).
+        ArrowDT::Int8 | ArrowDT::Int16 | ArrowDT::Int32 => DataType::Int32,
+        ArrowDT::Int64  => DataType::Int64,
+        // Unsigned ints: UInt8/16/32 → Int32 (safe within SQL range), UInt64 → Int64.
+        ArrowDT::UInt8 | ArrowDT::UInt16 | ArrowDT::UInt32 => DataType::Int32,
+        ArrowDT::UInt64 => DataType::Int64,
         ArrowDT::Float32   => DataType::Float32,
         ArrowDT::Float64   => DataType::Float64,
         ArrowDT::Utf8 | ArrowDT::LargeUtf8 => DataType::Utf8,
@@ -148,18 +150,32 @@ fn arrow_array_to_falcon(arr: &dyn Array, dt: &DataType) -> FalconResult<Column>
             )
         }
         DataType::Int32 => {
-            let a = arr.as_any().downcast_ref::<Int32Array>()
-                .ok_or_else(|| FalconError::InvalidQuery("expected Int32Array".into()))?;
-            ColumnBuilder::int32(
-                (0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i)) }).collect()
-            )
+            use arrow::array::{Int8Array, Int16Array, UInt8Array, UInt16Array, UInt32Array};
+            if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
+                ColumnBuilder::int32((0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i)) }).collect())
+            } else if let Some(a) = arr.as_any().downcast_ref::<Int16Array>() {
+                ColumnBuilder::int32((0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i) as i32) }).collect())
+            } else if let Some(a) = arr.as_any().downcast_ref::<Int8Array>() {
+                ColumnBuilder::int32((0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i) as i32) }).collect())
+            } else if let Some(a) = arr.as_any().downcast_ref::<UInt8Array>() {
+                ColumnBuilder::int32((0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i) as i32) }).collect())
+            } else if let Some(a) = arr.as_any().downcast_ref::<UInt16Array>() {
+                ColumnBuilder::int32((0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i) as i32) }).collect())
+            } else if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
+                ColumnBuilder::int32((0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i) as i32) }).collect())
+            } else {
+                return Err(FalconError::InvalidQuery("expected Int32-compatible array".into()));
+            }
         }
         DataType::Int64 => {
-            let a = arr.as_any().downcast_ref::<Int64Array>()
-                .ok_or_else(|| FalconError::InvalidQuery("expected Int64Array".into()))?;
-            ColumnBuilder::int64(
-                (0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i)) }).collect()
-            )
+            use arrow::array::UInt64Array;
+            if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                ColumnBuilder::int64((0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i)) }).collect())
+            } else if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
+                ColumnBuilder::int64((0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i) as i64) }).collect())
+            } else {
+                return Err(FalconError::InvalidQuery("expected Int64-compatible array".into()));
+            }
         }
         DataType::Float32 => {
             let a = arr.as_any().downcast_ref::<Float32Array>()
@@ -176,6 +192,7 @@ fn arrow_array_to_falcon(arr: &dyn Array, dt: &DataType) -> FalconResult<Column>
             )
         }
         DataType::Utf8 => {
+            use arrow::array::LargeStringArray;
             let vals: Vec<Option<String>> = if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
                 (0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i).to_string()) }).collect()
             } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
@@ -429,6 +446,27 @@ pub fn read_parquet_projected(
     let per_group: FalconResult<Vec<Vec<RecordBatch>>> = (0..n_groups)
         .into_par_iter()
         .map(|g| -> FalconResult<Vec<RecordBatch>> {
+            // Batch size is deliberately left at the arrow-rs default of 1024, which
+            // makes a Parquet load land as many small batches (1M rows -> 977).
+            //
+            // That looks wrong — the engine's per-batch thresholds are written
+            // against DEFAULT_BATCH_SIZE (65_536), so at 1024 the intra-batch
+            // parallel kernels never engage — and setting `.with_batch_size(
+            // Table::DEFAULT_BATCH_SIZE)` here was tried. It is 8x slower:
+            //
+            //   full_scan/1M     170us -> 1.58ms   (+828%)
+            //   group_by/1M     1.00ms -> 3.23ms   (+221%)
+            //   full_scan/100k  63.4us -> 131us    (+107%)
+            //   filter_where/1M 1.48ms -> 2.68ms    (+81%)
+            //
+            // The engine gets its parallelism from having *many batches to fan out
+            // over* (`AGG_PARALLEL_THRESHOLD` = 32 batches), not from splitting one
+            // big batch. 1M rows as 977 batches spreads across every core; as 16
+            // batches it falls under the threshold and runs serially. Small batches
+            // also keep each column slice inside L2 for the whole pass.
+            //
+            // Raise this only together with the inter-batch strategy in
+            // `query::aggregate`, and measure `full_scan/1M` before believing it.
             let reader = ParquetRecordBatchReaderBuilder::try_new(open()?)
                 .map_err(|e| FalconError::InvalidQuery(e.to_string()))?
                 .with_projection(mask.clone())

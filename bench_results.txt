@@ -1,0 +1,798 @@
+﻿cargo :     Blocking waiting for file lock on build directory
+At line:1 char:463
++ ... \falcondb"; cargo bench --bench query_bench > bench_results.txt 2>&1; ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Blocking wa...build directory:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Finished `bench` profile [optimized] target(s) in 2m 42s
+     Running benches\query_bench.rs (E:\rust-target\release\deps\query_bench-bf1d9f8376b42a6c.exe)
+Gnuplot not found, using plotters backend
+Benchmarking full_scan/falcondb/10000
+Benchmarking full_scan/falcondb/10000: Warming up for 3.0000 s
+Benchmarking full_scan/falcondb/10000: Collecting 100 samples in estimated 5.0411 s (81k iterations)
+Benchmarking full_scan/falcondb/10000: Analyzing
+full_scan/falcondb/10000
+                        time:   [66.693 µs 81.126 µs 103.48 µs]
+                        thrpt:  [96.639 Melem/s 123.27 Melem/s 149.94 Melem/s]
+                 change:
+                        time:   [+3.2448% +12.388% +24.566%] (p = 0.02 < 0.05)
+                        thrpt:  [-19.721% -11.023% -3.1428%]
+                        Performance has regressed.
+Found 14 outliers among 100 measurements (14.00%)
+  2 (2.00%) low severe
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+  9 (9.00%) high severe
+Benchmarking full_scan/polars/10000
+Benchmarking full_scan/polars/10000: Warming up for 3.0000 s
+Benchmarking full_scan/polars/10000: Collecting 100 samples in estimated 5.3144 s (25k iterations)
+Benchmarking full_scan/polars/10000: Analyzing
+full_scan/polars/10000  time:   [210.31 µs 258.58 µs 323.43 µs]
+                        thrpt:  [30.919 Melem/s 38.672 Melem/s 47.550 Melem/s]
+                 change:
+                        time:   [-0.5008% +10.184% +22.052%] (p = 0.11 > 0.05)
+                        thrpt:  [-18.068% -9.2426% +0.5033%]
+                        No change in performance detected.
+Found 9 outliers among 100 measurements (9.00%)
+  3 (3.00%) high mild
+  6 (6.00%) high severe
+Benchmarking full_scan/duckdb/10000
+Benchmarking full_scan/duckdb/10000: Warming up for 3.0000 s
+Benchmarking full_scan/duckdb/10000: Collecting 100 samples in estimated 5.7647 s (20k iterations)
+Benchmarking full_scan/duckdb/10000: Analyzing
+full_scan/duckdb/10000  time:   [314.08 µs 325.67 µs 341.06 µs]
+                        thrpt:  [29.320 Melem/s 30.706 Melem/s 31.839 Melem/s]
+                 change:
+                        time:   [+16.900% +31.231% +47.511%] (p = 0.00 < 0.05)
+                        thrpt:  [-32.208% -23.798% -14.457%]
+                        Performance has regressed.
+Found 11 outliers among 100 measurements (11.00%)
+  11 (11.00%) high severe
+Benchmarking full_scan/datafusion/10000
+Benchmarking full_scan/datafusion/10000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.9s, enable flat sampling, or
+ reduce sample count to 50.
+Benchmarking full_scan/datafusion/10000: Collecting 100 samples in estimated 7.9333 s (5050 iterations)
+Benchmarking full_scan/datafusion/10000: Analyzing
+full_scan/datafusion/10000
+                        time:   [2.4794 ms 2.6482 ms 2.8648 ms]
+                        thrpt:  [3.4906 Melem/s 3.7762 Melem/s 4.0333 Melem/s]
+                 change:
+                        time:   [+5.0451% +26.339% +49.792%] (p = 0.00 < 0.05)
+                        thrpt:  [-33.241% -20.848% -4.8028%]
+                        Performance has regressed.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking full_scan/falcondb/100000
+Benchmarking full_scan/falcondb/100000: Warming up for 3.0000 s
+Benchmarking full_scan/falcondb/100000: Collecting 100 samples in estimated 5.1792 s (25k iterations)
+Benchmarking full_scan/falcondb/100000: Analyzing
+full_scan/falcondb/100000
+                        time:   [91.957 µs 92.847 µs 93.682 µs]
+                        thrpt:  [1.0674 Gelem/s 1.0770 Gelem/s 1.0875 Gelem/s]
+                 change:
+                        time:   [-25.298% -10.548% +1.3788%] (p = 0.25 > 0.05)
+                        thrpt:  [-1.3600% +11.791% +33.865%]
+                        No change in performance detected.
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking full_scan/polars/100000
+Benchmarking full_scan/polars/100000: Warming up for 3.0000 s
+Benchmarking full_scan/polars/100000: Collecting 100 samples in estimated 5.6716 s (15k iterations)
+Benchmarking full_scan/polars/100000: Analyzing
+full_scan/polars/100000 time:   [390.49 µs 423.59 µs 469.77 µs]
+                        thrpt:  [212.87 Melem/s 236.08 Melem/s 256.09 Melem/s]
+                 change:
+                        time:   [+7.7078% +26.279% +51.064%] (p = 0.00 < 0.05)
+                        thrpt:  [-33.803% -20.810% -7.1562%]
+                        Performance has regressed.
+Found 12 outliers among 100 measurements (12.00%)
+  5 (5.00%) high mild
+  7 (7.00%) high severe
+Benchmarking full_scan/duckdb/100000
+Benchmarking full_scan/duckdb/100000: Warming up for 3.0000 s
+Benchmarking full_scan/duckdb/100000: Collecting 100 samples in estimated 6.8735 s (15k iterations)
+Benchmarking full_scan/duckdb/100000: Analyzing
+full_scan/duckdb/100000 time:   [466.28 µs 491.46 µs 522.02 µs]
+                        thrpt:  [191.57 Melem/s 203.47 Melem/s 214.46 Melem/s]
+                 change:
+                        time:   [-10.991% -1.5374% +8.7490%] (p = 0.76 > 0.05)
+                        thrpt:  [-8.0451% +1.5614% +12.348%]
+                        No change in performance detected.
+Found 12 outliers among 100 measurements (12.00%)
+  4 (4.00%) high mild
+  8 (8.00%) high severe
+Benchmarking full_scan/datafusion/100000
+Benchmarking full_scan/datafusion/100000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 9.9s, enable flat sampling, or
+ reduce sample count to 50.
+Benchmarking full_scan/datafusion/100000: Collecting 100 samples in estimated 9.8987 s (5050 iterations)
+Benchmarking full_scan/datafusion/100000: Analyzing
+full_scan/datafusion/100000
+                        time:   [2.9375 ms 3.2775 ms 3.6965 ms]
+                        thrpt:  [27.053 Melem/s 30.511 Melem/s 34.043 Melem/s]
+                 change:
+                        time:   [-6.5696% +14.263% +37.120%] (p = 0.20 > 0.05)
+                        thrpt:  [-27.071% -12.483% +7.0315%]
+                        No change in performance detected.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+Benchmarking full_scan/falcondb/1000000
+Benchmarking full_scan/falcondb/1000000: Warming up for 3.0000 s
+Benchmarking full_scan/falcondb/1000000: Collecting 100 samples in estimated 6.3095 s (20k iterations)
+Benchmarking full_scan/falcondb/1000000: Analyzing
+full_scan/falcondb/1000000
+                        time:   [271.82 µs 352.09 µs 509.88 µs]
+                        thrpt:  [1.9612 Gelem/s 2.8402 Gelem/s 3.6788 Gelem/s]
+                 change:
+                        time:   [-23.585% -0.8083% +27.438%] (p = 0.91 > 0.05)
+                        thrpt:  [-21.531% +0.8148% +30.864%]
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  1 (1.00%) low mild
+  6 (6.00%) high severe
+Benchmarking full_scan/polars/1000000
+Benchmarking full_scan/polars/1000000: Warming up for 3.0000 s
+Benchmarking full_scan/polars/1000000: Collecting 100 samples in estimated 5.3482 s (1200 iterations)
+Benchmarking full_scan/polars/1000000: Analyzing
+full_scan/polars/1000000
+                        time:   [4.4221 ms 4.8799 ms 5.4380 ms]
+                        thrpt:  [183.89 Melem/s 204.92 Melem/s 226.14 Melem/s]
+                 change:
+                        time:   [-41.722% -36.062% -28.376%] (p = 0.00 < 0.05)
+                        thrpt:  [+39.618% +56.401% +71.591%]
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+Benchmarking full_scan/duckdb/1000000
+Benchmarking full_scan/duckdb/1000000: Warming up for 3.0000 s
+Benchmarking full_scan/duckdb/1000000: Collecting 100 samples in estimated 9.2656 s (10k iterations)
+Benchmarking full_scan/duckdb/1000000: Analyzing
+full_scan/duckdb/1000000
+                        time:   [1.2108 ms 1.2909 ms 1.3663 ms]
+                        thrpt:  [731.93 Melem/s 774.63 Melem/s 825.88 Melem/s]
+                 change:
+                        time:   [+22.309% +29.499% +37.253%] (p = 0.00 < 0.05)
+                        thrpt:  [-27.142% -22.779% -18.240%]
+                        Performance has regressed.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+Benchmarking full_scan/datafusion/1000000
+Benchmarking full_scan/datafusion/1000000: Warming up for 3.0000 s
+Benchmarking full_scan/datafusion/1000000: Collecting 100 samples in estimated 5.1741 s (400 iterations)
+Benchmarking full_scan/datafusion/1000000: Analyzing
+full_scan/datafusion/1000000
+                        time:   [9.5990 ms 10.114 ms 10.768 ms]
+                        thrpt:  [92.870 Melem/s 98.874 Melem/s 104.18 Melem/s]
+                 change:
+                        time:   [+48.083% +55.632% +65.617%] (p = 0.00 < 0.05)
+                        thrpt:  [-39.620% -35.746% -32.470%]
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+
+Benchmarking filter_where/falcondb/10000
+Benchmarking filter_where/falcondb/10000: Warming up for 3.0000 s
+Benchmarking filter_where/falcondb/10000: Collecting 100 samples in estimated 5.5519 s (35k iterations)
+Benchmarking filter_where/falcondb/10000: Analyzing
+filter_where/falcondb/10000
+                        time:   [1.0532 ms 1.2796 ms 1.4952 ms]
+                        thrpt:  [6.6881 Melem/s 7.8147 Melem/s 9.4948 Melem/s]
+                 change:
+                        time:   [+167.32% +253.44% +363.90%] (p = 0.00 < 0.05)
+                        thrpt:  [-78.444% -71.706% -62.592%]
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking filter_where/polars/10000
+Benchmarking filter_where/polars/10000: Warming up for 3.0000 s
+Benchmarking filter_where/polars/10000: Collecting 100 samples in estimated 5.0763 s (1600 iterations)
+Benchmarking filter_where/polars/10000: Analyzing
+filter_where/polars/10000
+                        time:   [4.8401 ms 5.3286 ms 5.8448 ms]
+                        thrpt:  [1.7109 Melem/s 1.8767 Melem/s 2.0661 Melem/s]
+                 change:
+                        time:   [+325.73% +366.05% +412.05%] (p = 0.00 < 0.05)
+                        thrpt:  [-80.471% -78.543% -76.511%]
+                        Performance has regressed.
+Found 5 outliers among 100 measurements (5.00%)
+  5 (5.00%) high mild
+Benchmarking filter_where/duckdb/10000
+Benchmarking filter_where/duckdb/10000: Warming up for 3.0000 s
+Benchmarking filter_where/duckdb/10000: Collecting 100 samples in estimated 5.0874 s (1900 iterations)
+Benchmarking filter_where/duckdb/10000: Analyzing
+filter_where/duckdb/10000
+                        time:   [2.9453 ms 3.1108 ms 3.2865 ms]
+                        thrpt:  [3.0427 Melem/s 3.2146 Melem/s 3.3952 Melem/s]
+                 change:
+                        time:   [+15.728% +23.060% +30.928%] (p = 0.00 < 0.05)
+                        thrpt:  [-23.622% -18.739% -13.591%]
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking filter_where/datafusion/10000
+Benchmarking filter_where/datafusion/10000: Warming up for 3.0000 s
+Benchmarking filter_where/datafusion/10000: Collecting 100 samples in estimated 6.1391 s (400 iterations)
+Benchmarking filter_where/datafusion/10000: Analyzing
+filter_where/datafusion/10000
+                        time:   [16.631 ms 17.516 ms 18.422 ms]
+                        thrpt:  [542.83 Kelem/s 570.91 Kelem/s 601.28 Kelem/s]
+                 change:
+                        time:   [+47.735% +57.695% +68.307%] (p = 0.00 < 0.05)
+                        thrpt:  [-40.585% -36.586% -32.311%]
+                        Performance has regressed.
+Benchmarking filter_where/falcondb/100000
+Benchmarking filter_where/falcondb/100000: Warming up for 3.0000 s
+Benchmarking filter_where/falcondb/100000: Collecting 100 samples in estimated 5.9862 s (400 iterations)
+Benchmarking filter_where/falcondb/100000: Analyzing
+filter_where/falcondb/100000
+                        time:   [13.899 ms 15.660 ms 18.402 ms]
+                        thrpt:  [5.4341 Melem/s 6.3855 Melem/s 7.1949 Melem/s]
+                 change:
+                        time:   [+151.82% +221.63% +319.39%] (p = 0.00 < 0.05)
+                        thrpt:  [-76.156% -68.908% -60.290%]
+                        Performance has regressed.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking filter_where/polars/100000
+Benchmarking filter_where/polars/100000: Warming up for 3.0000 s
+Benchmarking filter_where/polars/100000: Collecting 100 samples in estimated 6.8746 s (300 iterations)
+Benchmarking filter_where/polars/100000: Analyzing
+filter_where/polars/100000
+                        time:   [15.414 ms 15.905 ms 16.413 ms]
+                        thrpt:  [6.0926 Melem/s 6.2873 Melem/s 6.4877 Melem/s]
+                 change:
+                        time:   [+22.216% +29.041% +36.140%] (p = 0.00 < 0.05)
+                        thrpt:  [-26.546% -22.505% -18.178%]
+                        Performance has regressed.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+Benchmarking filter_where/duckdb/100000
+Benchmarking filter_where/duckdb/100000: Warming up for 3.0000 s
+Benchmarking filter_where/duckdb/100000: Collecting 100 samples in estimated 6.9836 s (200 iterations)
+Benchmarking filter_where/duckdb/100000: Analyzing
+filter_where/duckdb/100000
+                        time:   [37.919 ms 39.279 ms 40.770 ms]
+                        thrpt:  [2.4528 Melem/s 2.5459 Melem/s 2.6372 Melem/s]
+                 change:
+                        time:   [+130.45% +141.92% +154.47%] (p = 0.00 < 0.05)
+                        thrpt:  [-60.703% -58.663% -56.606%]
+                        Performance has regressed.
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) high mild
+  5 (5.00%) high severe
+Benchmarking filter_where/datafusion/100000
+Benchmarking filter_where/datafusion/100000: Warming up for 3.0000 s
+Benchmarking filter_where/datafusion/100000: Collecting 100 samples in estimated 5.7709 s (200 iterations)
+Benchmarking filter_where/datafusion/100000: Analyzing
+filter_where/datafusion/100000
+                        time:   [27.685 ms 28.646 ms 29.661 ms]
+                        thrpt:  [3.3714 Melem/s 3.4909 Melem/s 3.6120 Melem/s]
+                 change:
+                        time:   [+1.7180% +6.8652% +11.896%] (p = 0.01 < 0.05)
+                        thrpt:  [-10.631% -6.4242% -1.6890%]
+                        Performance has regressed.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking filter_where/falcondb/1000000
+Benchmarking filter_where/falcondb/1000000: Warming up for 3.0000 s
+Benchmarking filter_where/falcondb/1000000: Collecting 100 samples in estimated 8.1807 s (200 iterations)
+Benchmarking filter_where/falcondb/1000000: Analyzing
+filter_where/falcondb/1000000
+                        time:   [47.491 ms 50.779 ms 54.180 ms]
+                        thrpt:  [18.457 Melem/s 19.693 Melem/s 21.056 Melem/s]
+                 change:
+                        time:   [-15.396% -4.4625% +6.5697%] (p = 0.46 > 0.05)
+                        thrpt:  [-6.1647% +4.6709% +18.198%]
+                        No change in performance detected.
+Benchmarking filter_where/polars/1000000
+Benchmarking filter_where/polars/1000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 12.6s, or reduce sample count 
+to 30.
+Benchmarking filter_where/polars/1000000: Collecting 100 samples in estimated 12.642 s (100 iterations)
+Benchmarking filter_where/polars/1000000: Analyzing
+filter_where/polars/1000000
+                        time:   [140.06 ms 146.74 ms 153.93 ms]
+                        thrpt:  [6.4966 Melem/s 6.8149 Melem/s 7.1399 Melem/s]
+                 change:
+                        time:   [-12.721% -7.3957% -2.0892%] (p = 0.01 < 0.05)
+                        thrpt:  [+2.1338% +7.9863% +14.575%]
+                        Performance has improved.
+Found 19 outliers among 100 measurements (19.00%)
+  12 (12.00%) high mild
+  7 (7.00%) high severe
+Benchmarking filter_where/duckdb/1000000
+Benchmarking filter_where/duckdb/1000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 52.4s, or reduce sample count 
+to 10.
+Benchmarking filter_where/duckdb/1000000: Collecting 100 samples in estimated 52.372 s (100 iterations)
+Benchmarking filter_where/duckdb/1000000: Analyzing
+filter_where/duckdb/1000000
+                        time:   [367.53 ms 418.39 ms 478.58 ms]
+                        thrpt:  [2.0895 Melem/s 2.3901 Melem/s 2.7209 Melem/s]
+                 change:
+                        time:   [+61.838% +87.468% +114.00%] (p = 0.00 < 0.05)
+                        thrpt:  [-53.270% -46.657% -38.210%]
+                        Performance has regressed.
+Found 13 outliers among 100 measurements (13.00%)
+  8 (8.00%) high mild
+  5 (5.00%) high severe
+Benchmarking filter_where/datafusion/1000000
+Benchmarking filter_where/datafusion/1000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 28.8s, or reduce sample count 
+to 10.
+Benchmarking filter_where/datafusion/1000000: Collecting 100 samples in estimated 28.783 s (100 iterations)
+Benchmarking filter_where/datafusion/1000000: Analyzing
+filter_where/datafusion/1000000
+                        time:   [225.46 ms 235.74 ms 246.49 ms]
+                        thrpt:  [4.0569 Melem/s 4.2420 Melem/s 4.4353 Melem/s]
+                 change:
+                        time:   [+33.836% +41.336% +50.031%] (p = 0.00 < 0.05)
+                        thrpt:  [-33.347% -29.246% -25.282%]
+                        Performance has regressed.
+
+Benchmarking group_by_agg/falcondb/10000
+Benchmarking group_by_agg/falcondb/10000: Warming up for 3.0000 s
+Benchmarking group_by_agg/falcondb/10000: Collecting 100 samples in estimated 5.1005 s (1500 iterations)
+Benchmarking group_by_agg/falcondb/10000: Analyzing
+group_by_agg/falcondb/10000
+                        time:   [4.4367 ms 4.9261 ms 5.4712 ms]
+                        thrpt:  [1.8277 Melem/s 2.0300 Melem/s 2.2539 Melem/s]
+                 change:
+                        time:   [-75.344% -38.524% +110.44%] (p = 0.72 > 0.05)
+                        thrpt:  [-52.480% +62.665% +305.58%]
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking group_by_agg/polars/10000
+Benchmarking group_by_agg/polars/10000: Warming up for 3.0000 s
+Benchmarking group_by_agg/polars/10000: Collecting 100 samples in estimated 7.2358 s (300 iterations)
+Benchmarking group_by_agg/polars/10000: Analyzing
+group_by_agg/polars/10000
+                        time:   [29.903 ms 32.480 ms 35.137 ms]
+                        thrpt:  [284.60 Kelem/s 307.88 Kelem/s 334.42 Kelem/s]
+                 change:
+                        time:   [-6.8262% +4.8271% +17.907%] (p = 0.45 > 0.05)
+                        thrpt:  [-15.187% -4.6048% +7.3263%]
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking group_by_agg/duckdb/10000
+Benchmarking group_by_agg/duckdb/10000: Warming up for 3.0000 s
+Benchmarking group_by_agg/duckdb/10000: Collecting 100 samples in estimated 5.1997 s (300 iterations)
+Benchmarking group_by_agg/duckdb/10000: Analyzing
+group_by_agg/duckdb/10000
+                        time:   [17.218 ms 18.133 ms 19.065 ms]
+                        thrpt:  [524.52 Kelem/s 551.48 Kelem/s 580.80 Kelem/s]
+                 change:
+                        time:   [+3.1375% +10.492% +18.098%] (p = 0.01 < 0.05)
+                        thrpt:  [-15.324% -9.4961% -3.0420%]
+                        Performance has regressed.
+Benchmarking group_by_agg/datafusion/10000
+Benchmarking group_by_agg/datafusion/10000: Warming up for 3.0000 s
+Benchmarking group_by_agg/datafusion/10000: Collecting 100 samples in estimated 7.3876 s (300 iterations)
+Benchmarking group_by_agg/datafusion/10000: Analyzing
+group_by_agg/datafusion/10000
+                        time:   [25.077 ms 26.078 ms 27.297 ms]
+                        thrpt:  [366.34 Kelem/s 383.46 Kelem/s 398.77 Kelem/s]
+                 change:
+                        time:   [-3.4603% +2.3406% +9.4042%] (p = 0.47 > 0.05)
+                        thrpt:  [-8.5958% -2.2871% +3.5844%]
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+Benchmarking group_by_agg/falcondb/100000
+Benchmarking group_by_agg/falcondb/100000: Warming up for 3.0000 s
+Benchmarking group_by_agg/falcondb/100000: Collecting 100 samples in estimated 6.8490 s (300 iterations)
+Benchmarking group_by_agg/falcondb/100000: Analyzing
+group_by_agg/falcondb/100000
+                        time:   [14.115 ms 15.162 ms 16.243 ms]
+                        thrpt:  [6.1564 Melem/s 6.5953 Melem/s 7.0849 Melem/s]
+                 change:
+                        time:   [-7.5351% +1.3916% +10.895%] (p = 0.78 > 0.05)
+                        thrpt:  [-9.8249% -1.3725% +8.1492%]
+                        No change in performance detected.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking group_by_agg/polars/100000
+Benchmarking group_by_agg/polars/100000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.6s, or reduce sample count t
+o 80.
+Benchmarking group_by_agg/polars/100000: Collecting 100 samples in estimated 5.6278 s (100 iterations)
+Benchmarking group_by_agg/polars/100000: Analyzing
+group_by_agg/polars/100000
+                        time:   [56.519 ms 59.631 ms 62.804 ms]
+                        thrpt:  [1.5922 Melem/s 1.6770 Melem/s 1.7693 Melem/s]
+                 change:
+                        time:   [+16.306% +25.068% +35.186%] (p = 0.00 < 0.05)
+                        thrpt:  [-26.028% -20.043% -14.020%]
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking group_by_agg/duckdb/100000
+Benchmarking group_by_agg/duckdb/100000: Warming up for 3.0000 s
+Benchmarking group_by_agg/duckdb/100000: Collecting 100 samples in estimated 6.1711 s (200 iterations)
+Benchmarking group_by_agg/duckdb/100000: Analyzing
+group_by_agg/duckdb/100000
+                        time:   [34.349 ms 36.254 ms 38.242 ms]
+                        thrpt:  [2.6149 Melem/s 2.7583 Melem/s 2.9113 Melem/s]
+                 change:
+                        time:   [-22.537% -16.202% -9.0379%] (p = 0.00 < 0.05)
+                        thrpt:  [+9.9358% +19.334% +29.093%]
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking group_by_agg/datafusion/100000
+Benchmarking group_by_agg/datafusion/100000: Warming up for 3.0000 s
+Benchmarking group_by_agg/datafusion/100000: Collecting 100 samples in estimated 6.9587 s (200 iterations)
+Benchmarking group_by_agg/datafusion/100000: Analyzing
+group_by_agg/datafusion/100000
+                        time:   [34.423 ms 36.185 ms 38.016 ms]
+                        thrpt:  [2.6305 Melem/s 2.7636 Melem/s 2.9050 Melem/s]
+                 change:
+                        time:   [-19.411% -13.604% -7.7223%] (p = 0.00 < 0.05)
+                        thrpt:  [+8.3686% +15.747% +24.087%]
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+Benchmarking group_by_agg/falcondb/1000000
+Benchmarking group_by_agg/falcondb/1000000: Warming up for 3.0000 s
+Benchmarking group_by_agg/falcondb/1000000: Collecting 100 samples in estimated 9.6479 s (200 iterations)
+Benchmarking group_by_agg/falcondb/1000000: Analyzing
+group_by_agg/falcondb/1000000
+                        time:   [8.9947 ms 10.762 ms 12.765 ms]
+                        thrpt:  [78.339 Melem/s 92.923 Melem/s 111.18 Melem/s]
+                 change:
+                        time:   [-83.505% -80.138% -76.275%] (p = 0.00 < 0.05)
+                        thrpt:  [+321.49% +403.49% +506.23%]
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  6 (6.00%) high mild
+  2 (2.00%) high severe
+Benchmarking group_by_agg/polars/1000000
+Benchmarking group_by_agg/polars/1000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 15.6s, or reduce sample count 
+to 30.
+Benchmarking group_by_agg/polars/1000000: Collecting 100 samples in estimated 15.605 s (100 iterations)
+Benchmarking group_by_agg/polars/1000000: Analyzing
+group_by_agg/polars/1000000
+                        time:   [153.47 ms 165.92 ms 179.52 ms]
+                        thrpt:  [5.5703 Melem/s 6.0271 Melem/s 6.5161 Melem/s]
+                 change:
+                        time:   [-49.462% -44.967% -40.084%] (p = 0.00 < 0.05)
+                        thrpt:  [+66.901% +81.710% +97.869%]
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  6 (6.00%) high mild
+  2 (2.00%) high severe
+Benchmarking group_by_agg/duckdb/1000000
+Benchmarking group_by_agg/duckdb/1000000: Warming up for 3.0000 s
+Benchmarking group_by_agg/duckdb/1000000: Collecting 100 samples in estimated 7.2718 s (300 iterations)
+Benchmarking group_by_agg/duckdb/1000000: Analyzing
+group_by_agg/duckdb/1000000
+                        time:   [23.435 ms 24.717 ms 26.112 ms]
+                        thrpt:  [38.297 Melem/s 40.458 Melem/s 42.671 Melem/s]
+                 change:
+                        time:   [-49.373% -46.335% -43.250%] (p = 0.00 < 0.05)
+                        thrpt:  [+76.213% +86.340% +97.523%]
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+Benchmarking group_by_agg/datafusion/1000000
+Benchmarking group_by_agg/datafusion/1000000: Warming up for 3.0000 s
+Benchmarking group_by_agg/datafusion/1000000: Collecting 100 samples in estimated 7.0923 s (200 iterations)
+Benchmarking group_by_agg/datafusion/1000000: Analyzing
+group_by_agg/datafusion/1000000
+                        time:   [35.961 ms 39.998 ms 44.537 ms]
+                        thrpt:  [22.453 Melem/s 25.001 Melem/s 27.808 Melem/s]
+                 change:
+                        time:   [-66.480% -62.265% -57.132%] (p = 0.00 < 0.05)
+                        thrpt:  [+133.28% +165.01% +198.33%]
+                        Performance has improved.
+Found 14 outliers among 100 measurements (14.00%)
+  1 (1.00%) high mild
+  13 (13.00%) high severe
+
+Benchmarking order_by/falcondb/10000
+Benchmarking order_by/falcondb/10000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.5s, enable flat sampling, or
+ reduce sample count to 60.
+Benchmarking order_by/falcondb/10000: Collecting 100 samples in estimated 5.5271 s (5050 iterations)
+Benchmarking order_by/falcondb/10000: Analyzing
+order_by/falcondb/10000 time:   [1.2515 ms 1.3043 ms 1.3628 ms]
+                        thrpt:  [7.3377 Melem/s 7.6668 Melem/s 7.9907 Melem/s]
+                 change:
+                        time:   [-6.1766% +18.718% +54.048%] (p = 0.27 > 0.05)
+                        thrpt:  [-35.085% -15.767% +6.5832%]
+                        No change in performance detected.
+Found 17 outliers among 100 measurements (17.00%)
+  12 (12.00%) high mild
+  5 (5.00%) high severe
+Benchmarking order_by/polars/10000
+Benchmarking order_by/polars/10000: Warming up for 3.0000 s
+Benchmarking order_by/polars/10000: Collecting 100 samples in estimated 5.0781 s (600 iterations)
+Benchmarking order_by/polars/10000: Analyzing
+order_by/polars/10000   time:   [8.3669 ms 10.430 ms 12.749 ms]
+                        thrpt:  [784.38 Kelem/s 958.80 Kelem/s 1.1952 Melem/s]
+                 change:
+                        time:   [-41.349% -24.616% -4.6481%] (p = 0.01 < 0.05)
+                        thrpt:  [+4.8747% +32.654% +70.501%]
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+Benchmarking order_by/duckdb/10000
+Benchmarking order_by/duckdb/10000: Warming up for 3.0000 s
+Benchmarking order_by/duckdb/10000: Collecting 100 samples in estimated 5.1098 s (800 iterations)
+Benchmarking order_by/duckdb/10000: Analyzing
+order_by/duckdb/10000   time:   [9.0124 ms 9.7073 ms 10.479 ms]
+                        thrpt:  [954.32 Kelem/s 1.0302 Melem/s 1.1096 Melem/s]
+                 change:
+                        time:   [-14.000% -5.3799% +4.8511%] (p = 0.29 > 0.05)
+                        thrpt:  [-4.6267% +5.6858% +16.279%]
+                        No change in performance detected.
+Found 9 outliers among 100 measurements (9.00%)
+  5 (5.00%) high mild
+  4 (4.00%) high severe
+Benchmarking order_by/datafusion/10000
+Benchmarking order_by/datafusion/10000: Warming up for 3.0000 s
+Benchmarking order_by/datafusion/10000: Collecting 100 samples in estimated 5.4040 s (800 iterations)
+Benchmarking order_by/datafusion/10000: Analyzing
+order_by/datafusion/10000
+                        time:   [6.1478 ms 6.6041 ms 7.0972 ms]
+                        thrpt:  [1.4090 Melem/s 1.5142 Melem/s 1.6266 Melem/s]
+                 change:
+                        time:   [+6.9957% +16.177% +25.641%] (p = 0.00 < 0.05)
+                        thrpt:  [-20.408% -13.924% -6.5383%]
+                        Performance has regressed.
+Found 17 outliers among 100 measurements (17.00%)
+  16 (16.00%) high mild
+  1 (1.00%) high severe
+Benchmarking order_by/falcondb/100000
+Benchmarking order_by/falcondb/100000: Warming up for 3.0000 s
+Benchmarking order_by/falcondb/100000: Collecting 100 samples in estimated 6.1460 s (500 iterations)
+Benchmarking order_by/falcondb/100000: Analyzing
+order_by/falcondb/100000
+                        time:   [13.868 ms 16.358 ms 19.125 ms]
+                        thrpt:  [5.2287 Melem/s 6.1132 Melem/s 7.2106 Melem/s]
+                 change:
+                        time:   [-7.4957% +16.593% +46.926%] (p = 0.20 > 0.05)
+                        thrpt:  [-31.939% -14.232% +8.1031%]
+                        No change in performance detected.
+Found 22 outliers among 100 measurements (22.00%)
+  6 (6.00%) high mild
+  16 (16.00%) high severe
+Benchmarking order_by/polars/100000
+Benchmarking order_by/polars/100000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 6.7s, or reduce sample count t
+o 70.
+Benchmarking order_by/polars/100000: Collecting 100 samples in estimated 6.7441 s (100 iterations)
+Benchmarking order_by/polars/100000: Analyzing
+order_by/polars/100000  time:   [39.923 ms 45.557 ms 52.486 ms]
+                        thrpt:  [1.9053 Melem/s 2.1950 Melem/s 2.5048 Melem/s]
+                 change:
+                        time:   [-28.083% -10.834% +9.5283%] (p = 0.31 > 0.05)
+                        thrpt:  [-8.6994% +12.150% +39.050%]
+                        No change in performance detected.
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+Benchmarking order_by/duckdb/100000
+Benchmarking order_by/duckdb/100000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.6s, or reduce sample count t
+o 60.
+Benchmarking order_by/duckdb/100000: Collecting 100 samples in estimated 7.5767 s (100 iterations)
+Benchmarking order_by/duckdb/100000: Analyzing
+order_by/duckdb/100000  time:   [65.763 ms 71.582 ms 77.751 ms]
+                        thrpt:  [1.2862 Melem/s 1.3970 Melem/s 1.5206 Melem/s]
+                 change:
+                        time:   [+25.678% +38.102% +50.088%] (p = 0.00 < 0.05)
+                        thrpt:  [-33.373% -27.590% -20.431%]
+                        Performance has regressed.
+Found 5 outliers among 100 measurements (5.00%)
+  5 (5.00%) high mild
+Benchmarking order_by/datafusion/100000
+Benchmarking order_by/datafusion/100000: Warming up for 3.0000 s
+Benchmarking order_by/datafusion/100000: Collecting 100 samples in estimated 5.8538 s (300 iterations)
+Benchmarking order_by/datafusion/100000: Analyzing
+order_by/datafusion/100000
+                        time:   [23.448 ms 25.022 ms 26.828 ms]
+                        thrpt:  [3.7275 Melem/s 3.9965 Melem/s 4.2648 Melem/s]
+                 change:
+                        time:   [-37.168% -30.721% -23.361%] (p = 0.00 < 0.05)
+                        thrpt:  [+30.482% +44.344% +59.154%]
+                        Performance has improved.
+Found 19 outliers among 100 measurements (19.00%)
+  5 (5.00%) low mild
+  1 (1.00%) high mild
+  13 (13.00%) high severe
+
+Benchmarking sql_pipeline/falcondb/10000
+Benchmarking sql_pipeline/falcondb/10000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/falcondb/10000: Collecting 100 samples in estimated 5.7689 s (10k iterations)
+Benchmarking sql_pipeline/falcondb/10000: Analyzing
+sql_pipeline/falcondb/10000
+                        time:   [464.82 µs 499.62 µs 543.58 µs]
+                        thrpt:  [18.396 Melem/s 20.015 Melem/s 21.514 Melem/s]
+                 change:
+                        time:   [-78.199% -68.076% -48.204%] (p = 0.00 < 0.05)
+                        thrpt:  [+93.065% +213.24% +358.70%]
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  2 (2.00%) low mild
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+Benchmarking sql_pipeline/polars/10000
+Benchmarking sql_pipeline/polars/10000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/polars/10000: Collecting 100 samples in estimated 5.1763 s (800 iterations)
+Benchmarking sql_pipeline/polars/10000: Analyzing
+sql_pipeline/polars/10000
+                        time:   [5.4316 ms 7.0611 ms 9.0015 ms]
+                        thrpt:  [1.1109 Melem/s 1.4162 Melem/s 1.8411 Melem/s]
+                 change:
+                        time:   [-60.034% -46.554% -29.795%] (p = 0.00 < 0.05)
+                        thrpt:  [+42.441% +87.104% +150.21%]
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+Benchmarking sql_pipeline/duckdb/10000
+Benchmarking sql_pipeline/duckdb/10000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/duckdb/10000: Collecting 100 samples in estimated 5.0843 s (800 iterations)
+Benchmarking sql_pipeline/duckdb/10000: Analyzing
+sql_pipeline/duckdb/10000
+                        time:   [5.0176 ms 5.0885 ms 5.1608 ms]
+                        thrpt:  [1.9377 Melem/s 1.9652 Melem/s 1.9930 Melem/s]
+                 change:
+                        time:   [-34.912% -31.839% -28.685%] (p = 0.00 < 0.05)
+                        thrpt:  [+40.222% +46.711% +53.639%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+Benchmarking sql_pipeline/datafusion/10000
+Benchmarking sql_pipeline/datafusion/10000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/datafusion/10000: Collecting 100 samples in estimated 5.0584 s (700 iterations)
+Benchmarking sql_pipeline/datafusion/10000: Analyzing
+sql_pipeline/datafusion/10000
+                        time:   [7.4236 ms 8.9527 ms 10.789 ms]
+                        thrpt:  [926.85 Kelem/s 1.1170 Melem/s 1.3470 Melem/s]
+                 change:
+                        time:   [+6.4503% +30.027% +59.972%] (p = 0.01 < 0.05)
+                        thrpt:  [-37.489% -23.093% -6.0594%]
+                        Performance has regressed.
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) high mild
+  8 (8.00%) high severe
+Benchmarking sql_pipeline/falcondb/100000
+Benchmarking sql_pipeline/falcondb/100000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/falcondb/100000: Collecting 100 samples in estimated 8.9507 s (10k iterations)
+Benchmarking sql_pipeline/falcondb/100000: Analyzing
+sql_pipeline/falcondb/100000
+                        time:   [1.1156 ms 1.3966 ms 1.8372 ms]
+                        thrpt:  [54.430 Melem/s 71.603 Melem/s 89.636 Melem/s]
+                 change:
+                        time:   [-41.189% -17.945% +13.498%] (p = 0.30 > 0.05)
+                        thrpt:  [-11.893% +21.870% +70.037%]
+                        No change in performance detected.
+Found 6 outliers among 100 measurements (6.00%)
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+Benchmarking sql_pipeline/polars/100000
+Benchmarking sql_pipeline/polars/100000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/polars/100000: Collecting 100 samples in estimated 5.3711 s (600 iterations)
+Benchmarking sql_pipeline/polars/100000: Analyzing
+sql_pipeline/polars/100000
+                        time:   [8.5802 ms 10.764 ms 13.557 ms]
+                        thrpt:  [7.3764 Melem/s 9.2904 Melem/s 11.655 Melem/s]
+                 change:
+                        time:   [-40.730% -27.075% -9.2942%] (p = 0.00 < 0.05)
+                        thrpt:  [+10.247% +37.127% +68.720%]
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high severe
+Benchmarking sql_pipeline/duckdb/100000
+Benchmarking sql_pipeline/duckdb/100000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/duckdb/100000: Collecting 100 samples in estimated 5.5686 s (600 iterations)
+Benchmarking sql_pipeline/duckdb/100000: Analyzing
+sql_pipeline/duckdb/100000
+                        time:   [11.969 ms 12.936 ms 14.040 ms]
+                        thrpt:  [7.1227 Melem/s 7.7305 Melem/s 8.3549 Melem/s]
+                 change:
+                        time:   [+7.2130% +16.613% +27.935%] (p = 0.00 < 0.05)
+                        thrpt:  [-21.835% -14.247% -6.7277%]
+                        Performance has regressed.
+Found 10 outliers among 100 measurements (10.00%)
+  3 (3.00%) high mild
+  7 (7.00%) high severe
+Benchmarking sql_pipeline/datafusion/100000
+Benchmarking sql_pipeline/datafusion/100000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/datafusion/100000: Collecting 100 samples in estimated 5.9821 s (500 iterations)
+Benchmarking sql_pipeline/datafusion/100000: Analyzing
+sql_pipeline/datafusion/100000
+                        time:   [9.5523 ms 11.306 ms 13.372 ms]
+                        thrpt:  [7.4783 Melem/s 8.8452 Melem/s 10.469 Melem/s]
+                 change:
+                        time:   [+10.327% +30.419% +58.862%] (p = 0.00 < 0.05)
+                        thrpt:  [-37.052% -23.324% -9.3603%]
+                        Performance has regressed.
+Found 10 outliers among 100 measurements (10.00%)
+  3 (3.00%) high mild
+  7 (7.00%) high severe
+
+Benchmarking streaming_filter/falcondb_chunked_64k/100000
+Benchmarking streaming_filter/falcondb_chunked_64k/100000: Warming up for 3.0000 s
+Benchmarking streaming_filter/falcondb_chunked_64k/100000: Collecting 100 samples in estimated 9.8423 s (10k iterations
+)
+Benchmarking streaming_filter/falcondb_chunked_64k/100000: Analyzing
+streaming_filter/falcondb_chunked_64k/100000
+                        time:   [913.61 µs 927.56 µs 941.66 µs]
+                        thrpt:  [106.20 Melem/s 107.81 Melem/s 109.46 Melem/s]
+                 change:
+                        time:   [-57.523% -52.976% -48.482%] (p = 0.00 < 0.05)
+                        thrpt:  [+94.105% +112.66% +135.42%]
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking streaming_filter/falcondb_direct/100000
+Benchmarking streaming_filter/falcondb_direct/100000: Warming up for 3.0000 s
+Benchmarking streaming_filter/falcondb_direct/100000: Collecting 100 samples in estimated 5.6503 s (10k iterations)
+Benchmarking streaming_filter/falcondb_direct/100000: Analyzing
+streaming_filter/falcondb_direct/100000
+                        time:   [611.80 µs 618.94 µs 625.95 µs]
+                        thrpt:  [159.76 Melem/s 161.57 Melem/s 163.45 Melem/s]
+                 change:
+                        time:   [-50.522% -38.157% -24.784%] (p = 0.00 < 0.05)
+                        thrpt:  [+32.951% +61.700% +102.11%]
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+Benchmarking streaming_filter/falcondb_chunked_64k/1000000
+Benchmarking streaming_filter/falcondb_chunked_64k/1000000: Warming up for 3.0000 s
+Benchmarking streaming_filter/falcondb_chunked_64k/1000000: Collecting 100 samples in estimated 5.2354 s (500 iteration
+s)
+Benchmarking streaming_filter/falcondb_chunked_64k/1000000: Analyzing
+streaming_filter/falcondb_chunked_64k/1000000
+                        time:   [9.5214 ms 9.7011 ms 9.8869 ms]
+                        thrpt:  [101.14 Melem/s 103.08 Melem/s 105.03 Melem/s]
+                 change:
+                        time:   [-43.542% -42.034% -40.467%] (p = 0.00 < 0.05)
+                        thrpt:  [+67.974% +72.516% +77.123%]
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+Benchmarking streaming_filter/falcondb_direct/1000000
+Benchmarking streaming_filter/falcondb_direct/1000000: Warming up for 3.0000 s
+Benchmarking streaming_filter/falcondb_direct/1000000: Collecting 100 samples in estimated 5.2268 s (1400 iterations)
+Benchmarking streaming_filter/falcondb_direct/1000000: Analyzing
+streaming_filter/falcondb_direct/1000000
+                        time:   [3.9234 ms 3.9617 ms 4.0007 ms]
+                        thrpt:  [249.96 Melem/s 252.42 Melem/s 254.88 Melem/s]
+                 change:
+                        time:   [-52.493% -39.511% -28.864%] (p = 0.00 < 0.05)
+                        thrpt:  [+40.575% +65.320% +110.50%]
+                        Performance has improved.
+

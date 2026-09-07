@@ -39,8 +39,8 @@ pub struct ParsedQuery {
     pub windows:  Vec<WindowExpr>,
     /// `WITH name AS (вЂ¦)` bindings, in declaration order. Each is materialised into a
     /// temporary table before the main query runs, so a later CTE can reference an
-    /// earlier one.
-    pub ctes:     Vec<(String, ParsedQuery)>,
+    /// earlier one. The `bool` is `true` for RECURSIVE CTEs.
+    pub ctes:     Vec<(String, ParsedQuery, bool)>,
 }
 
 /// Source format for COPY ... FROM.
@@ -279,8 +279,8 @@ fn translate_statement(stmt: Statement) -> FalconResult<ParsedStatement> {
     match stmt {
         Statement::Query(q) => Ok(ParsedStatement::Query(translate_query(*q)?)),
         Statement::Insert(ins) => Ok(ParsedStatement::Insert(translate_insert(ins)?)),
-        Statement::Update { table, assignments, selection, .. } => {
-            Ok(ParsedStatement::Update(translate_update(table, assignments, selection)?))
+        Statement::Update { table, assignments, selection, returning, .. } => {
+            Ok(ParsedStatement::Update(translate_update(table, assignments, selection, returning)?))
         }
         Statement::Delete(del) => Ok(ParsedStatement::Delete(translate_delete(del)?)),
         Statement::CreateTable { name, columns, if_not_exists, constraints, .. } => {
@@ -359,7 +359,25 @@ fn translate_statement(stmt: Statement) -> FalconResult<ParsedStatement> {
                             ),
                         });
                     }
-                    _ => {} // ForeignKey, Index, etc. вЂ” not supported yet
+                    TableConstraint::ForeignKey {
+                        name,
+                        columns,
+                        foreign_table,
+                        referred_columns,
+                        ..
+                    } => {
+                        let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                        let ref_cols: Vec<String> = referred_columns.iter().map(|c| c.value.clone()).collect();
+                        table_constraints.push(crate::storage::table::TableConstraint {
+                            name: name.as_ref().map(|n| n.value.clone()),
+                            kind: crate::storage::table::ConstraintKind::ForeignKey {
+                                columns:     cols,
+                                ref_table:   foreign_table.to_string(),
+                                ref_columns: ref_cols,
+                            },
+                        });
+                    }
+                    _ => {} // Index, etc. — not supported
                 }
             }
 
@@ -463,7 +481,8 @@ fn translate_insert(ins: sqlparser::ast::Insert) -> FalconResult<InsertStmt> {
         InsertSource::Select(Box::new(translate_query(*query)?))
     };
 
-    Ok(InsertStmt { table, columns, source })
+    let returning = translate_returning(ins.returning.as_deref())?;
+    Ok(InsertStmt { table, columns, source, returning })
 }
 
 // в”Ђв”Ђв”Ђ UPDATE в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
@@ -472,6 +491,7 @@ fn translate_update(
     table:       sqlparser::ast::TableWithJoins,
     assignments: Vec<sqlparser::ast::Assignment>,
     selection:   Option<SqlExpr>,
+    returning:   Option<Vec<sqlparser::ast::SelectItem>>,
 ) -> FalconResult<UpdateStmt> {
     let name = match &table.relation {
         TableFactor::Table { name, .. } => name.to_string(),
@@ -485,15 +505,15 @@ fn translate_update(
     let assignments = assignments
         .iter()
         .map(|a| {
-            // `a.target` is a column path; take the last segment as the column name.
             let col = assignment_column(a)?;
             Ok((col, translate_expr(&a.value)?))
         })
         .collect::<FalconResult<Vec<_>>>()?;
 
     let filter = selection.as_ref().map(translate_expr).transpose()?;
+    let returning = translate_returning(returning.as_deref())?;
 
-    Ok(UpdateStmt { table: name, assignments, filter })
+    Ok(UpdateStmt { table: name, assignments, filter, returning })
 }
 
 fn assignment_column(a: &sqlparser::ast::Assignment) -> FalconResult<String> {
@@ -527,8 +547,38 @@ fn translate_delete(del: sqlparser::ast::Delete) -> FalconResult<DeleteStmt> {
     };
 
     let filter = del.selection.as_ref().map(translate_expr).transpose()?;
+    let returning = translate_returning(del.returning.as_deref())?;
 
-    Ok(DeleteStmt { table: name, filter })
+    Ok(DeleteStmt { table: name, filter, returning })
+}
+
+/// Translate a `RETURNING` clause (a slice of `SelectItem`) into `SelectExpr` list.
+fn translate_returning(
+    items: Option<&[sqlparser::ast::SelectItem]>,
+) -> FalconResult<Vec<SelectExpr>> {
+    let Some(items) = items else { return Ok(vec![]) };
+    items.iter().enumerate().map(|(i, item)| {
+        match item {
+            SelectItem::UnnamedExpr(e) => {
+                let expr = translate_expr(e)?;
+                let alias = expr_alias(e, i);
+                Ok(SelectExpr { expr, alias })
+            }
+            SelectItem::ExprWithAlias { expr: e, alias } => {
+                let expr = translate_expr(e)?;
+                Ok(SelectExpr { expr, alias: alias.value.clone() })
+            }
+            SelectItem::Wildcard(_) => {
+                // RETURNING * — sentinel; executor expands to all columns.
+                Ok(SelectExpr { expr: Expr::Column("*".into()), alias: "*".into() })
+            }
+            SelectItem::QualifiedWildcard(name, _) => {
+                Err(FalconError::InvalidQuery(format!(
+                    "qualified wildcard {name}.* is not supported in RETURNING"
+                )))
+            }
+        }
+    }).collect()
 }
 
 // в”Ђв”Ђв”Ђ Query translation в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
@@ -537,17 +587,13 @@ fn translate_query(query: Query) -> FalconResult<ParsedQuery> {
     // в”Ђв”Ђ WITH вЂ¦ AS (вЂ¦) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     let ctes = match &query.with {
         Some(with) => {
-            if with.recursive {
-                return Err(FalconError::InvalidQuery(
-                    "WITH RECURSIVE is not supported".into(),
-                ));
-            }
+            let recursive = with.recursive;
             with.cte_tables
                 .iter()
                 .map(|cte| {
                     let name = cte.alias.name.value.clone();
                     let plan = translate_query((*cte.query).clone())?;
-                    Ok((name, plan))
+                    Ok((name, plan, recursive))
                 })
                 .collect::<FalconResult<Vec<_>>>()?
         }
@@ -609,10 +655,22 @@ fn translate_query(query: Query) -> FalconResult<ParsedQuery> {
             )),
         };
         use crate::query::join::JoinType;
+        use crate::query::expr::Expr as FExpr;
         let (on, join_type) = match &join.join_operator {
-            JoinOperator::Inner(JoinConstraint::On(expr))      => (translate_expr(expr)?, JoinType::Inner),
-            JoinOperator::LeftOuter(JoinConstraint::On(expr))  => (translate_expr(expr)?, JoinType::Left),
-            JoinOperator::RightOuter(JoinConstraint::On(expr)) => (translate_expr(expr)?, JoinType::Right),
+            JoinOperator::Inner(JoinConstraint::On(expr))         => (translate_expr(expr)?, JoinType::Inner),
+            JoinOperator::LeftOuter(JoinConstraint::On(expr))     => (translate_expr(expr)?, JoinType::Left),
+            JoinOperator::RightOuter(JoinConstraint::On(expr))    => (translate_expr(expr)?, JoinType::Right),
+            JoinOperator::FullOuter(JoinConstraint::On(expr))     => (translate_expr(expr)?, JoinType::Full),
+            // CROSS JOIN has no ON clause — store a TRUE placeholder; executor routes via JoinType::Cross.
+            JoinOperator::CrossJoin => (FExpr::Literal(crate::storage::types::ScalarValue::Boolean(Some(true))), JoinType::Cross),
+            // NATURAL JOIN: treated as INNER with the cross-product; caller must deduplicate.
+            JoinOperator::Inner(JoinConstraint::Natural)
+            | JoinOperator::LeftOuter(JoinConstraint::Natural)
+            | JoinOperator::RightOuter(JoinConstraint::Natural) => {
+                return Err(FalconError::InvalidQuery(
+                    "NATURAL JOIN is not supported — use an explicit ON condition".into()
+                ))
+            }
             other => return Err(FalconError::InvalidQuery(
                 format!("unsupported JOIN type: {other:?}")
             )),
@@ -730,6 +788,29 @@ fn try_translate_agg(e: &SqlExpr, alias: &str) -> FalconResult<Option<AggExpr>> 
         "AVG"   => AggFunc::Avg,
         "MIN"   => AggFunc::Min,
         "MAX"   => AggFunc::Max,
+        "STRING_AGG" | "GROUP_CONCAT" | "LISTAGG" => {
+            // Second arg is the separator string
+            let sep = match &func.args {
+                FunctionArguments::List(list) => {
+                    list.args.get(1).and_then(|a| match a {
+                        FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                            SqlExpr::Value(Value::SingleQuotedString(s))
+                        )) => Some(s.clone()),
+                        _ => None,
+                    }).unwrap_or_else(|| ",".to_string())
+                }
+                _ => ",".to_string(),
+            };
+            AggFunc::StringAgg { separator: sep }
+        }
+        "BOOL_AND" | "EVERY" => AggFunc::BoolAnd,
+        "BOOL_OR"  | "SOME"  => AggFunc::BoolOr,
+        "STDDEV" | "STDDEV_SAMP" | "STD" => AggFunc::Stddev { population: false },
+        "STDDEV_POP"  => AggFunc::Stddev   { population: true  },
+        "VARIANCE" | "VAR_SAMP" | "VAR" => AggFunc::Variance { population: false },
+        "VAR_POP"     => AggFunc::Variance { population: true  },
+        "FIRST"  | "FIRST_VALUE_AGG" => AggFunc::First,
+        "LAST"   | "LAST_VALUE_AGG"  => AggFunc::Last,
         _       => return Ok(None),
     };
 
@@ -776,17 +857,30 @@ fn try_translate_window(e: &SqlExpr, alias: &str) -> FalconResult<Option<WindowE
             let offset = extract_window_offset(&func.args, 1)?;
             WindowFunc::Lead(offset)
         }
-        "SUM"   => WindowFunc::Sum,
-        "AVG"   => WindowFunc::Avg,
-        "MIN"   => WindowFunc::Min,
-        "MAX"   => WindowFunc::Max,
-        "COUNT" => WindowFunc::Count,
+        "SUM"         => WindowFunc::Sum,
+        "AVG"         => WindowFunc::Avg,
+        "MIN"         => WindowFunc::Min,
+        "MAX"         => WindowFunc::Max,
+        "COUNT"       => WindowFunc::Count,
+        "FIRST_VALUE" => WindowFunc::FirstValue,
+        "LAST_VALUE"  => WindowFunc::LastValue,
+        "NTH_VALUE"   => {
+            let n = extract_window_offset(&func.args, 2)?;
+            WindowFunc::NthValue(n.max(1))
+        }
+        "PERCENT_RANK" => WindowFunc::PercentRank,
+        "CUME_DIST"    => WindowFunc::CumeDist,
+        "NTILE"        => {
+            let n = extract_window_offset(&func.args, 1)?;
+            WindowFunc::Ntile(n.max(1))
+        }
         _       => return Ok(None),
     };
 
     // Input expression (the first arg for SUM/AVG/MIN/MAX/LAG/LEAD).
     let input = match name.as_str() {
-        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" => None,
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT"
+        | "PERCENT_RANK" | "CUME_DIST" | "NTILE" => None,
         _ => {
             match &func.args {
                 FunctionArguments::List(list) => {
@@ -879,16 +973,17 @@ fn translate_window_frame(
     };
 
     Ok(match (start, end) {
-        // UNBOUNDED PRECEDING AND CURRENT ROW is exactly the cumulative frame.
+        // UNBOUNDED PRECEDING AND CURRENT ROW — standard cumulative frame.
         (None, Some(0)) => WindowFrame::Cumulative,
+        // UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING — whole partition at every row.
+        (None, None)    => WindowFrame::WholePartition,
+        // N PRECEDING AND UNBOUNDED FOLLOWING (incl. CURRENT ROW = 0 PRECEDING).
+        (Some(preceding), None) => WindowFrame::UnboundedFollowing { preceding },
+        // Bounded sliding window.
         (Some(preceding), Some(following)) => WindowFrame::Rows { preceding, following },
-        _ => {
-            return Err(FalconError::InvalidQuery(
-                "unsupported window frame: UNBOUNDED is only supported as \
-                 'UNBOUNDED PRECEDING AND CURRENT ROW'"
-                    .into(),
-            ))
-        }
+        // UNBOUNDED PRECEDING AND N FOLLOWING — unusual but valid; treat as bounded
+        // from the start of the partition (preceding = large sentinel).
+        (None, Some(following)) => WindowFrame::Rows { preceding: usize::MAX / 2, following },
     })
 }
 

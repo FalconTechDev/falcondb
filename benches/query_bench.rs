@@ -48,7 +48,10 @@ use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use duckdb::Connection;
-use polars::prelude::{col, lit, LazyFrame, ScanArgsParquet, SortMultipleOptions};
+use polars::prelude::{
+    col, lit, DataFrame, IntoLazy, JoinArgs, JoinType, ScanArgsParquet, SortMultipleOptions,
+    UniqueKeepStrategy,
+};
 use datafusion::prelude::SessionContext;
 use tokio::runtime::Runtime;
 
@@ -109,8 +112,19 @@ fn load_duckdb(path: &Path) -> Connection {
     conn
 }
 
-fn load_polars(path: &Path) -> LazyFrame {
-    polars::prelude::LazyFrame::scan_parquet(path, ScanArgsParquet::default()).unwrap()
+/// Materialised, like every other engine here.
+///
+/// This used to return the `LazyFrame` from `scan_parquet` straight into the timed
+/// closure, so each Polars iteration re-read and re-decoded the Parquet file from
+/// disk while FalconDB, DuckDB and DataFusion queried tables already resident in
+/// memory. Every "FalconDB is N× faster than Polars" number that came out of this
+/// file before this change was measuring our in-memory query against their file
+/// read, and was inflated by an unknown amount.
+fn load_polars(path: &Path) -> DataFrame {
+    polars::prelude::LazyFrame::scan_parquet(path, ScanArgsParquet::default())
+        .unwrap()
+        .collect()
+        .unwrap()
 }
 
 fn load_datafusion(path: &Path, rt: &Runtime) -> SessionContext {
@@ -188,7 +202,7 @@ fn bench_full_scan(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("polars", rows), &lf, |b, lf| {
             b.iter(|| {
-                let df = black_box(lf).clone()
+                let df = black_box(lf).clone().lazy()
                     .select([col("score").sum().alias("s")])
                     .collect().unwrap();
                 df.column("s").unwrap().f64().unwrap().get(0).unwrap()
@@ -261,7 +275,7 @@ fn bench_filter(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("polars", rows), &lf, |b, lf| {
             b.iter(|| {
-                black_box(lf).clone()
+                black_box(lf).clone().lazy()
                     .filter(col("score").gt(lit(50.0f64)))
                     .collect().unwrap()
                     .height()
@@ -278,6 +292,418 @@ fn bench_filter(c: &mut Criterion) {
                     .sql(black_box("SELECT * FROM bench WHERE score > 50")).await.unwrap();
                 let out = df.collect().await.unwrap();
                 out.iter().map(|b| b.num_rows()).sum::<usize>()
+            }));
+        });
+    }
+    g.finish();
+}
+
+
+// ─── DML ──────────────────────────────────────────────────────────────────────
+
+/// UPDATE and DELETE, the last operations with no benchmark at all.
+///
+/// Every unmeasured area examined in this file so far turned out to hold a large
+/// gap — a join 109x behind, DISTINCT and window functions last of four — because
+/// passing correctness tests say nothing about time. DML is what is left.
+///
+/// Only FalconDB and DuckDB run here: Polars has no in-place UPDATE/DELETE, and
+/// timing a rebuild-the-frame equivalent against a mutation would compare two
+/// different things, which is the mistake this file already made once with joins.
+///
+/// `iter_batched` rebuilds the table in the untimed setup closure, because a
+/// DELETE that has already run has nothing left to delete and would time an empty
+/// statement.
+fn bench_dml(c: &mut Criterion) {
+    let mut g = c.benchmark_group("dml");
+    let rows = 100_000usize;
+    g.throughput(Throughput::Elements(rows as u64));
+
+    let dir  = tempfile::tempdir().unwrap();
+    let path = write_parquet_file(rows, &dir);
+
+    // Half the rows match, so neither statement is a no-op or a full rewrite.
+    const UPDATE_SQL: &str = "UPDATE bench SET score = score + 1 WHERE score > 50";
+    const DELETE_SQL: &str = "DELETE FROM bench WHERE score > 50";
+
+    for (label, sql) in [("update", UPDATE_SQL), ("delete", DELETE_SQL)] {
+        g.bench_with_input(BenchmarkId::new(format!("falcondb_{label}"), rows), &path, |b, p| {
+            b.iter_batched(
+                || load_falcon(p),
+                |db| { db.sql(black_box(sql)).unwrap(); },
+                BatchSize::LargeInput,
+            );
+        });
+
+        g.bench_with_input(BenchmarkId::new(format!("duckdb_{label}"), rows), &path, |b, p| {
+            b.iter_batched(
+                || load_duckdb(p),
+                |conn| { conn.execute_batch(black_box(sql)).unwrap(); },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    g.finish();
+}
+
+// ─── DISTINCT and window functions ───────────────────────────────────────────
+
+/// Neither DISTINCT nor window functions had a benchmark. That is exactly the gap
+/// that hid a 100x-slow INNER JOIN: eleven join tests all passed, none timed
+/// anything, and nine rounds of tuning went into operators that were already
+/// ahead. These two are the remaining unmeasured operators reachable from SQL.
+fn bench_distinct(c: &mut Criterion) {
+    let mut g = c.benchmark_group("distinct");
+    let rt = Runtime::new().unwrap();
+
+    for &rows in &[100_000usize, 1_000_000] {
+        g.throughput(Throughput::Elements(rows as u64));
+        let dir  = tempfile::tempdir().unwrap();
+        let path = write_parquet_file(rows, &dir);
+
+        let db   = load_falcon(&path);
+        let conn = load_duckdb(&path);
+        let df   = load_polars(&path);
+        let ctx  = load_datafusion(&path, &rt);
+
+        // score = (i % 100) + 0.5, so this is 100 distinct values out of `rows`:
+        // every row is hashed, and almost all of them collapse.
+        const SQL: &str = "SELECT DISTINCT score FROM bench";
+        const EXPECTED: usize = 100;
+
+        g.bench_with_input(BenchmarkId::new("falcondb", rows), &db, |b, db| {
+            b.iter_batched(
+                || String::from(SQL),
+                |sql| {
+                    let n = db.sql(&sql).unwrap().row_count();
+                    assert_eq!(n, EXPECTED, "distinct returned {n} rows");
+                    n
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_with_input(BenchmarkId::new("polars", rows), &df, |b, df| {
+            b.iter(|| {
+                black_box(df).clone().lazy()
+                    .select([col("score")])
+                    .unique(None, UniqueKeepStrategy::Any)
+                    .collect().unwrap()
+                    .height()
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("duckdb", rows), &conn, |b, c| {
+            b.iter(|| duck_count(black_box(c), SQL));
+        });
+
+        g.bench_with_input(BenchmarkId::new("datafusion", rows), &ctx, |b, ctx| {
+            b.iter(|| rt.block_on(async {
+                let df = black_box(ctx).sql(black_box(SQL)).await.unwrap();
+                df.collect().await.unwrap().iter().map(|b| b.num_rows()).sum::<usize>()
+            }));
+        });
+    }
+    g.finish();
+}
+
+/// Polars is absent here on purpose: it expresses ROW_NUMBER through a different
+/// shape entirely, and timing a different formulation against ours is how the
+/// earlier comparisons in this file went wrong. The three SQL engines run the same
+/// statement.
+fn bench_window(c: &mut Criterion) {
+    let mut g = c.benchmark_group("window_row_number");
+    let rt = Runtime::new().unwrap();
+
+    for &rows in &[100_000usize] {
+        g.throughput(Throughput::Elements(rows as u64));
+        let dir  = tempfile::tempdir().unwrap();
+        let path = write_parquet_file(rows, &dir);
+
+        let db   = load_falcon(&path);
+        let conn = load_duckdb(&path);
+        let ctx  = load_datafusion(&path, &rt);
+
+        const SQL: &str =
+            "SELECT ROW_NUMBER() OVER (ORDER BY score DESC) AS rn FROM bench";
+
+        g.bench_with_input(BenchmarkId::new("falcondb", rows), &db, |b, db| {
+            b.iter_batched(
+                || String::from(SQL),
+                |sql| {
+                    let n = db.sql(&sql).unwrap().row_count();
+                    assert_eq!(n, rows, "window returned {n} rows");
+                    n
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_with_input(BenchmarkId::new("duckdb", rows), &conn, |b, c| {
+            b.iter(|| duck_count(black_box(c), SQL));
+        });
+
+        g.bench_with_input(BenchmarkId::new("datafusion", rows), &ctx, |b, ctx| {
+            b.iter(|| rt.block_on(async {
+                let df = black_box(ctx).sql(black_box(SQL)).await.unwrap();
+                df.collect().await.unwrap().iter().map(|b| b.num_rows()).sum::<usize>()
+            }));
+        });
+    }
+    g.finish();
+}
+
+// ─── JOIN ─────────────────────────────────────────────────────────────────────
+
+/// A dimension table to join `bench` against: every tenth `id`, plus a payload
+/// column so the join has to carry something.
+fn write_lookup_file(rows: usize, dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("lookup.parquet");
+    let schema = Schema::new(vec![
+        Field::required("lid", DataType::Int64),
+        Field::required("label", DataType::Utf8),
+    ]);
+    let n = rows / 10;
+    let batch = RecordBatch::new(schema.clone(), vec![
+        ColumnBuilder::int64((0..n).map(|i| Some((i * 10) as i64)).collect()),
+        ColumnBuilder::utf8_from_str((0..n).map(|i| Some(DEPTS[i % 5])).collect()),
+    ]).unwrap();
+    let mut table = Table::new("lookup", schema);
+    table.append_batch(batch).unwrap();
+    falcondb::storage::parquet_io::write_parquet(&table.batches, &path).unwrap();
+    path
+}
+
+/// JOIN was not measured at all until now — neither were window functions or
+/// DISTINCT. Nine rounds of tuning went into six query shapes while whole
+/// subsystems went unbenchmarked, and the two worst findings of the series (a
+/// per-1024-row `execute_select`, a threshold that never fired) both came from
+/// exactly that kind of unexamined corner.
+fn bench_join(c: &mut Criterion) {
+    let mut g = c.benchmark_group("inner_join");
+    let rt = Runtime::new().unwrap();
+
+    for &rows in &[100_000usize, 1_000_000] {
+        g.throughput(Throughput::Elements(rows as u64));
+        let dir = tempfile::tempdir().unwrap();
+        let bench_path = write_parquet_file(rows, &dir);
+        let lookup_path = write_lookup_file(rows, &dir);
+
+        // Every engine joins `bench` to `lookup` on id = lid and counts the result,
+        // so no engine can win by materialising less of it.
+        const JOIN_SQL: &str =
+            "SELECT COUNT(*) AS n FROM bench JOIN lookup ON bench.id = lookup.lid";
+        let expected = rows / 10;
+
+        let db = Database::in_memory();
+        db.load_parquet(&bench_path, "bench").unwrap();
+        db.load_parquet(&lookup_path, "lookup").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE bench AS SELECT * FROM read_parquet('{}');
+             CREATE TABLE lookup AS SELECT * FROM read_parquet('{}');",
+            bench_path.display(), lookup_path.display()
+        )).unwrap();
+
+        let left_df = load_polars(&bench_path);
+        let right_df = load_polars(&lookup_path);
+
+        let ctx = SessionContext::new();
+        rt.block_on(async {
+            ctx.register_parquet("bench", bench_path.to_str().unwrap(), Default::default())
+                .await.unwrap();
+            ctx.register_parquet("lookup", lookup_path.to_str().unwrap(), Default::default())
+                .await.unwrap();
+        });
+
+        g.bench_with_input(BenchmarkId::new("falcondb", rows), &db, |b, db| {
+            b.iter_batched(
+                || String::from(JOIN_SQL),
+                |sql| {
+                    let r = db.sql(&sql).unwrap();
+                    let got = r.batches[0].column(0).get(0).unwrap().as_f64().unwrap() as usize;
+                    assert_eq!(got, expected, "join produced the wrong row count");
+                    got
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_with_input(BenchmarkId::new("polars", rows), &(left_df, right_df), |b, (l, r)| {
+            b.iter(|| {
+                let df = black_box(l).clone().lazy()
+                    .join(
+                        black_box(r).clone().lazy(),
+                        [col("id")], [col("lid")],
+                        JoinArgs::new(JoinType::Inner),
+                    )
+                    .select([col("id").count().alias("n")])
+                    .collect().unwrap();
+                df.column("n").unwrap().get(0).unwrap();
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("duckdb", rows), &conn, |b, c| {
+            b.iter(|| {
+                black_box(c).query_row(JOIN_SQL, [], |r| r.get::<_, i64>(0)).unwrap()
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("datafusion", rows), &ctx, |b, ctx| {
+            b.iter(|| rt.block_on(async {
+                let df = black_box(ctx).sql(black_box(JOIN_SQL)).await.unwrap();
+                df.collect().await.unwrap().len()
+            }));
+        });
+    }
+    g.finish();
+}
+
+
+/// LEFT, SEMI and ANTI joins, none of which had a benchmark.
+///
+/// Only INNER was measured, and INNER alone turned out to be 109x behind Polars.
+/// These three take different code paths: LEFT goes through the same probe but
+/// keeps unmatched rows, while SEMI and ANTI go through
+/// `execute_hash_semi_anti_join`, which is a separate function with its own probe
+/// loop. Polars is absent because EXISTS has no direct equivalent in its
+/// expression API, and timing a different formulation is what made the earlier
+/// Polars comparisons in this file invalid.
+fn bench_join_variants(c: &mut Criterion) {
+    let mut g = c.benchmark_group("join_variants");
+    let rt = Runtime::new().unwrap();
+
+    let rows = 100_000usize;
+    g.throughput(Throughput::Elements(rows as u64));
+    let dir = tempfile::tempdir().unwrap();
+    let bench_path = write_parquet_file(rows, &dir);
+    let lookup_path = write_lookup_file(rows, &dir);
+
+    let db = Database::in_memory();
+    db.load_parquet(&bench_path, "bench").unwrap();
+    db.load_parquet(&lookup_path, "lookup").unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE bench AS SELECT * FROM read_parquet('{}');
+         CREATE TABLE lookup AS SELECT * FROM read_parquet('{}');",
+        bench_path.display(), lookup_path.display()
+    )).unwrap();
+
+    let ctx = SessionContext::new();
+    rt.block_on(async {
+        ctx.register_parquet("bench", bench_path.to_str().unwrap(), Default::default())
+            .await.unwrap();
+        ctx.register_parquet("lookup", lookup_path.to_str().unwrap(), Default::default())
+            .await.unwrap();
+    });
+
+    // (label, SQL, expected COUNT(*)) — every engine answers the same question and
+    // returns one number, so none can win by materialising less.
+    let cases: [(&str, &str, usize); 3] = [
+        (
+            "left",
+            "SELECT COUNT(*) AS n FROM bench LEFT JOIN lookup ON bench.id = lookup.lid",
+            rows,
+        ),
+        (
+            "semi",
+            "SELECT COUNT(*) AS n FROM bench              WHERE EXISTS (SELECT 1 FROM lookup WHERE lookup.lid = bench.id)",
+            rows / 10,
+        ),
+        (
+            "anti",
+            "SELECT COUNT(*) AS n FROM bench              WHERE NOT EXISTS (SELECT 1 FROM lookup WHERE lookup.lid = bench.id)",
+            rows - rows / 10,
+        ),
+    ];
+
+    for (label, sql, expected) in cases {
+        g.bench_with_input(BenchmarkId::new(format!("falcondb_{label}"), rows), &db, |b, db| {
+            b.iter_batched(
+                || String::from(sql),
+                |q| {
+                    let r = db.sql(&q).unwrap();
+                    let got = r.batches[0].column(0).get(0).unwrap().as_f64().unwrap() as usize;
+                    assert_eq!(got, expected, "{label} join counted {got}, expected {expected}");
+                    got
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_with_input(BenchmarkId::new(format!("duckdb_{label}"), rows), &conn, |b, c| {
+            b.iter(|| black_box(c).query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap());
+        });
+
+        g.bench_with_input(BenchmarkId::new(format!("datafusion_{label}"), rows), &ctx, |b, ctx| {
+            b.iter(|| rt.block_on(async {
+                let df = black_box(ctx).sql(black_box(sql)).await.unwrap();
+                df.collect().await.unwrap().len()
+            }));
+        });
+    }
+    g.finish();
+}
+
+// ─── INTEGER SUM ──────────────────────────────────────────────────────────────
+
+/// `full_scan` sums `score`, which is Float64, so nothing here covered SUM over an
+/// integer column — and the two take different kernels. This group exists so a
+/// change to the integer path can be seen at all.
+fn bench_int_sum(c: &mut Criterion) {
+    let mut g = c.benchmark_group("int_sum");
+    let rt = Runtime::new().unwrap();
+
+    for &rows in &[10_000usize, 100_000, 1_000_000] {
+        g.throughput(Throughput::Elements(rows as u64));
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_parquet_file(rows, &dir);
+
+        let db = load_falcon(&path);
+        let lf = load_polars(&path);
+        let conn = load_duckdb(&path);
+        let ctx = load_datafusion(&path, &rt);
+
+        const INT_SQL: &str = "SELECT SUM(id) AS s FROM bench";
+        // id = 0..rows, so the sum is the (n-1)n/2 triangular number.
+        let expected = ((rows as f64 - 1.0) * rows as f64) / 2.0;
+
+        g.bench_with_input(BenchmarkId::new("falcondb", rows), &db, |b, db| {
+            b.iter_batched(
+                || String::from(INT_SQL),
+                |sql| {
+                    let r = db.sql(&sql).unwrap();
+                    let got = r.batches[0].column(0).get(0).unwrap().as_f64().unwrap();
+                    assert!((got - expected).abs() < 1.0, "int sum {got}, expected {expected}");
+                    got
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        g.bench_with_input(BenchmarkId::new("polars", rows), &lf, |b, lf| {
+            b.iter(|| {
+                let df = black_box(lf).clone().lazy()
+                    .select([col("id").sum().alias("s")])
+                    .collect().unwrap();
+                df.column("s").unwrap().get(0).unwrap();
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("duckdb", rows), &conn, |b, c| {
+            b.iter(|| {
+                black_box(c)
+                    .query_row(INT_SQL, [], |r| r.get::<_, i64>(0))
+                    .unwrap()
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("datafusion", rows), &ctx, |b, ctx| {
+            b.iter(|| rt.block_on(async {
+                let df = black_box(ctx).sql(black_box(INT_SQL)).await.unwrap();
+                df.collect().await.unwrap().len()
             }));
         });
     }
@@ -325,7 +751,7 @@ fn bench_group_by(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("polars", rows), &lf, |b, lf| {
             b.iter(|| {
-                black_box(lf).clone()
+                black_box(lf).clone().lazy()
                     .group_by([col("dept")])
                     .agg([
                         col("id").count().alias("cnt"),
@@ -387,7 +813,7 @@ fn bench_sort(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("polars", rows), &lf, |b, lf| {
             b.iter(|| {
-                black_box(lf).clone()
+                black_box(lf).clone().lazy()
                     .sort(["score"], SortMultipleOptions::default().with_order_descending(true))
                     .collect().unwrap()
                     .height()
@@ -443,7 +869,7 @@ fn bench_sql_pipeline(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("polars", rows), &lf, |b, lf| {
             b.iter(|| {
-                black_box(lf).clone()
+                black_box(lf).clone().lazy()
                     .group_by([col("dept")])
                     .agg([
                         col("id").count().alias("cnt"),
@@ -517,6 +943,12 @@ fn bench_streaming(c: &mut Criterion) {
 
 criterion_group!(benches,
     bench_full_scan,
+    bench_int_sum,
+    bench_join,
+    bench_join_variants,
+    bench_dml,
+    bench_distinct,
+    bench_window,
     bench_filter,
     bench_group_by,
     bench_sort,

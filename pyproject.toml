@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "falcondb"
+version = "0.1.0"
+description = "High-performance columnar analytical database engine"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["database", "analytics", "columnar", "sql", "arrow"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Database",
+]
+
+[tool.maturin]
+features = ["python"]
+module-name = "falcondb"
+# maturin adds cdylib automatically — do not list it in Cargo.toml [lib] crate-type
+

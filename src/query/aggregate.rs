@@ -28,6 +28,13 @@ pub enum AggFunc {
     Min,
     Max,
     CountDistinct,
+    StringAgg { separator: String },
+    BoolAnd,
+    BoolOr,
+    Stddev { population: bool },
+    Variance { population: bool },
+    First,
+    Last,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +81,13 @@ enum Accumulator {
     Avg          { total: f64, count: i64 },
     Min          { value: Option<f64>, str_value: Option<String> },
     Max          { value: Option<f64>, str_value: Option<String> },
+    StringAgg    { parts: Vec<String>, sep: String },
+    BoolAnd      { result: Option<bool> },
+    BoolOr       { result: Option<bool> },
+    Stddev       { sum: f64, sum_sq: f64, count: i64, population: bool },
+    Variance     { sum: f64, sum_sq: f64, count: i64, population: bool },
+    First        { value: Option<ScalarValue> },
+    Last         { value: Option<ScalarValue> },
 }
 
 impl Accumulator {
@@ -85,6 +99,13 @@ impl Accumulator {
             AggFunc::Avg           => Self::Avg  { total: 0.0, count: 0 },
             AggFunc::Min           => Self::Min  { value: None, str_value: None },
             AggFunc::Max           => Self::Max  { value: None, str_value: None },
+            AggFunc::StringAgg { separator } => Self::StringAgg { parts: vec![], sep: separator.clone() },
+            AggFunc::BoolAnd       => Self::BoolAnd { result: None },
+            AggFunc::BoolOr        => Self::BoolOr  { result: None },
+            AggFunc::Stddev   { population } => Self::Stddev   { sum: 0.0, sum_sq: 0.0, count: 0, population: *population },
+            AggFunc::Variance { population } => Self::Variance { sum: 0.0, sum_sq: 0.0, count: 0, population: *population },
+            AggFunc::First         => Self::First { value: None },
+            AggFunc::Last          => Self::Last  { value: None },
         }
     }
 
@@ -118,6 +139,30 @@ impl Accumulator {
                         None      => s.clone(),
                     });
                 }
+            }
+            Self::StringAgg { parts, .. } => {
+                parts.push(val.to_string());
+            }
+            Self::BoolAnd { result } => {
+                let b = match val { ScalarValue::Boolean(Some(b)) => *b, _ => return };
+                *result = Some(result.unwrap_or(true) && b);
+            }
+            Self::BoolOr { result } => {
+                let b = match val { ScalarValue::Boolean(Some(b)) => *b, _ => return };
+                *result = Some(result.unwrap_or(false) || b);
+            }
+            Self::Stddev { sum, sum_sq, count, .. } | Self::Variance { sum, sum_sq, count, .. } => {
+                if let Some(v) = val.as_f64() {
+                    *sum += v;
+                    *sum_sq += v * v;
+                    *count += 1;
+                }
+            }
+            Self::First { value } => {
+                if value.is_none() { *value = Some(val.clone()); }
+            }
+            Self::Last { value } => {
+                *value = Some(val.clone());
             }
         }
     }
@@ -171,6 +216,41 @@ impl Accumulator {
                     });
                 }
             }
+            (Self::StringAgg { parts, .. }, Self::StringAgg { parts: other, .. }) => {
+                parts.extend(other);
+            }
+            (Self::BoolAnd { result }, Self::BoolAnd { result: r2 }) => {
+                *result = match (*result, r2) {
+                    (Some(a), Some(b)) => Some(a && b),
+                    (Some(a), None)    => Some(a),
+                    (None, Some(b))    => Some(b),
+                    _                  => None,
+                };
+            }
+            (Self::BoolOr { result }, Self::BoolOr { result: r2 }) => {
+                *result = match (*result, r2) {
+                    (Some(a), Some(b)) => Some(a || b),
+                    (Some(a), None)    => Some(a),
+                    (None, Some(b))    => Some(b),
+                    _                  => None,
+                };
+            }
+            (
+                Self::Stddev { sum, sum_sq, count, .. },
+                Self::Stddev { sum: s2, sum_sq: ss2, count: c2, .. },
+            ) |
+            (
+                Self::Variance { sum, sum_sq, count, .. },
+                Self::Variance { sum: s2, sum_sq: ss2, count: c2, .. },
+            ) => {
+                *sum += s2; *sum_sq += ss2; *count += c2;
+            }
+            (Self::First { value }, Self::First { value: v2 }) => {
+                if value.is_none() { *value = v2; }
+            }
+            (Self::Last { value }, Self::Last { value: v2 }) => {
+                if v2.is_some() { *value = v2; }
+            }
             // Accumulators are built from the same AggFunc list in the same order,
             // so the variants always line up. A mismatch is a bug, not input data.
             _ => unreachable!("merging accumulators of different kinds"),
@@ -198,9 +278,52 @@ impl Accumulator {
                 else if let Some(s) = str_value { ScalarValue::Utf8(Some(s.clone())) }
                 else { ScalarValue::Null }
             }
+            Self::StringAgg { parts, sep } => {
+                if parts.is_empty() { ScalarValue::Null }
+                else { ScalarValue::Utf8(Some(parts.join(sep.as_str()))) }
+            }
+            Self::BoolAnd { result } => match result {
+                Some(b) => ScalarValue::Boolean(Some(*b)),
+                None    => ScalarValue::Null,
+            },
+            Self::BoolOr { result } => match result {
+                Some(b) => ScalarValue::Boolean(Some(*b)),
+                None    => ScalarValue::Null,
+            },
+            Self::Stddev { sum, sum_sq, count, population } => {
+                if *count == 0 { return ScalarValue::Null; }
+                let n = *count as f64;
+                let mean = sum / n;
+                let var_pop = (sum_sq / n - mean * mean).max(0.0);
+                if *population {
+                    ScalarValue::Float64(Some(var_pop.sqrt()))
+                } else {
+                    if n <= 1.0 { ScalarValue::Null }
+                    else { ScalarValue::Float64(Some((var_pop * n / (n - 1.0)).sqrt())) }
+                }
+            }
+            Self::Variance { sum, sum_sq, count, population } => {
+                if *count == 0 { return ScalarValue::Null; }
+                let n = *count as f64;
+                let mean = sum / n;
+                let var_pop = sum_sq / n - mean * mean;
+                if *population {
+                    ScalarValue::Float64(Some(var_pop.max(0.0)))
+                } else {
+                    if n <= 1.0 { ScalarValue::Null }
+                    else { ScalarValue::Float64(Some((var_pop * n / (n - 1.0)).max(0.0))) }
+                }
+            }
+            Self::First { value } => value.clone().unwrap_or(ScalarValue::Null),
+            Self::Last  { value } => value.clone().unwrap_or(ScalarValue::Null),
         }
     }
 }
+
+/// Minimum rows in a single batch to justify intra-batch rayon parallelism in group-by.
+/// Below this the rayon task-spawn overhead dominates: 100k rows / 20 threads = 5k rows/task
+/// is too fine-grained. 512k ensures ≥25k rows per task on a 20-thread machine.
+const PAR_INTRA_GB_ROWS: usize = 524_288;
 
 // в”Ђв”Ђв”Ђ Fast-path batch state (parallel arrays, no boxing) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
@@ -273,9 +396,14 @@ impl GroupByExec {
     /// - All agg inputs are `Expr::Column` (numeric) OR `Expr::Literal` with `COUNT`
     /// - No CountDistinct
     fn execute_fast(&self, batches: &[RecordBatch]) -> FalconResult<Option<RecordBatch>> {
-        // No CountDistinct in fast path
+        // Skip fast path for functions that need the slow accumulator
         for agg in &self.aggs {
-            if matches!(agg.func, AggFunc::CountDistinct) { return Ok(None); }
+            if matches!(agg.func,
+                AggFunc::CountDistinct | AggFunc::StringAgg { .. }
+                | AggFunc::BoolAnd | AggFunc::BoolOr
+                | AggFunc::Stddev { .. } | AggFunc::Variance { .. }
+                | AggFunc::First | AggFunc::Last
+            ) { return Ok(None); }
         }
 
         // Single group-by column, must be Expr::Column
@@ -374,21 +502,61 @@ impl GroupByExec {
             let global_keys: Vec<String> = first_col.dict().to_vec();
             let n_g = global_keys.len();
 
-            let partial_states: FalconResult<Vec<Vec<BatchAggState>>> = batches
-                .par_iter()
-                .map(|batch| {
-                    let gb_dict = batch.column(gb_col_idx).as_utf8_column()
-                        .ok_or_else(|| FalconError::InvalidQuery(
-                            format!("Expected Utf8 column '{gb_name}'")
-                        ))?;
-                    let mut local_states: Vec<BatchAggState> = (0..n_aggs)
-                        .map(|_| BatchAggState::with_capacity(n_g))
-                        .collect();
-                    // Codes are 0-indexed dict codes; code == gid for no-null columns.
-                    self.accumulate_batch(gb_dict.codes(), batch, &agg_col_indices, &mut local_states)?;
-                    Ok(local_states)
-                })
-                .collect();
+            // Intra-batch parallel path: one large batch (e.g. from Parquet) → split into
+            // rayon chunks so each thread accumulates its own local state then we merge.
+            if batches.len() == 1 && first_b.row_count() >= PAR_INTRA_GB_ROWS {
+                let batch = first_b;
+                let gb_dict = batch.column(gb_col_idx).as_utf8_column()
+                    .ok_or_else(|| FalconError::InvalidQuery(format!("Expected Utf8 column '{gb_name}'")))?;
+                let codes = gb_dict.codes();
+                let n_rows = codes.len();
+                let n_threads = rayon::current_num_threads().max(1);
+                let chunk_size = ((n_rows + n_threads - 1) / n_threads).max(1024);
+                let partial: FalconResult<Vec<Vec<BatchAggState>>> = codes
+                    .par_chunks(chunk_size)
+                    .enumerate()
+                    .map(|(ci, codes_chunk)| {
+                        let row_start = ci * chunk_size;
+                        let mut local: Vec<BatchAggState> = (0..n_aggs)
+                            .map(|_| BatchAggState::with_capacity(n_g))
+                            .collect();
+                        self.accumulate_batch(codes_chunk, row_start, batch, &agg_col_indices, &mut local)?;
+                        Ok(local)
+                    })
+                    .collect();
+                let mut final_states: Vec<BatchAggState> = (0..n_aggs)
+                    .map(|_| BatchAggState::with_capacity(n_g))
+                    .collect();
+                for local in partial? {
+                    for (agg_idx, agg) in self.aggs.iter().enumerate() {
+                        for g in 0..n_g {
+                            merge_state_entry(&agg.func, &local[agg_idx], g, &mut final_states[agg_idx], g);
+                        }
+                    }
+                }
+                return self.build_fast_result_utf8(gb_name, global_keys, final_states);
+            }
+
+            macro_rules! map_batches_utf8_nonnull {
+                ($iter:expr) => {
+                    $iter.map(|batch| {
+                        let gb_dict = batch.column(gb_col_idx).as_utf8_column()
+                            .ok_or_else(|| FalconError::InvalidQuery(
+                                format!("Expected Utf8 column '{gb_name}'")
+                            ))?;
+                        let mut local_states: Vec<BatchAggState> = (0..n_aggs)
+                            .map(|_| BatchAggState::with_capacity(n_g))
+                            .collect();
+                        self.accumulate_batch(gb_dict.codes(), 0, batch, &agg_col_indices, &mut local_states)?;
+                        Ok(local_states)
+                    }).collect()
+                };
+            }
+            let partial_states: FalconResult<Vec<Vec<BatchAggState>>> = if batches.len() < 32 {
+                map_batches_utf8_nonnull!(batches.iter())
+            } else {
+                map_batches_utf8_nonnull!(batches.par_iter())
+            };
 
             // Merge: simple indexed array addition — no HashMap, no string comparison.
             let mut final_states: Vec<BatchAggState> = (0..n_aggs)
@@ -409,9 +577,7 @@ impl GroupByExec {
 
         // NULLABLE PATH — at least one batch has null GB values.
         // Use per-batch key tracking and HashMap-based merge to handle the extra null group.
-        let partials: FalconResult<Vec<(Vec<String>, Vec<BatchAggState>)>> = batches
-            .par_iter()
-            .map(|batch| {
+        let batch_fn_utf8_null = |batch: &RecordBatch| -> FalconResult<(Vec<String>, Vec<BatchAggState>)> {
                 let gb_col = batch.column(gb_col_idx);
                 let gb_dict = gb_col.as_utf8_column()
                     .ok_or_else(|| FalconError::InvalidQuery(
@@ -453,10 +619,14 @@ impl GroupByExec {
                     };
                     batch_gids.push(gid);
                 }
-                self.accumulate_batch(&batch_gids, batch, &agg_col_indices, &mut local_states)?;
+                self.accumulate_batch(&batch_gids, 0, batch, &agg_col_indices, &mut local_states)?;
                 Ok((local_keys, local_states))
-            })
-            .collect();
+        };
+        let partials: FalconResult<Vec<(Vec<String>, Vec<BatchAggState>)>> = if batches.len() < 32 {
+            batches.iter().map(batch_fn_utf8_null).collect()
+        } else {
+            batches.par_iter().map(batch_fn_utf8_null).collect()
+        };
 
         let mut final_keys:   Vec<String>          = Vec::new();
         let mut final_map:    FastMap<String, u32> = FastMap::default();
@@ -500,39 +670,38 @@ impl GroupByExec {
             .map(|&n| n.and_then(|name| first_i.schema.column_index(name).ok()))
             .collect();
 
-        let partials: FalconResult<Vec<(Vec<i64>, Vec<BatchAggState>)>> = batches
-            .par_iter()
-            .map(|batch| {
-                let n_rows = batch.row_count();
-                let gb_col = batch.column(gb_col_idx_i);
-                let gb_i64 = gb_col.as_int64_values()
-                    .ok_or_else(|| FalconError::InvalidQuery(
-                        format!("Expected Int64 column '{gb_name}'")
-                    ))?;
-
-                let mut local_keys:   Vec<i64>           = Vec::new();
-                let mut local_map:    FastMap<i64, u32>  = FastMap::default();
-                let mut local_states: Vec<BatchAggState> = (0..n_aggs).map(|_| BatchAggState::new()).collect();
-
-                let mut batch_gids: Vec<u32> = Vec::with_capacity(n_rows);
-                for row in 0..n_rows {
-                    let key: i64 = gb_i64[row].unwrap_or(i64::MIN);
-                    let gid = if let Some(&id) = local_map.get(&key) {
-                        id
-                    } else {
-                        let id = local_keys.len() as u32;
-                        local_keys.push(key);
-                        local_map.insert(key, id);
-                        for s in &mut local_states { s.push_group(); }
-                        id
-                    };
-                    batch_gids.push(gid);
-                }
-
-                self.accumulate_batch(&batch_gids, batch, &agg_col_indices_i, &mut local_states)?;
-                Ok((local_keys, local_states))
-            })
-            .collect();
+        let batch_fn_i64 = |batch: &RecordBatch| -> FalconResult<(Vec<i64>, Vec<BatchAggState>)> {
+            let n_rows = batch.row_count();
+            let gb_col = batch.column(gb_col_idx_i);
+            let gb_i64 = gb_col.as_int64_values()
+                .ok_or_else(|| FalconError::InvalidQuery(
+                    format!("Expected Int64 column '{gb_name}'")
+                ))?;
+            let mut local_keys:   Vec<i64>           = Vec::new();
+            let mut local_map:    FastMap<i64, u32>  = FastMap::default();
+            let mut local_states: Vec<BatchAggState> = (0..n_aggs).map(|_| BatchAggState::new()).collect();
+            let mut batch_gids: Vec<u32> = Vec::with_capacity(n_rows);
+            for row in 0..n_rows {
+                let key: i64 = gb_i64[row].unwrap_or(i64::MIN);
+                let gid = if let Some(&id) = local_map.get(&key) {
+                    id
+                } else {
+                    let id = local_keys.len() as u32;
+                    local_keys.push(key);
+                    local_map.insert(key, id);
+                    for s in &mut local_states { s.push_group(); }
+                    id
+                };
+                batch_gids.push(gid);
+            }
+            self.accumulate_batch(&batch_gids, 0, batch, &agg_col_indices_i, &mut local_states)?;
+            Ok((local_keys, local_states))
+        };
+        let partials: FalconResult<Vec<(Vec<i64>, Vec<BatchAggState>)>> = if batches.len() < 32 {
+            batches.iter().map(batch_fn_i64).collect()
+        } else {
+            batches.par_iter().map(batch_fn_i64).collect()
+        };
 
         // в”Ђв”Ђ Merge partial results в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         let mut final_keys:   Vec<i64>           = Vec::new();
@@ -565,6 +734,7 @@ impl GroupByExec {
     fn accumulate_batch(
         &self,
         batch_gids:      &[u32],
+        row_start:       usize,
         batch:           &RecordBatch,
         agg_col_indices: &[Option<usize>],
         states:          &mut [BatchAggState],
@@ -589,7 +759,7 @@ impl GroupByExec {
                 let (left, right) = states.split_at_mut(j);
                 let sum_st = &mut left[i];
                 let avg_st = &mut right[0];  // right[0] == states[j]
-                for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
+                for (&gid, &v) in batch_gids.iter().zip(c.dense()[row_start..].iter()) {
                     let g = gid as usize;
                     sum_st.sum[g]    += v;
                     sum_st.has_val[g] = true;
@@ -622,8 +792,8 @@ impl GroupByExec {
                     if !c.has_nulls() {
                         for &gid in batch_gids { state.count[gid as usize] += 1; }
                     } else {
-                        for (row, &gid) in batch_gids.iter().enumerate() {
-                            if c.is_valid(row) { state.count[gid as usize] += 1; }
+                        for (r, &gid) in batch_gids.iter().enumerate() {
+                            if c.is_valid(row_start + r) { state.count[gid as usize] += 1; }
                         }
                     }
                 }
@@ -631,33 +801,33 @@ impl GroupByExec {
                     if !c.has_nulls() {
                         for &gid in batch_gids { state.count[gid as usize] += 1; }
                     } else {
-                        for (row, &gid) in batch_gids.iter().enumerate() {
-                            if c.is_valid(row) { state.count[gid as usize] += 1; }
+                        for (r, &gid) in batch_gids.iter().enumerate() {
+                            if c.is_valid(row_start + r) { state.count[gid as usize] += 1; }
                         }
                     }
                 }
                 (AggFunc::Count, Column::Int32(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if c.is_valid(row) { state.count[gid as usize] += 1; }
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if c.is_valid(row_start + r) { state.count[gid as usize] += 1; }
                     }
                 }
                 (AggFunc::Count, Column::Utf8(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if c.get_str(row).is_some() { state.count[gid as usize] += 1; }
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if c.get_str(row_start + r).is_some() { state.count[gid as usize] += 1; }
                     }
                 }
 
                 // в”Ђв”Ђ SUM в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
                 (AggFunc::Sum, Column::Float64(c)) => {
                     if !c.has_nulls() {
-                        for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
+                        for (&gid, &v) in batch_gids.iter().zip(c.dense()[row_start..].iter()) {
                             let g = gid as usize;
                             state.sum[g] += v;
                             state.has_val[g] = true;
                         }
                     } else {
-                        for (row, &gid) in batch_gids.iter().enumerate() {
-                            if let Some(v) = c.get(row) {
+                        for (r, &gid) in batch_gids.iter().enumerate() {
+                            if let Some(v) = c.get(row_start + r) {
                                 let g = gid as usize;
                                 state.sum[g] += v;
                                 state.has_val[g] = true;
@@ -667,14 +837,14 @@ impl GroupByExec {
                 }
                 (AggFunc::Sum, Column::Int64(c)) => {
                     if !c.has_nulls() {
-                        for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
+                        for (&gid, &v) in batch_gids.iter().zip(c.dense()[row_start..].iter()) {
                             let g = gid as usize;
                             state.sum[g] += v as f64;
                             state.has_val[g] = true;
                         }
                     } else {
-                        for (row, &gid) in batch_gids.iter().enumerate() {
-                            if let Some(v) = c.get(row) {
+                        for (r, &gid) in batch_gids.iter().enumerate() {
+                            if let Some(v) = c.get(row_start + r) {
                                 let g = gid as usize;
                                 state.sum[g] += v as f64;
                                 state.has_val[g] = true;
@@ -683,8 +853,8 @@ impl GroupByExec {
                     }
                 }
                 (AggFunc::Sum, Column::Int32(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if let Some(v) = c.get(row_start + r) {
                             let g = gid as usize;
                             state.sum[g] += v as f64;
                             state.has_val[g] = true;
@@ -695,14 +865,14 @@ impl GroupByExec {
                 // в”Ђв”Ђ AVG в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
                 (AggFunc::Avg, Column::Float64(c)) => {
                     if !c.has_nulls() {
-                        for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
+                        for (&gid, &v) in batch_gids.iter().zip(c.dense()[row_start..].iter()) {
                             let g = gid as usize;
                             state.sum[g]   += v;
                             state.count[g] += 1;
                         }
                     } else {
-                        for (row, &gid) in batch_gids.iter().enumerate() {
-                            if let Some(v) = c.get(row) {
+                        for (r, &gid) in batch_gids.iter().enumerate() {
+                            if let Some(v) = c.get(row_start + r) {
                                 let g = gid as usize;
                                 state.sum[g]   += v;
                                 state.count[g] += 1;
@@ -712,14 +882,14 @@ impl GroupByExec {
                 }
                 (AggFunc::Avg, Column::Int64(c)) => {
                     if !c.has_nulls() {
-                        for (&gid, &v) in batch_gids.iter().zip(c.dense().iter()) {
+                        for (&gid, &v) in batch_gids.iter().zip(c.dense()[row_start..].iter()) {
                             let g = gid as usize;
                             state.sum[g]   += v as f64;
                             state.count[g] += 1;
                         }
                     } else {
-                        for (row, &gid) in batch_gids.iter().enumerate() {
-                            if let Some(v) = c.get(row) {
+                        for (r, &gid) in batch_gids.iter().enumerate() {
+                            if let Some(v) = c.get(row_start + r) {
                                 let g = gid as usize;
                                 state.sum[g]   += v as f64;
                                 state.count[g] += 1;
@@ -728,8 +898,8 @@ impl GroupByExec {
                     }
                 }
                 (AggFunc::Avg, Column::Int32(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if let Some(v) = c.get(row_start + r) {
                             let g = gid as usize;
                             state.sum[g]   += v as f64;
                             state.count[g] += 1;
@@ -739,8 +909,8 @@ impl GroupByExec {
 
                 // в”Ђв”Ђ MIN в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
                 (AggFunc::Min, Column::Float64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if let Some(v) = c.get(row_start + r) {
                             let g = gid as usize;
                             if !state.has_val[g] || v < state.sum[g] {
                                 state.sum[g] = v; state.has_val[g] = true;
@@ -749,8 +919,8 @@ impl GroupByExec {
                     }
                 }
                 (AggFunc::Min, Column::Int64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if let Some(v) = c.get(row_start + r) {
                             let g  = gid as usize;
                             let vf = v as f64;
                             if !state.has_val[g] || vf < state.sum[g] {
@@ -762,8 +932,8 @@ impl GroupByExec {
 
                 // в”Ђв”Ђ MAX в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
                 (AggFunc::Max, Column::Float64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if let Some(v) = c.get(row_start + r) {
                             let g = gid as usize;
                             if !state.has_val[g] || v > state.sum[g] {
                                 state.sum[g] = v; state.has_val[g] = true;
@@ -772,8 +942,8 @@ impl GroupByExec {
                     }
                 }
                 (AggFunc::Max, Column::Int64(c)) => {
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = c.get(row) {
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if let Some(v) = c.get(row_start + r) {
                             let g  = gid as usize;
                             let vf = v as f64;
                             if !state.has_val[g] || vf > state.sum[g] {
@@ -790,8 +960,8 @@ impl GroupByExec {
                             "Cannot aggregate '{}' as float", agg.alias
                         ))
                     })?;
-                    for (row, &gid) in batch_gids.iter().enumerate() {
-                        if let Some(v) = vals[row] {
+                    for (r, &gid) in batch_gids.iter().enumerate() {
+                        if let Some(v) = vals[row_start + r] {
                             let g = gid as usize;
                             match &agg.func {
                                 AggFunc::Sum => { state.sum[g] += v; state.has_val[g] = true; }
@@ -912,13 +1082,20 @@ impl GroupByExec {
             Ok(a)
         };
 
-        let (groups, key_order, group_key_values) = batches
-            .par_iter()
-            .try_fold(empty, |mut acc, batch| -> FalconResult<Partial> {
+        let (groups, key_order, group_key_values) = if batches.len() < 32 {
+            batches.iter().try_fold(empty(), |mut acc, batch| -> FalconResult<Partial> {
                 self.accumulate_slow(batch, &mut acc.0, &mut acc.1, &mut acc.2)?;
                 Ok(acc)
-            })
-            .try_reduce(empty, merge)?;
+            })?
+        } else {
+            batches
+                .par_iter()
+                .try_fold(empty, |mut acc, batch| -> FalconResult<Partial> {
+                    self.accumulate_slow(batch, &mut acc.0, &mut acc.1, &mut acc.2)?;
+                    Ok(acc)
+                })
+                .try_reduce(empty, merge)?
+        };
 
         self.build_slow_result(&groups, &key_order, &group_key_values)
     }
@@ -997,7 +1174,7 @@ fn merge_state_entry(
     dst_gi: usize,
 ) {
     match func {
-        AggFunc::Count | AggFunc::CountDistinct => {
+        AggFunc::Count => {
             dst.count[dst_gi] += src.count[src_gi];
         }
         AggFunc::Sum => {
@@ -1022,6 +1199,11 @@ fn merge_state_entry(
                 dst.has_val[dst_gi] = true;
             }
         }
+        AggFunc::CountDistinct
+        | AggFunc::StringAgg { .. }
+        | AggFunc::BoolAnd | AggFunc::BoolOr
+        | AggFunc::Stddev { .. } | AggFunc::Variance { .. }
+        | AggFunc::First | AggFunc::Last => unreachable!("not in fast path"),
     }
 }
 
@@ -1056,43 +1238,80 @@ pub fn execute_agg_only(
 
     // Accumulate each batch independently, then merge. Aggregates are associative
     // over disjoint row ranges, so this is safe and lets every core work.
-    let accumulators = batches
-        .par_iter()
-        .try_fold(
-            || aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
-            |mut accs, batch| -> FalconResult<Vec<Accumulator>> {
-                for ((acc, agg), &maybe_idx) in
-                    accs.iter_mut().zip(aggs.iter()).zip(col_indices.iter())
-                {
-                    if is_count_star(agg) {
-                        if let Accumulator::Count { n } = acc {
-                            *n += batch.row_count() as i64;
-                        }
+    //
+    // Below this many rows a serial fold wins outright. Entering a rayon region
+    // costs a fixed ~27 µs here — waking the pool — and the vectorised kernel is
+    // fast enough that a lot of rows are needed to earn that back. Timing
+    // `full_scan` at three sizes gives serial 0.224 ns/row against parallel
+    // 27.4 µs + 0.070 ns/row, so the two meet at about 178k rows.
+    //
+    // The count is in rows, not batches: a batch is 1024 rows off a Parquet load
+    // but 65_536 elsewhere, and a batch-count threshold silently means completely
+    // different things depending on where the table came from.
+    const AGG_PARALLEL_MIN_ROWS: usize = 178_000;
+
+    /// Batches per rayon task. At ~1024 rows a batch, eight of them is roughly
+    /// 8 µs of work — enough to be worth a hand-off, small enough that 12 cores
+    /// still all get a share at 100k rows.
+    const AGG_MIN_BATCHES_PER_TASK: usize = 8;
+
+    macro_rules! accumulate_body {
+        ($accs:expr, $batch:expr) => {{
+            let mut accs = $accs;
+            let batch = $batch;
+            for ((acc, agg), &maybe_idx) in
+                accs.iter_mut().zip(aggs.iter()).zip(col_indices.iter())
+            {
+                if is_count_star(agg) {
+                    if let Accumulator::Count { n } = acc {
+                        *n += batch.row_count() as i64;
+                    }
+                    continue;
+                }
+                if let Some(idx) = maybe_idx {
+                    let col = batch.column(idx);
+                    if accumulate_typed(acc, col) {
                         continue;
                     }
-                    if let Some(idx) = maybe_idx {
-                        let col = batch.column(idx);
-                        if accumulate_typed(acc, col) {
-                            continue;
-                        }
-                    }
-                    let vals = agg.input.eval_batch(batch)?;
-                    for val in &vals {
-                        acc.update(val);
-                    }
                 }
-                Ok(accs)
-            },
-        )
-        .try_reduce(
-            || aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
-            |mut a, b| {
-                for (acc, other) in a.iter_mut().zip(b) {
-                    acc.merge(other);
+                let vals = agg.input.eval_batch(batch)?;
+                for val in &vals {
+                    acc.update(val);
                 }
-                Ok(a)
-            },
-        )?;
+            }
+            Ok(accs)
+        }};
+    }
+
+    let total_rows: usize = batches.iter().map(|b| b.row_count()).sum();
+
+    let accumulators = if total_rows < AGG_PARALLEL_MIN_ROWS {
+        batches.iter().try_fold(
+            aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
+            |accs, batch| -> FalconResult<Vec<Accumulator>> { accumulate_body!(accs, batch) },
+        )?
+    } else {
+        batches
+            .par_iter()
+            // A batch off a Parquet load is 1024 rows — about a microsecond of work.
+            // Left to itself rayon splits down to one batch per task, so at 100k rows
+            // (98 batches) the dispatch cost is the bulk of the query. Handing each
+            // task a run of batches keeps every core busy with far fewer hand-offs.
+            .with_min_len(AGG_MIN_BATCHES_PER_TASK)
+            .try_fold(
+                || aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
+                |accs, batch| -> FalconResult<Vec<Accumulator>> { accumulate_body!(accs, batch) },
+            )
+            .try_reduce(
+                || aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
+                |mut a, b| {
+                    for (acc, other) in a.iter_mut().zip(b) {
+                        acc.merge(other);
+                    }
+                    Ok(a)
+                },
+            )?
+    };
 
     let mut fields  = Vec::new();
     let mut columns = Vec::new();
@@ -1116,6 +1335,74 @@ pub fn execute_agg_only(
 /// The no-NULL case is kept as a separate straight loop over the dense slice
 /// because that is the shape LLVM can autovectorise; interleaving a validity
 /// check would stop it.
+/// Number of independent accumulators used to add a float slice.
+/// Two AVX2 registers' worth: enough chains to keep the FPU busy, few enough that
+/// the tail stays short.
+const SUM_LANES: usize = 8;
+
+/// Sum a slice with several independent accumulators.
+///
+/// `iter().sum()` cannot be vectorised: float addition is not associative, so the
+/// compiler has to add strictly left to right and every add waits on the previous
+/// one's latency. That put the f64 sum at 0.73 ns/row, about seven times off what
+/// the hardware can do. Splitting into independent chains lets the CPU issue them
+/// together and lets LLVM emit SIMD.
+///
+/// This does reassociate the additions, so the last bits of the result can differ
+/// from a strict left-to-right sum. For a long run of values that is normally
+/// *more* accurate, not less — it is a step toward pairwise summation.
+#[inline]
+fn sum_lanes<T: SumLane>(dense: &[T]) -> f64 {
+    let mut acc = [0.0f64; SUM_LANES];
+    let mut chunks = dense.chunks_exact(SUM_LANES);
+    for c in &mut chunks {
+        for (a, &v) in acc.iter_mut().zip(c.iter()) {
+            *a += v.to_f64();
+        }
+    }
+    let mut total = acc.iter().sum::<f64>();
+    for &v in chunks.remainder() {
+        total += v.to_f64();
+    }
+    total
+}
+
+/// Widened to f64 for summation.
+///
+/// `Into<f64>` would be the natural bound but `i64` does not implement it: the
+/// conversion loses precision past 2^53. SUM already returns f64 and the previous
+/// `v as f64` did exactly this, so the trait keeps that behaviour rather than
+/// changing what SUM means on wide integers.
+trait SumLane: Copy + Sync {
+    fn to_f64(self) -> f64;
+}
+
+impl SumLane for f64 {
+    #[inline(always)]
+    fn to_f64(self) -> f64 { self }
+}
+impl SumLane for f32 {
+    #[inline(always)]
+    fn to_f64(self) -> f64 { self as f64 }
+}
+impl SumLane for i64 {
+    #[inline(always)]
+    fn to_f64(self) -> f64 { self as f64 }
+}
+impl SumLane for i32 {
+    #[inline(always)]
+    fn to_f64(self) -> f64 { self as f64 }
+}
+
+/// Rows per rayon task when summing one large slice.
+const PAR_SUM_CHUNK: usize = 16_384;
+
+/// Parallel variant of [`sum_lanes`]. Chunked rather than per-element so each
+/// task does real work and still sums its own chunk with the vectorised kernel.
+fn par_sum_lanes<T: SumLane>(dense: &[T]) -> f64 {
+    dense.par_chunks(PAR_SUM_CHUNK).map(sum_lanes).sum::<f64>()
+}
+
 fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
     use crate::storage::column::Column as C;
 
@@ -1163,10 +1450,19 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
         }
         Accumulator::Sum { total, valid } => {
             // Fast paths for no-null columns: a single reduction without branches.
+            // For large slices (>= 64k elements) we split into chunks and let
+            // rayon do the reduction in parallel — this lets us use all cores even
+            // when there is only one batch, recovering the ~14% gap vs DuckDB at 1M rows.
+            const PAR_SUM_THRESHOLD: usize = 65_536;
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
-                    if !c.dense().is_empty() {
-                        *total += c.dense().iter().copied().sum::<f64>();
+                    let dense = c.dense();
+                    if !dense.is_empty() {
+                        *total += if dense.len() >= PAR_SUM_THRESHOLD {
+                            par_sum_lanes(dense)
+                        } else {
+                            sum_lanes(dense)
+                        };
                         *valid = true;
                     }
                     return true;
@@ -1174,8 +1470,13 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             }
             if let C::Int64(c) = col {
                 if !c.has_nulls() {
-                    if !c.dense().is_empty() {
-                        *total += c.dense().iter().map(|&v| v as f64).sum::<f64>();
+                    let dense = c.dense();
+                    if !dense.is_empty() {
+                        *total += if dense.len() >= PAR_SUM_THRESHOLD {
+                            par_sum_lanes(dense)
+                        } else {
+                            sum_lanes(dense)
+                        };
                         *valid = true;
                     }
                     return true;
@@ -1183,8 +1484,13 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             }
             if let C::Int32(c) = col {
                 if !c.has_nulls() {
-                    if !c.dense().is_empty() {
-                        *total += c.dense().iter().map(|&v| v as f64).sum::<f64>();
+                    let dense = c.dense();
+                    if !dense.is_empty() {
+                        *total += if dense.len() >= PAR_SUM_THRESHOLD {
+                            par_sum_lanes(dense)
+                        } else {
+                            sum_lanes(dense)
+                        };
                         *valid = true;
                     }
                     return true;
@@ -1204,7 +1510,11 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
                     let dense = c.dense();
-                    *total += dense.iter().copied().sum::<f64>();
+                    *total += if dense.len() >= 65_536 {
+                        dense.par_iter().copied().sum::<f64>()
+                    } else {
+                        dense.iter().copied().sum::<f64>()
+                    };
                     *count += dense.len() as i64;
                     return true;
                 }
@@ -1222,7 +1532,13 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
         Accumulator::Min { value, .. } => {
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
-                    if let Some(chunk_min) = c.dense().iter().copied().reduce(f64::min) {
+                    let dense = c.dense();
+                    let chunk_min = if dense.len() >= 65_536 {
+                        dense.par_iter().copied().reduce(|| f64::INFINITY, f64::min)
+                    } else {
+                        dense.iter().copied().fold(f64::INFINITY, f64::min)
+                    };
+                    if chunk_min.is_finite() {
                         *value = Some(value.map_or(chunk_min, |v: f64| v.min(chunk_min)));
                     }
                     return true;
@@ -1242,7 +1558,13 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
         Accumulator::Max { value, .. } => {
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
-                    if let Some(chunk_max) = c.dense().iter().copied().reduce(f64::max) {
+                    let dense = c.dense();
+                    let chunk_max = if dense.len() >= 65_536 {
+                        dense.par_iter().copied().reduce(|| f64::NEG_INFINITY, f64::max)
+                    } else {
+                        dense.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+                    };
+                    if chunk_max.is_finite() {
                         *value = Some(value.map_or(chunk_max, |v: f64| v.max(chunk_max)));
                     }
                     return true;
@@ -1259,8 +1581,15 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             }
             true
         }
-        // COUNT(DISTINCT) needs the values themselves, not a running scalar.
-        Accumulator::CountDistinct { .. } => false,
+        // These need the slow accumulator path
+        Accumulator::CountDistinct { .. }
+        | Accumulator::StringAgg { .. }
+        | Accumulator::BoolAnd { .. }
+        | Accumulator::BoolOr  { .. }
+        | Accumulator::Stddev  { .. }
+        | Accumulator::Variance { .. }
+        | Accumulator::First { .. }
+        | Accumulator::Last  { .. } => false,
     }
 }
 
@@ -1290,7 +1619,11 @@ fn build_agg_col(func: &AggFunc, state: &BatchAggState, n: usize) -> (DataType, 
                 .collect();
             (DataType::Float64, Column::Float64(PrimitiveColumn::new(vals)))
         }
-        AggFunc::CountDistinct => unreachable!("CountDistinct not in fast path"),
+        AggFunc::CountDistinct
+        | AggFunc::StringAgg { .. }
+        | AggFunc::BoolAnd | AggFunc::BoolOr
+        | AggFunc::Stddev { .. } | AggFunc::Variance { .. }
+        | AggFunc::First | AggFunc::Last => unreachable!("not in fast path"),
     }
 }
 
@@ -1437,6 +1770,55 @@ mod tests {
         assert_eq!(min_col.get(0).unwrap(), ScalarValue::Float64(Some(8.0))); // eng
         let max_col = result.column_by_name("max_s").unwrap();
         assert_eq!(max_col.get(0).unwrap(), ScalarValue::Float64(Some(10.0))); // eng
+    }
+
+    #[test]
+    fn lane_sum_matches_a_plain_sum() {
+        // Lengths around the lane count: shorter than one chunk, exactly one,
+        // and several with every possible tail.
+        for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 1000, 65_537] {
+            let vals: Vec<f64> = (0..n).map(|i| (i % 100) as f64 + 0.5).collect();
+            let plain: f64 = vals.iter().copied().sum();
+            let lanes = sum_lanes(&vals);
+            let par = par_sum_lanes(&vals);
+            // Reassociation moves the last bits only; scale the tolerance with the
+            // magnitude of the sum rather than asserting bit equality.
+            let tol = (plain.abs() * 1e-12).max(1e-9);
+            assert!((lanes - plain).abs() <= tol, "n={n}: lanes {lanes} vs {plain}");
+            assert!((par - plain).abs() <= tol, "n={n}: par {par} vs {plain}");
+        }
+    }
+
+    #[test]
+    fn lane_sum_matches_a_plain_sum_for_integers() {
+        for n in [0usize, 1, 7, 8, 9, 17, 1000, 65_537] {
+            let i64s: Vec<i64> = (0..n).map(|i| i as i64 - 500).collect();
+            let plain: f64 = i64s.iter().map(|&v| v as f64).sum();
+            assert!((sum_lanes(&i64s) - plain).abs() <= (plain.abs() * 1e-12).max(1e-9));
+            assert!((par_sum_lanes(&i64s) - plain).abs() <= (plain.abs() * 1e-12).max(1e-9));
+
+            let i32s: Vec<i32> = (0..n).map(|i| i as i32 - 500).collect();
+            let plain32: f64 = i32s.iter().map(|&v| v as f64).sum();
+            assert!((sum_lanes(&i32s) - plain32).abs() <= (plain32.abs() * 1e-12).max(1e-9));
+        }
+    }
+
+    #[test]
+    fn lane_sum_keeps_the_old_wide_integer_behaviour() {
+        // i64 -> f64 loses precision past 2^53. SUM has always returned f64 and the
+        // previous kernel did the same `as f64` cast, so the widening must round the
+        // same way rather than quietly becoming exact.
+        let big = 1i64 << 53;
+        let vals = vec![big, 1, big, 1];
+        let plain: f64 = vals.iter().map(|&v| v as f64).sum();
+        assert_eq!(sum_lanes(&vals), plain);
+    }
+
+    #[test]
+    fn lane_sum_handles_negatives_and_fractions() {
+        let vals: Vec<f64> = (0..1234).map(|i| (i as f64 - 617.0) * 0.375).collect();
+        let plain: f64 = vals.iter().copied().sum();
+        assert!((sum_lanes(&vals) - plain).abs() <= (plain.abs() * 1e-12).max(1e-9));
     }
 
     #[test]

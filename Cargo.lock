@@ -1985,6 +1985,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "smallvec",
  "sqlparser 0.47.0",
  "tempfile",
  "thiserror 1.0.69",

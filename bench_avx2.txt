@@ -1,0 +1,349 @@
+﻿cargo :    Compiling smallvec v1.15.2
+At line:2 char:1
++ cargo bench --bench query_bench -- falcondb 2>&1 | Tee-Object "bench_ ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling smallvec v1.15.2:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+   Compiling libduckdb-sys v1.2.2
+   Compiling cookie v0.16.2
+   Compiling polars-lazy v0.46.0
+   Compiling plotters-svg v0.3.7
+   Compiling xz2 v0.1.7
+   Compiling bzip2 v0.5.2
+   Compiling arrow-ord v54.2.1
+   Compiling rust_decimal v1.42.1
+   Compiling arrow-string v54.2.1
+   Compiling arrow-arith v54.2.1
+   Compiling arrow-row v54.2.1
+   Compiling safe_arch v0.7.4
+   Compiling serde_urlencoded v0.7.1
+   Compiling crossbeam-queue v0.3.13
+   Compiling crossbeam-channel v0.5.16
+   Compiling itertools v0.10.5
+   Compiling polars v0.46.0
+   Compiling impl-more v0.3.5
+   Compiling clap v4.6.4
+   Compiling parking_lot_core v0.9.12
+   Compiling icu_normalizer v2.2.0
+   Compiling plotters v0.3.7
+   Compiling strum v0.25.0
+   Compiling ciborium v0.2.2
+   Compiling bzip2 v0.4.4
+   Compiling crossbeam v0.8.4
+   Compiling thiserror v1.0.69
+   Compiling parking_lot v0.12.5
+   Compiling dashmap v6.2.1
+   Compiling wide v0.7.33
+   Compiling idna_adapter v1.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling hashlink v0.9.1
+   Compiling crossterm v0.28.1
+   Compiling tokio v1.53.1
+   Compiling idna v1.1.0
+   Compiling comfy-table v7.1.4
+   Compiling polars-arrow v0.46.0
+   Compiling criterion-plot v0.5.0
+   Compiling sqlparser v0.47.0
+   Compiling is-terminal v0.4.17
+   Compiling arrow-cast v53.4.1
+   Compiling url v2.5.8
+   Compiling arrow-cast v54.2.1
+   Compiling oorandom v11.1.5
+   Compiling fallible-iterator v0.3.0
+   Compiling yansi v1.0.1
+   Compiling diff v0.1.13
+   Compiling anes v0.1.6
+   Compiling pretty_assertions v1.4.1
+   Compiling criterion v0.5.1
+   Compiling arrow-ipc v53.4.1
+   Compiling arrow-json v53.4.1
+   Compiling object_store v0.11.2
+   Compiling tokio-util v0.7.19
+   Compiling actix-rt v2.11.0
+   Compiling arrow-csv v53.4.1
+   Compiling arrow v53.4.1
+   Compiling parquet v53.4.1
+   Compiling polars-compute v0.46.0
+   Compiling polars-row v0.46.0
+   Compiling polars-parquet v0.46.0
+   Compiling h2 v0.3.27
+   Compiling actix-codec v0.5.2
+   Compiling actix-server v2.6.0
+   Compiling datafusion-common-runtime v43.0.0
+   Compiling polars-core v0.46.0
+   Compiling arrow v54.2.1
+   Compiling datafusion-common v43.0.0
+   Compiling actix-http v3.13.1
+   Compiling async-compression v0.4.19
+   Compiling duckdb v1.2.2
+   Compiling actix-web v4.14.0
+   Compiling datafusion-expr-common v43.0.0
+   Compiling datafusion-physical-expr-common v43.0.0
+   Compiling datafusion-functions-aggregate-common v43.0.0
+   Compiling datafusion-functions-window-common v43.0.0
+   Compiling falcondb v0.1.0 (.)
+   Compiling datafusion-expr v43.0.0
+   Compiling datafusion-physical-expr v43.0.0
+   Compiling datafusion-execution v43.0.0
+   Compiling datafusion-sql v43.0.0
+   Compiling datafusion-functions v43.0.0
+   Compiling datafusion-physical-plan v43.0.0
+   Compiling datafusion-functions-aggregate v43.0.0
+   Compiling datafusion-optimizer v43.0.0
+   Compiling datafusion-functions-window v43.0.0
+   Compiling polars-ops v0.46.0
+   Compiling datafusion-functions-nested v43.0.0
+   Compiling datafusion-catalog v43.0.0
+   Compiling datafusion-physical-optimizer v43.0.0
+   Compiling datafusion v43.0.0
+   Compiling polars-time v0.46.0
+   Compiling polars-io v0.46.0
+   Compiling polars-plan v0.46.0
+   Compiling polars-expr v0.46.0
+   Compiling polars-mem-engine v0.46.0
+    Finished `bench` profile [optimized] target(s) in 13m 12s
+     Running benches\query_bench.rs (E:\rust-target\release\deps\query_bench-bf1d9f8376b42a6c.exe)
+Gnuplot not found, using plotters backend
+Benchmarking full_scan/falcondb/10000
+Benchmarking full_scan/falcondb/10000: Warming up for 3.0000 s
+Benchmarking full_scan/falcondb/10000: Collecting 100 samples in estimated 5.4069 s (66k iterations)
+Benchmarking full_scan/falcondb/10000: Analyzing
+full_scan/falcondb/10000
+                        time:   [70.292 µs 70.717 µs 71.141 µs]
+                        thrpt:  [140.57 Melem/s 141.41 Melem/s 142.26 Melem/s]
+                 change:
+                        time:   [-42.680% -41.707% -40.698%] (p = 0.00 < 0.05)
+                        thrpt:  [+68.628% +71.547% +74.458%]
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+Benchmarking full_scan/falcondb/100000
+Benchmarking full_scan/falcondb/100000: Warming up for 3.0000 s
+Benchmarking full_scan/falcondb/100000: Collecting 100 samples in estimated 5.6685 s (30k iterations)
+Benchmarking full_scan/falcondb/100000: Analyzing
+full_scan/falcondb/100000
+                        time:   [227.92 µs 249.50 µs 268.79 µs]
+                        thrpt:  [372.03 Melem/s 400.80 Melem/s 438.76 Melem/s]
+                 change:
+                        time:   [-51.510% -48.809% -45.910%] (p = 0.00 < 0.05)
+                        thrpt:  [+84.876% +95.347% +106.23%]
+                        Performance has improved.
+Found 17 outliers among 100 measurements (17.00%)
+  17 (17.00%) high severe
+Benchmarking full_scan/falcondb/1000000
+Benchmarking full_scan/falcondb/1000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 6.8s, enable flat sampling, or
+ reduce sample count to 60.
+Benchmarking full_scan/falcondb/1000000: Collecting 100 samples in estimated 6.7844 s (5050 iterations)
+Benchmarking full_scan/falcondb/1000000: Analyzing
+full_scan/falcondb/1000000
+                        time:   [1.5496 ms 1.6542 ms 1.7564 ms]
+                        thrpt:  [569.36 Melem/s 604.50 Melem/s 645.32 Melem/s]
+                 change:
+                        time:   [-22.223% -15.646% -8.7464%] (p = 0.00 < 0.05)
+                        thrpt:  [+9.5847% +18.549% +28.573%]
+                        Performance has improved.
+
+Benchmarking filter_where/falcondb/10000
+Benchmarking filter_where/falcondb/10000: Warming up for 3.0000 s
+Benchmarking filter_where/falcondb/10000: Collecting 100 samples in estimated 5.3512 s (45k iterations)
+Benchmarking filter_where/falcondb/10000: Analyzing
+filter_where/falcondb/10000
+                        time:   [123.69 µs 124.77 µs 125.93 µs]
+                        thrpt:  [79.411 Melem/s 80.150 Melem/s 80.849 Melem/s]
+                 change:
+                        time:   [-18.538% -17.052% -15.504%] (p = 0.00 < 0.05)
+                        thrpt:  [+18.348% +20.557% +22.757%]
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+Benchmarking filter_where/falcondb/100000
+Benchmarking filter_where/falcondb/100000: Warming up for 3.0000 s
+Benchmarking filter_where/falcondb/100000: Collecting 100 samples in estimated 6.9220 s (15k iterations)
+Benchmarking filter_where/falcondb/100000: Analyzing
+filter_where/falcondb/100000
+                        time:   [455.25 µs 478.00 µs 500.09 µs]
+                        thrpt:  [199.96 Melem/s 209.20 Melem/s 219.66 Melem/s]
+                 change:
+                        time:   [-30.440% -26.039% -21.078%] (p = 0.00 < 0.05)
+                        thrpt:  [+26.707% +35.207% +43.762%]
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) low mild
+  2 (2.00%) high mild
+Benchmarking filter_where/falcondb/1000000
+Benchmarking filter_where/falcondb/1000000: Warming up for 3.0000 s
+Benchmarking filter_where/falcondb/1000000: Collecting 100 samples in estimated 5.2435 s (1400 iterations)
+Benchmarking filter_where/falcondb/1000000: Analyzing
+filter_where/falcondb/1000000
+                        time:   [3.4127 ms 3.5468 ms 3.6879 ms]
+                        thrpt:  [271.15 Melem/s 281.94 Melem/s 293.03 Melem/s]
+                 change:
+                        time:   [-13.022% -9.3023% -5.5702%] (p = 0.00 < 0.05)
+                        thrpt:  [+5.8987% +10.256% +14.972%]
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  2 (2.00%) low mild
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking group_by_agg/falcondb/10000
+Benchmarking group_by_agg/falcondb/10000: Warming up for 3.0000 s
+Benchmarking group_by_agg/falcondb/10000: Collecting 100 samples in estimated 5.0464 s (61k iterations)
+Benchmarking group_by_agg/falcondb/10000: Analyzing
+group_by_agg/falcondb/10000
+                        time:   [86.843 µs 87.602 µs 88.315 µs]
+                        thrpt:  [113.23 Melem/s 114.15 Melem/s 115.15 Melem/s]
+                 change:
+                        time:   [-53.900% -52.914% -51.850%] (p = 0.00 < 0.05)
+                        thrpt:  [+107.68% +112.38% +116.92%]
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) low severe
+  3 (3.00%) low mild
+  1 (1.00%) high mild
+Benchmarking group_by_agg/falcondb/100000
+Benchmarking group_by_agg/falcondb/100000: Warming up for 3.0000 s
+Benchmarking group_by_agg/falcondb/100000: Collecting 100 samples in estimated 5.2821 s (20k iterations)
+Benchmarking group_by_agg/falcondb/100000: Analyzing
+group_by_agg/falcondb/100000
+                        time:   [263.10 µs 265.57 µs 267.91 µs]
+                        thrpt:  [373.26 Melem/s 376.55 Melem/s 380.09 Melem/s]
+                 change:
+                        time:   [-50.601% -50.122% -49.605%] (p = 0.00 < 0.05)
+                        thrpt:  [+98.433% +100.49% +102.43%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+Benchmarking group_by_agg/falcondb/1000000
+Benchmarking group_by_agg/falcondb/1000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 6.1s, enable flat sampling, or
+ reduce sample count to 60.
+Benchmarking group_by_agg/falcondb/1000000: Collecting 100 samples in estimated 6.1023 s (5050 iterations)
+Benchmarking group_by_agg/falcondb/1000000: Analyzing
+group_by_agg/falcondb/1000000
+                        time:   [1.1903 ms 1.1956 ms 1.2009 ms]
+                        thrpt:  [832.73 Melem/s 836.37 Melem/s 840.09 Melem/s]
+                 change:
+                        time:   [-67.696% -66.804% -65.881%] (p = 0.00 < 0.05)
+                        thrpt:  [+193.09% +201.24% +209.56%]
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking order_by/falcondb/10000
+Benchmarking order_by/falcondb/10000: Warming up for 3.0000 s
+Benchmarking order_by/falcondb/10000: Collecting 100 samples in estimated 5.4746 s (20k iterations)
+Benchmarking order_by/falcondb/10000: Analyzing
+order_by/falcondb/10000 time:   [252.85 µs 255.68 µs 258.63 µs]
+                        thrpt:  [38.665 Melem/s 39.112 Melem/s 39.549 Melem/s]
+                 change:
+                        time:   [-55.558% -54.162% -52.955%] (p = 0.00 < 0.05)
+                        thrpt:  [+112.56% +118.16% +125.01%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+Benchmarking order_by/falcondb/100000
+Benchmarking order_by/falcondb/100000: Warming up for 3.0000 s
+Benchmarking order_by/falcondb/100000: Collecting 100 samples in estimated 5.2391 s (1300 iterations)
+Benchmarking order_by/falcondb/100000: Analyzing
+order_by/falcondb/100000
+                        time:   [3.8252 ms 3.9305 ms 4.0370 ms]
+                        thrpt:  [24.771 Melem/s 25.442 Melem/s 26.142 Melem/s]
+                 change:
+                        time:   [-59.625% -58.190% -56.740%] (p = 0.00 < 0.05)
+                        thrpt:  [+131.16% +139.18% +147.68%]
+                        Performance has improved.
+
+Benchmarking sql_pipeline/falcondb/10000
+Benchmarking sql_pipeline/falcondb/10000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/falcondb/10000: Collecting 100 samples in estimated 5.2939 s (35k iterations)
+Benchmarking sql_pipeline/falcondb/10000: Analyzing
+sql_pipeline/falcondb/10000
+                        time:   [158.19 µs 161.10 µs 163.43 µs]
+                        thrpt:  [61.187 Melem/s 62.073 Melem/s 63.216 Melem/s]
+                 change:
+                        time:   [-51.007% -49.831% -48.581%] (p = 0.00 < 0.05)
+                        thrpt:  [+94.480% +99.326% +104.11%]
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) low severe
+  1 (1.00%) low mild
+Benchmarking sql_pipeline/falcondb/100000
+Benchmarking sql_pipeline/falcondb/100000: Warming up for 3.0000 s
+Benchmarking sql_pipeline/falcondb/100000: Collecting 100 samples in estimated 5.8448 s (15k iterations)
+Benchmarking sql_pipeline/falcondb/100000: Analyzing
+sql_pipeline/falcondb/100000
+                        time:   [373.06 µs 377.84 µs 383.97 µs]
+                        thrpt:  [260.43 Melem/s 264.67 Melem/s 268.05 Melem/s]
+                 change:
+                        time:   [-48.569% -46.686% -44.956%] (p = 0.00 < 0.05)
+                        thrpt:  [+81.673% +87.568% +94.435%]
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  2 (2.00%) high mild
+  6 (6.00%) high severe
+
+Benchmarking streaming_filter/falcondb_chunked_64k/100000
+Benchmarking streaming_filter/falcondb_chunked_64k/100000: Warming up for 3.0000 s
+Benchmarking streaming_filter/falcondb_chunked_64k/100000: Collecting 100 samples in estimated 5.3010 s (10k iterations
+)
+Benchmarking streaming_filter/falcondb_chunked_64k/100000: Analyzing
+streaming_filter/falcondb_chunked_64k/100000
+                        time:   [504.01 µs 509.29 µs 515.12 µs]
+                        thrpt:  [194.13 Melem/s 196.35 Melem/s 198.41 Melem/s]
+                 change:
+                        time:   [-62.786% -61.691% -60.603%] (p = 0.00 < 0.05)
+                        thrpt:  [+153.83% +161.04% +168.72%]
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking streaming_filter/falcondb_direct/100000
+Benchmarking streaming_filter/falcondb_direct/100000: Warming up for 3.0000 s
+Benchmarking streaming_filter/falcondb_direct/100000: Collecting 100 samples in estimated 7.1028 s (15k iterations)
+Benchmarking streaming_filter/falcondb_direct/100000: Analyzing
+streaming_filter/falcondb_direct/100000
+                        time:   [443.40 µs 459.67 µs 475.46 µs]
+                        thrpt:  [210.32 Melem/s 217.55 Melem/s 225.53 Melem/s]
+                 change:
+                        time:   [-33.749% -28.720% -23.383%] (p = 0.00 < 0.05)
+                        thrpt:  [+30.519% +40.292% +50.942%]
+                        Performance has improved.
+Benchmarking streaming_filter/falcondb_chunked_64k/1000000
+Benchmarking streaming_filter/falcondb_chunked_64k/1000000: Warming up for 3.0000 s
+Benchmarking streaming_filter/falcondb_chunked_64k/1000000: Collecting 100 samples in estimated 5.1552 s (800 iteration
+s)
+Benchmarking streaming_filter/falcondb_chunked_64k/1000000: Analyzing
+streaming_filter/falcondb_chunked_64k/1000000
+                        time:   [6.3420 ms 6.4315 ms 6.5284 ms]
+                        thrpt:  [153.18 Melem/s 155.48 Melem/s 157.68 Melem/s]
+                 change:
+                        time:   [-58.504% -57.795% -57.073%] (p = 0.00 < 0.05)
+                        thrpt:  [+132.95% +136.94% +140.99%]
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
+Benchmarking streaming_filter/falcondb_direct/1000000
+Benchmarking streaming_filter/falcondb_direct/1000000: Warming up for 3.0000 s
+Benchmarking streaming_filter/falcondb_direct/1000000: Collecting 100 samples in estimated 5.0367 s (1300 iterations)
+Benchmarking streaming_filter/falcondb_direct/1000000: Analyzing
+streaming_filter/falcondb_direct/1000000
+                        time:   [4.2338 ms 4.3304 ms 4.4286 ms]
+                        thrpt:  [225.81 Melem/s 230.93 Melem/s 236.20 Melem/s]
+                 change:
+                        time:   [-24.933% -21.969% -18.831%] (p = 0.00 < 0.05)
+                        thrpt:  [+23.200% +28.155% +33.213%]
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+

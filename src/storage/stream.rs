@@ -41,18 +41,38 @@ impl ChunkedScanner {
     pub fn new(chunk_rows: usize) -> Self { Self { chunk_rows } }
 
     /// Filter a table in chunks, returning all passing RecordBatches.
+    ///
+    /// Batches smaller than `chunk_rows` are gathered into a run and filtered in
+    /// one pass. Filtering them one at a time meant a fresh `execute_select` — and
+    /// all its setup — per batch, which off a Parquet load is once per 1024 rows:
+    /// 977 executions for a million rows against 16 here. That made the chunked
+    /// scan 2.8x slower than the direct one on identical data, and left
+    /// `chunk_rows` doing nothing at all, since no batch ever exceeded it.
+    ///
+    /// Grouping copies no data — a `RecordBatch` clone is a refcount bump — and
+    /// still bounds work in flight by `chunk_rows`, which is what the parameter
+    /// was meant to promise.
     pub fn filter(&self, table: &Table, filter: &Expr) -> FalconResult<Vec<RecordBatch>> {
         let query = SelectQuery::scan_all().with_filter(filter.clone());
         let mut out = Vec::new();
+        let mut run: Vec<RecordBatch> = Vec::new();
+        let mut run_rows = 0usize;
+
         for batch in &table.batches {
-            if batch.row_count() <= self.chunk_rows {
-                out.extend(filter_batch(batch, &query)?);
-            } else {
+            if batch.row_count() > self.chunk_rows {
+                flush_run(&mut run, &mut run_rows, &query, &mut out)?;
                 for chunk in split_batch(batch, self.chunk_rows)? {
                     out.extend(filter_batch(&chunk, &query)?);
                 }
+                continue;
+            }
+            run_rows += batch.row_count();
+            run.push(batch.clone());
+            if run_rows >= self.chunk_rows {
+                flush_run(&mut run, &mut run_rows, &query, &mut out)?;
             }
         }
+        flush_run(&mut run, &mut run_rows, &query, &mut out)?;
         Ok(out)
     }
 
@@ -93,6 +113,23 @@ impl ChunkedScanner {
         // Phase 2: merge partial aggregates.
         exec.execute(&partials)
     }
+}
+
+/// Filter one accumulated run of batches and reset it.
+fn flush_run(
+    run:      &mut Vec<RecordBatch>,
+    run_rows: &mut usize,
+    query:    &SelectQuery,
+    out:      &mut Vec<RecordBatch>,
+) -> FalconResult<()> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    let mut tmp = Table::new("_chunk", run[0].schema.clone());
+    tmp.batches.append(run);
+    *run_rows = 0;
+    out.extend(execute_select(&tmp, query)?);
+    Ok(())
 }
 
 fn filter_batch(batch: &RecordBatch, query: &SelectQuery) -> FalconResult<Vec<RecordBatch>> {

@@ -25,7 +25,7 @@ lz4_flex           = "0.11"
 bytemuck           = { version = "1.16", features = ["derive"] }
 memmap2            = "0.9"
 crossbeam          = "0.8"
-pyo3               = { version = "0.22", features = ["extension-module"], optional = true }
+pyo3               = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
 tokio              = { version = "1", features = ["full"] }
 arrow              = { version = "53", features = ["ipc"] }
 parquet            = { version = "53", features = ["arrow"] }

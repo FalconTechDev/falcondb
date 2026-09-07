@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+
+use rayon::prelude::*;
+
 use super::hash::{FastMap, FastSet};
 
 use crate::storage::{
@@ -7,6 +11,12 @@ use crate::storage::{
     types::{DataType, FalconError, FalconResult, ScalarValue},
 };
 
+/// Minimum left rows before a probe splits over cores.
+///
+/// Shared by the inner-join probe and the semi/anti one: both decide each left row
+/// independently, so one threshold covers both rather than each growing its own.
+const PAR_PROBE_ROWS: usize = 65_536;
+
 // ─── Join type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +24,10 @@ pub enum JoinType {
     Inner,
     Left,
     Right,
+    /// All matched rows + unmatched rows from both sides (NULLs on the missing side).
+    Full,
+    /// Cartesian product — every left row paired with every right row, no ON condition.
+    Cross,
     /// Return left rows that have at least one match on the right.
     Semi,
     /// Return left rows that have NO match on the right.
@@ -48,7 +62,8 @@ pub fn execute_hash_semi_anti_join(
 
     let right_merged = merge_batches(right_batches)?;
     let left_merged  = merge_batches(left_batches)?;
-    let (hash_table, bloom) = build_hash_table(&right_merged, right_keys)?;
+    let typed = int_keys_usable(&right_merged, right_keys, &left_merged, left_keys);
+    let (hash_table, bloom) = build_hash_table(&right_merged, right_keys, typed)?;
 
     let left_key_cols: Vec<&Column> = left_keys.iter()
         .map(|k| left_merged.column_by_name(k))
@@ -62,19 +77,43 @@ pub fn execute_hash_semi_anti_join(
         .as_ref()
         .filter(|_| filter_is_safe(&right_key_cols, &left_key_cols));
 
-    let mut keep = Vec::with_capacity(left_merged.row_count());
-    for l_row in 0..left_merged.row_count() {
+    // Each left row is decided independently — semi/anti keep or drop it and record
+    // nothing shared — so the probe splits over row ranges. The inner join's probe
+    // was parallelised earlier; this one was left serial and is the same shape.
+    let n_left = left_merged.row_count();
+    let decide = |l_row: usize| -> FalconResult<bool> {
         // A definite miss needs no string key: semi drops the row, anti keeps it.
         if let Some(f) = bloom {
-            if !f.might_contain(row_key_hash(&left_key_cols, l_row)) {
-                keep.push(anti);
-                continue;
+            let h = match &hash_table {
+                JoinKeyMap::Int(_) => int_key_hash(int_key(left_key_cols[0], l_row)),
+                JoinKeyMap::Str(_) => row_key_hash(&left_key_cols, l_row),
+            };
+            if !f.might_contain(h) {
+                return Ok(anti);
             }
         }
-        let key     = row_key(&left_key_cols, l_row)?;
-        let matched = hash_table.contains_key(&key);
-        keep.push(if anti { !matched } else { matched });
-    }
+        let matched = match &hash_table {
+            JoinKeyMap::Int(t) => t.contains(int_key(left_key_cols[0], l_row)),
+            JoinKeyMap::Str(t) => t.contains_key(&row_key(&left_key_cols, l_row)?),
+        };
+        Ok(if anti { !matched } else { matched })
+    };
+
+    let keep: Vec<bool> = if n_left >= PAR_PROBE_ROWS {
+        let chunk = (n_left / rayon::current_num_threads().max(1)).max(8_192);
+        let ranges: Vec<(usize, usize)> = (0..n_left)
+            .step_by(chunk)
+            .map(|s| (s, (s + chunk).min(n_left)))
+            .collect();
+        let parts: FalconResult<Vec<Vec<bool>>> = ranges
+            .par_iter()
+            .map(|&(start, end)| (start..end).map(&decide).collect())
+            .collect();
+        // Ranges are visited in order, so the mask lines up with the input rows.
+        parts?.concat()
+    } else {
+        (0..n_left).map(&decide).collect::<FalconResult<_>>()?
+    };
 
     left_merged.filter_by_mask(&keep)
 }
@@ -84,6 +123,32 @@ pub fn execute_hash_semi_anti_join(
 /// Algorithm:
 ///   1. Build phase — hash the *right* side into a HashMap<key → Vec<row_idx>>.
 ///   2. Probe phase — iterate *left* rows, look up matches in the hash table.
+/// Execute a CROSS JOIN (cartesian product) — no key columns required.
+pub fn execute_cross_join(
+    left_batches:  &[RecordBatch],
+    right_batches: &[RecordBatch],
+) -> FalconResult<RecordBatch> {
+    if left_batches.is_empty() || right_batches.is_empty() {
+        return if left_batches.is_empty() {
+            merge_batches(left_batches)
+        } else {
+            merge_batches(right_batches)
+        };
+    }
+    let left  = merge_batches(left_batches)?;
+    let right = merge_batches(right_batches)?;
+    let n = left.row_count() * right.row_count();
+    let mut left_indices:  Vec<u32> = Vec::with_capacity(n);
+    let mut right_indices: Vec<u32> = Vec::with_capacity(n);
+    for l in 0..left.row_count() {
+        for r in 0..right.row_count() {
+            left_indices.push(l as u32);
+            right_indices.push(r as u32);
+        }
+    }
+    build_output(&left, &right, &left_indices, &right_indices, None)
+}
+
 pub fn execute_hash_join(
     left_batches:  &[RecordBatch],
     right_batches: &[RecordBatch],
@@ -91,17 +156,76 @@ pub fn execute_hash_join(
     right_keys:    &[&str],
     join_type:     JoinType,
 ) -> FalconResult<RecordBatch> {
+    execute_hash_join_projected(
+        left_batches, right_batches, left_keys, right_keys, join_type, None,
+    )
+}
+
+/// Hash join that materialises only the output columns in `keep`.
+///
+/// `keep` must list every column any later stage reads, under either its source
+/// name or its post-join name; `None` means "build them all", which is what every
+/// caller that cannot prove the set should pass. Building a column costs a cache
+/// miss per output row against the larger input, so for `SELECT COUNT(*)` over a
+/// join — which reads no columns at all — this is most of the query.
+pub fn execute_hash_join_projected(
+    left_batches:  &[RecordBatch],
+    right_batches: &[RecordBatch],
+    left_keys:     &[&str],
+    right_keys:    &[&str],
+    join_type:     JoinType,
+    keep:          Option<&HashSet<String>>,
+) -> FalconResult<RecordBatch> {
     if left_batches.is_empty() || right_batches.is_empty() {
+        // FULL OUTER: even if one side is empty, return the other with NULLs.
+        if join_type == JoinType::Full {
+            let (left, right) = if left_batches.is_empty() {
+                (merge_batches(right_batches)?, merge_batches(right_batches)?)
+            } else {
+                (merge_batches(left_batches)?, merge_batches(left_batches)?)
+            };
+            let n = if left_batches.is_empty() { right.row_count() } else { left.row_count() };
+            let (li, ri): (Vec<u32>, Vec<u32>) = if left_batches.is_empty() {
+                (vec![NO_ROW; n], (0..n as u32).collect())
+            } else {
+                ((0..n as u32).collect(), vec![NO_ROW; n])
+            };
+            return build_output(&left, &right, &li, &ri, None);
+        }
         return Err(FalconError::InvalidQuery("join requires non-empty inputs".into()));
     }
     if left_keys.len() != right_keys.len() || left_keys.is_empty() {
         return Err(FalconError::InvalidQuery("join key lists must have the same length".into()));
     }
 
-    let right_merged = merge_batches(right_batches)?;
-    let left_merged  = merge_batches(left_batches)?;
+    // Concatenating a side copies every column it has. Columns that the join will
+    // not emit are copied and then thrown away — at 1M rows that was two thirds of
+    // the left-hand merge, and it is why `SUM(k)` measured *faster* than `COUNT(*)`
+    // on the same join: both built one output column, but both also merged three.
+    //
+    // The key columns have to survive because the probe reads them.
+    // Output names depend on which columns each side *has*: a right column keeps its
+    // name unless the left side also has one by that name, in which case it becomes
+    // `right.x`. Trimming a side could therefore rename a column that the query then
+    // fails to find, so when the two schemas share any name, nothing is trimmed.
+    let names_collide = match (left_batches.first(), right_batches.first()) {
+        (Some(l), Some(r)) => {
+            let left_names: HashSet<&str> =
+                l.schema.fields.iter().map(|f| f.name.as_str()).collect();
+            r.schema.fields.iter().any(|f| left_names.contains(f.name.as_str()))
+        }
+        _ => false,
+    };
+    let trim = keep.filter(|_| !names_collide);
 
-    let (hash_table, bloom) = build_hash_table(&right_merged, right_keys)?;
+    let left_slim  = project_for_join(left_batches, left_keys, trim);
+    let right_slim = project_for_join(right_batches, right_keys, trim);
+
+    let right_merged = merge_batches(&right_slim)?;
+    let left_merged  = merge_batches(&left_slim)?;
+
+    let typed = int_keys_usable(&right_merged, right_keys, &left_merged, left_keys);
+    let (hash_table, bloom) = build_hash_table(&right_merged, right_keys, typed)?;
     probe(
         &left_merged,
         &right_merged,
@@ -110,6 +234,7 @@ pub fn execute_hash_join(
         &hash_table,
         bloom.as_ref(),
         join_type,
+        keep,
     )
 }
 
@@ -164,8 +289,8 @@ pub fn execute_sort_merge_join(
     l_idx.sort_unstable_by(|&a, &b| l_keys[a].cmp(&l_keys[b]));
     r_idx.sort_unstable_by(|&a, &b| r_keys[a].cmp(&r_keys[b]));
 
-    let mut left_out:  Vec<Option<usize>> = Vec::new();
-    let mut right_out: Vec<Option<usize>> = Vec::new();
+    let mut left_out:  Vec<u32> = Vec::new();
+    let mut right_out: Vec<u32> = Vec::new();
 
     let (mut i, mut j) = (0usize, 0usize);
     while i < l_idx.len() && j < r_idx.len() {
@@ -183,8 +308,8 @@ pub fn execute_sort_merge_join(
 
                 for &l in &l_idx[i..i_end] {
                     for &r in &r_idx[j..j_end] {
-                        left_out.push(Some(l));
-                        right_out.push(Some(r));
+                        left_out.push(l as u32);
+                        right_out.push(r as u32);
                     }
                 }
                 i = i_end;
@@ -193,7 +318,7 @@ pub fn execute_sort_merge_join(
         }
     }
 
-    build_output(&left, &right, &left_out, &right_out)
+    build_output(&left, &right, &left_out, &right_out, None)
 }
 
 /// Is sort-merge the better choice for these inputs?
@@ -219,15 +344,29 @@ const BLOOM_MIN_ROWS: usize = 1_024;
 fn build_hash_table(
     batch: &RecordBatch,
     keys:  &[&str],
-) -> FalconResult<(FastMap<String, Vec<usize>>, Option<BuildFilter>)> {
+    typed: bool,
+) -> FalconResult<(JoinKeyMap, Option<BuildFilter>)> {
     let key_cols: Vec<&Column> = keys.iter()
         .map(|k| batch.column_by_name(k))
         .collect::<FalconResult<_>>()?;
 
-    let mut table: FastMap<String, Vec<usize>> = FastMap::default();
     let n = batch.row_count();
     let mut bloom = (n >= BLOOM_MIN_ROWS).then(|| BuildFilter::with_capacity(n));
 
+    if typed {
+        let col = key_cols[0];
+        let mut table = IntHashTable::with_rows(n);
+        for row in 0..n {
+            let k = int_key(col, row);
+            table.insert(k, row);
+            if let Some(f) = bloom.as_mut() {
+                f.insert(int_key_hash(k));
+            }
+        }
+        return Ok((JoinKeyMap::Int(table), bloom));
+    }
+
+    let mut table: FastMap<String, Vec<usize>> = FastMap::default();
     for row in 0..n {
         let key = row_key(&key_cols, row)?;
         table.entry(key).or_default().push(row);
@@ -236,19 +375,85 @@ fn build_hash_table(
         }
     }
 
-    Ok((table, bloom))
+    Ok((JoinKeyMap::Str(table), bloom))
 }
 
 // ─── Probe phase ─────────────────────────────────────────────────────────────
+
+/// Match one left row and append whatever it contributes to the output.
+///
+/// Shared by the serial and parallel drivers so the two cannot drift: this join
+/// was 100x behind precisely because one copy of a routine got fixed and another
+/// did not. `right_matched` is `None` for the parallel path, which only runs for
+/// INNER and LEFT — the join types that never need it.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn probe_one(
+    l_row:         usize,
+    left_key_cols: &[&Column],
+    hash_table:    &JoinKeyMap,
+    bloom:         Option<&BuildFilter>,
+    join_type:     &JoinType,
+    left_indices:  &mut Vec<u32>,
+    right_indices: &mut Vec<u32>,
+    right_matched: Option<&mut Vec<bool>>,
+    scratch:       &mut Vec<usize>,
+) -> FalconResult<()> {
+    // A definite miss skips the lookup, and on the string path the key build too.
+    if let Some(f) = bloom {
+        let h = match hash_table {
+            JoinKeyMap::Int(_) => int_key_hash(int_key(left_key_cols[0], l_row)),
+            JoinKeyMap::Str(_) => row_key_hash(left_key_cols, l_row),
+        };
+        if !f.might_contain(h) {
+            if *join_type == JoinType::Left {
+                left_indices.push(l_row as u32);
+                right_indices.push(NO_ROW);
+            }
+            return Ok(());
+        }
+    }
+
+    // Reused across rows so a match costs no allocation.
+    scratch.clear();
+    match hash_table {
+        JoinKeyMap::Int(t) => t.collect_matches(int_key(left_key_cols[0], l_row), scratch),
+        JoinKeyMap::Str(t) => {
+            if let Some(rows) = t.get(&row_key(left_key_cols, l_row)?) {
+                scratch.extend_from_slice(rows);
+            }
+        }
+    }
+
+    if scratch.is_empty() {
+        if *join_type == JoinType::Left || *join_type == JoinType::Full {
+            left_indices.push(l_row as u32);
+            right_indices.push(NO_ROW);
+        }
+        return Ok(());
+    }
+
+    for &r_row in scratch.iter() {
+        left_indices.push(l_row as u32);
+        right_indices.push(r_row as u32);
+    }
+    if let Some(m) = right_matched {
+        for &r_row in scratch.iter() {
+            m[r_row] = true;
+        }
+    }
+    Ok(())
+}
 
 fn probe(
     left:       &RecordBatch,
     right:      &RecordBatch,
     left_keys:  &[&str],
     right_keys: &[&str],
-    hash_table: &FastMap<String, Vec<usize>>,
+    hash_table: &JoinKeyMap,
     bloom:      Option<&BuildFilter>,
     join_type:  JoinType,
+    keep:       Option<&HashSet<String>>,
 ) -> FalconResult<RecordBatch> {
     let left_key_cols: Vec<&Column> = left_keys.iter()
         .map(|k| left.column_by_name(k))
@@ -257,57 +462,78 @@ fn probe(
         .map(|k| right.column_by_name(k))
         .collect::<FalconResult<_>>()?;
 
-    let mut left_indices:  Vec<Option<usize>> = Vec::new();
-    let mut right_indices: Vec<Option<usize>> = Vec::new();
-    let mut right_matched: Vec<bool>          = vec![false; right.row_count()];
-
     // Only use the filter when the two sides agree on key types; see
     // `row_key_hash` for why a mismatch could drop matches.
-    let bloom = bloom.filter(|_| filter_is_safe(&right_key_cols, &left_key_cols));
+    let bloom_ok = bloom.filter(|_| filter_is_safe(&right_key_cols, &left_key_cols));
 
-    for l_row in 0..left.row_count() {
-        // Definitely-absent rows skip the `row_key` allocation entirely.
-        if let Some(f) = bloom {
-            if !f.might_contain(row_key_hash(&left_key_cols, l_row)) {
-                if join_type == JoinType::Left {
-                    left_indices.push(Some(l_row));
-                    right_indices.push(None);
+    // INNER and LEFT decide each left row independently, so the probe splits over
+    // row ranges. RIGHT and FULL also have to record which right rows were hit,
+    // which is shared state, so they stay on the serial path rather than paying
+    // for synchronisation on every match.
+    //
+    // Everything else in the engine — scan, filter, group-by — is parallel; the
+    // join was the one operator still running on a single core.
+    if matches!(join_type, JoinType::Inner | JoinType::Left)
+        && left.row_count() >= PAR_PROBE_ROWS
+    {
+        let n = left.row_count();
+        let chunk = (n / rayon::current_num_threads().max(1)).max(8_192);
+        let ranges: Vec<(usize, usize)> = (0..n)
+            .step_by(chunk)
+            .map(|s| (s, (s + chunk).min(n)))
+            .collect();
+
+        let parts: FalconResult<Vec<(Vec<u32>, Vec<u32>)>> = ranges
+            .par_iter()
+            .map(|&(start, end)| {
+                let mut li = Vec::new();
+                let mut ri = Vec::new();
+                let mut scratch = Vec::new();
+                for l_row in start..end {
+                    probe_one(
+                        l_row, &left_key_cols, hash_table, bloom_ok, &join_type,
+                        &mut li, &mut ri, None, &mut scratch,
+                    )?;
                 }
-                continue;
-            }
+                Ok((li, ri))
+            })
+            .collect();
+
+        // Ranges are visited in order, so concatenating them keeps the same output
+        // row order the serial path produces.
+        let mut left_indices = Vec::new();
+        let mut right_indices = Vec::new();
+        for (li, ri) in parts? {
+            left_indices.extend(li);
+            right_indices.extend(ri);
         }
-
-        let key     = row_key(&left_key_cols, l_row)?;
-        let matches = hash_table.get(&key);
-
-        match matches {
-            Some(r_rows) => {
-                for &r_row in r_rows {
-                    left_indices.push(Some(l_row));
-                    right_indices.push(Some(r_row));
-                    right_matched[r_row] = true;
-                }
-            }
-            None => {
-                if join_type == JoinType::Left {
-                    left_indices.push(Some(l_row));
-                    right_indices.push(None);
-                }
-            }
-        }
+        return build_output(left, right, &left_indices, &right_indices, keep);
     }
 
-    // RIGHT JOIN: add unmatched right rows.
-    if join_type == JoinType::Right {
+    let mut left_indices:  Vec<u32> = Vec::new();
+    let mut right_indices: Vec<u32> = Vec::new();
+    let mut right_matched: Vec<bool>          = vec![false; right.row_count()];
+
+    let mut scratch = Vec::new();
+    for l_row in 0..left.row_count() {
+        probe_one(
+            l_row, &left_key_cols, hash_table, bloom_ok, &join_type,
+            &mut left_indices, &mut right_indices, Some(&mut right_matched),
+            &mut scratch,
+        )?;
+    }
+
+    // RIGHT / FULL OUTER JOIN: add unmatched right rows.
+    if join_type == JoinType::Right || join_type == JoinType::Full {
         for (r_row, &matched) in right_matched.iter().enumerate() {
             if !matched {
-                left_indices.push(None);
-                right_indices.push(Some(r_row));
+                left_indices.push(NO_ROW);
+                right_indices.push(r_row as u32);
             }
         }
     }
 
-    build_output(left, right, &left_indices, &right_indices)
+    build_output(left, right, &left_indices, &right_indices, keep)
 }
 
 // ─── Output builder ───────────────────────────────────────────────────────────
@@ -315,37 +541,98 @@ fn probe(
 fn build_output(
     left:          &RecordBatch,
     right:         &RecordBatch,
-    left_indices:  &[Option<usize>],
-    right_indices: &[Option<usize>],
+    left_indices:  &[u32],
+    right_indices: &[u32],
+    keep:          Option<&HashSet<String>>,
 ) -> FalconResult<RecordBatch> {
+    // Match pairs are `u32` row numbers with `NO_ROW` reserved as the NULL marker,
+    // so a side at or past that many rows cannot be addressed. Refusing is the only
+    // safe answer: silently truncating would join the wrong rows together.
+    for (side, batch) in [("left", left), ("right", right)] {
+        if batch.row_count() >= NO_ROW as usize {
+            return Err(FalconError::InvalidQuery(format!(
+                "join {side} side has {} rows, more than this join can address ({})",
+                batch.row_count(),
+                NO_ROW as usize - 1,
+            )));
+        }
+    }
+
     let n_rows = left_indices.len();
     let mut fields  = Vec::new();
     let mut columns = Vec::new();
 
-    // All left columns.
-    for (i, field) in left.schema.fields.iter().enumerate() {
-        let col    = left.column(i);
-        let vals   = gather_nullable(col, left_indices, n_rows)?;
-        let (_, c) = scalar_vec_to_col(&vals, &field.data_type);
-        fields.push(Field::nullable(field.name.as_str(), field.data_type.clone()));
-        columns.push(c);
-    }
-
-    // Right columns — skip key columns to avoid duplicates.
+    // Right columns keep their name unless the left side already used it.
     let left_names: FastSet<&str> =
         left.schema.column_names().into_iter().collect();
 
+    // One entry per output column: which side it comes from and its index there.
+    // Building the list first lets every column be gathered independently.
+    enum Side { Left, Right }
+    let mut plan: Vec<(Side, usize, String, DataType)> = Vec::new();
+    // A column nothing downstream reads is never built. Gathering one costs a cache
+    // miss per output row against the larger input, which for `SELECT COUNT(*)` over
+    // a join was most of the query. `keep` is `None` whenever the caller could not
+    // prove which columns are read, and then everything is built as before.
+    //
+    // Both the source name and the post-join name are accepted, so a reference that
+    // survived a rename is not pruned by accident: erring toward keeping a column
+    // costs time, dropping one the query reads is a wrong answer.
+    let wanted = |src: &str, out: &str| -> bool {
+        keep.is_none_or(|k| k.contains(src) || k.contains(out))
+    };
+
+    for (i, field) in left.schema.fields.iter().enumerate() {
+        if wanted(&field.name, &field.name) {
+            plan.push((Side::Left, i, field.name.clone(), field.data_type.clone()));
+        }
+    }
     for (i, field) in right.schema.fields.iter().enumerate() {
         let name = if left_names.contains(field.name.as_str()) {
             format!("right.{}", field.name)
         } else {
             field.name.clone()
         };
+        if wanted(&field.name, &name) {
+            plan.push((Side::Right, i, name, field.data_type.clone()));
+        }
+    }
 
-        let col    = right.column(i);
-        let vals   = gather_nullable(col, right_indices, n_rows)?;
-        let (_, c) = scalar_vec_to_col(&vals, &field.data_type);
-        fields.push(Field::nullable(name.as_str(), field.data_type.clone()));
+    // A batch with no columns reports zero rows, which would turn COUNT(*) into 0.
+    // Keep one column from the smaller side so the row count survives; the right
+    // side is the build side and is normally the smaller of the two.
+    if plan.is_empty() {
+        if let Some(field) = right.schema.fields.first() {
+            plan.push((Side::Right, 0, field.name.clone(), field.data_type.clone()));
+        } else if let Some(field) = left.schema.fields.first() {
+            plan.push((Side::Left, 0, field.name.clone(), field.data_type.clone()));
+        }
+    }
+
+    let gather_one = |(side, i, _name, dt): &(Side, usize, String, DataType)| -> FalconResult<Column> {
+        let (col, indices) = match side {
+            Side::Left  => (left.column(*i),  left_indices),
+            Side::Right => (right.column(*i), right_indices),
+        };
+        Ok(match gather_u32_typed(col, indices, dt) {
+            Some((_, c)) => c,
+            None => {
+                let vals = gather_nullable(col, indices, n_rows)?;
+                scalar_vec_to_col(&vals, dt).1
+            }
+        })
+    };
+
+    // Serial on purpose. Gathering the output columns in parallel looks free —
+    // they are independent passes over a shared index list — and was tried here at
+    // 100k output rows: LEFT JOIN went from 1.70x DuckDB to 1.76x, i.e. nothing.
+    // That is the same answer `RecordBatch::filter_by_bitmask` records for the same
+    // idea: a gather is bound by memory, so more threads contend for one bus
+    // instead of adding throughput.
+    let built: FalconResult<Vec<Column>> = plan.iter().map(gather_one).collect();
+
+    for ((_, _, name, dt), c) in plan.iter().zip(built?) {
+        fields.push(Field::nullable(name.as_str(), dt.clone()));
         columns.push(c);
     }
 
@@ -359,6 +646,167 @@ fn row_key(key_cols: &[&Column], row: usize) -> FalconResult<String> {
         .map(|col| col.get(row).map(|v| v.to_string()))
         .collect();
     Ok(parts?.join("\x00"))
+}
+
+// ─── Typed integer keys ───────────────────────────────────────────────────────
+
+/// The hash table, keyed either by a raw integer or by the formatted string.
+///
+/// `row_key` formats every key into a `String`: for a join on an `i64` column that
+/// is a `ScalarValue`, an integer formatted into a heap string, a `Vec<String>`
+/// and a final joined `String` — four allocations per row, on both sides. At a
+/// million rows a side it was the bulk of a 312 ms join. Hashing the integer
+/// itself allocates nothing.
+enum JoinKeyMap {
+    Int(IntHashTable),
+    Str(FastMap<String, Vec<usize>>),
+}
+
+/// Chained hash table over integer keys, in three flat arrays.
+///
+/// The map this replaces was `FastMap<i64, Vec<usize>>`, which allocates a `Vec`
+/// per distinct key: a 100k-row build side meant 100k heap allocations, and
+/// measured at ~30 ms of a 41 ms join — far more than the probe it feeds. Here a
+/// build touches three preallocated arrays and allocates nothing per key.
+///
+/// `heads` is indexed by bucket and holds the first row in that bucket, `next`
+/// chains the rest, and `keys` lets the probe confirm a real match rather than a
+/// bucket collision. Row numbers are `u32`, which is why `int_keys_usable` refuses
+/// build sides at or above `u32::MAX` rows.
+struct IntHashTable {
+    mask:  usize,
+    heads: Vec<u32>,
+    next:  Vec<u32>,
+    keys:  Vec<i64>,
+}
+
+/// Marks the end of a chain / an empty bucket.
+const NO_ROW: u32 = u32::MAX;
+
+impl IntHashTable {
+    fn with_rows(n: usize) -> Self {
+        // Two buckets per row keeps chains short without wasting much memory.
+        let buckets = (n.max(1) * 2).next_power_of_two();
+        Self {
+            mask:  buckets - 1,
+            heads: vec![NO_ROW; buckets],
+            next:  vec![NO_ROW; n],
+            keys:  Vec::with_capacity(n),
+        }
+    }
+
+    /// Mixes an i64 into a bucket. Join keys are very often dense runs like
+    /// 0, 10, 20, ..., which would pile into a handful of buckets if the low bits
+    /// were used directly.
+    #[inline(always)]
+    fn bucket(&self, key: i64) -> usize {
+        let mut h = key as u64;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        (h as usize) & self.mask
+    }
+
+    #[inline]
+    fn insert(&mut self, key: i64, row: usize) {
+        // `keys` is indexed by row, so rows have to arrive in order for the probe's
+        // `self.keys[row]` check to refer to the right key.
+        debug_assert_eq!(self.keys.len(), row, "build rows must be inserted in order");
+        let b = self.bucket(key);
+        self.keys.push(key);
+        self.next[row] = self.heads[b];
+        self.heads[b] = row as u32;
+    }
+
+    /// Append every build-side row matching `key`.
+    #[inline]
+    fn collect_matches(&self, key: i64, out: &mut Vec<usize>) {
+        let mut cur = self.heads[self.bucket(key)];
+        while cur != NO_ROW {
+            let row = cur as usize;
+            if self.keys[row] == key {
+                out.push(row);
+            }
+            cur = self.next[row];
+        }
+    }
+
+    #[inline]
+    fn contains(&self, key: i64) -> bool {
+        let mut cur = self.heads[self.bucket(key)];
+        while cur != NO_ROW {
+            let row = cur as usize;
+            if self.keys[row] == key {
+                return true;
+            }
+            cur = self.next[row];
+        }
+        false
+    }
+}
+
+/// Integer-like columns that fit an `i64` key without loss.
+fn is_int_key_col(col: &Column) -> bool {
+    matches!(
+        col,
+        Column::Int64(_) | Column::Int32(_) | Column::Date32(_) | Column::Timestamp(_)
+    )
+}
+
+/// Bloom hash for a raw integer key.
+///
+/// The generic `row_key_hash` matches on the column enum for every row, which on
+/// the typed path is dispatch the caller has already resolved — and it runs once
+/// per probed row, so it is the hottest thing in the join. Build and probe must
+/// agree on this function or the filter would reject real matches.
+#[inline(always)]
+fn int_key_hash(k: i64) -> u64 {
+    let mut h = k as u64;
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h
+}
+
+#[inline(always)]
+fn int_key(col: &Column, row: usize) -> i64 {
+    match col {
+        Column::Int64(c) => c.dense()[row],
+        Column::Int32(c) => c.dense()[row] as i64,
+        Column::Date32(c) => c.dense()[row] as i64,
+        Column::Timestamp(c) => c.dense()[row],
+        _ => unreachable!("guarded by is_int_key_col"),
+    }
+}
+
+/// May this join hash raw integers instead of formatted strings?
+///
+/// Requires one key column per side, the same integer type on both, and no NULLs.
+/// The NULL rule is not an optimisation detail: `row_key` renders a NULL as the
+/// text "NULL", so on the string path two NULL keys compare equal and join to each
+/// other, which SQL says must not happen. Restricting the typed path to null-free
+/// columns keeps both paths giving the same answer instead of quietly disagreeing.
+fn int_keys_usable(
+    build: &RecordBatch,
+    build_keys: &[&str],
+    probe: &RecordBatch,
+    probe_keys: &[&str],
+) -> bool {
+    if build_keys.len() != 1 || probe_keys.len() != 1 {
+        return false;
+    }
+    let (Ok(b), Ok(p)) = (
+        build.column_by_name(build_keys[0]),
+        probe.column_by_name(probe_keys[0]),
+    ) else {
+        return false;
+    };
+    is_int_key_col(b)
+        && b.data_type() == p.data_type()
+        && b.null_count() == 0
+        && p.null_count() == 0
+        // IntHashTable numbers build rows as u32.
+        && build.row_count() < NO_ROW as usize
 }
 
 // ─── Bloom filter over the build side ────────────────────────────────────────
@@ -466,21 +914,8 @@ fn filter_is_safe(build: &[&Column], probe: &[&Column]) -> bool {
         && build.iter().zip(probe).all(|(b, p)| b.data_type() == p.data_type())
 }
 
-fn gather_nullable(
-    col:     &Column,
-    indices: &[Option<usize>],
-    n:       usize,
-) -> FalconResult<Vec<ScalarValue>> {
-    let mut vals = Vec::with_capacity(n);
-    for &idx in indices {
-        vals.push(match idx {
-            Some(i) => col.get(i)?,
-            None    => ScalarValue::Null,
-        });
-    }
-    Ok(vals)
-}
-
+/// Build a column from boxed values, widening narrow numerics as the join's output
+/// schema has always done.
 fn scalar_vec_to_col(vals: &[ScalarValue], dt: &DataType) -> (DataType, Column) {
     match dt {
         DataType::Boolean => (
@@ -509,30 +944,131 @@ fn scalar_vec_to_col(vals: &[ScalarValue], dt: &DataType) -> (DataType, Column) 
     }
 }
 
-fn merge_batches(batches: &[RecordBatch]) -> FalconResult<RecordBatch> {
-    if batches.len() == 1 {
-        return Ok(batches[0].clone());
+/// Gather one output column through `ScalarValue`, for types the typed path skips.
+fn gather_nullable(
+    col:     &Column,
+    indices: &[u32],
+    n:       usize,
+) -> FalconResult<Vec<ScalarValue>> {
+    let mut vals = Vec::with_capacity(n);
+    for &idx in indices {
+        vals.push(if idx == NO_ROW {
+            ScalarValue::Null
+        } else {
+            col.get(idx as usize)?
+        });
     }
+    Ok(vals)
+}
 
-    let schema    = batches[0].schema.clone();
-    let col_count = schema.field_count();
-    let total: usize = batches.iter().map(|b| b.row_count()).sum();
-
-    let mut merged: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(total); col_count];
-    for batch in batches {
-        for ci in 0..col_count {
-            let col = batch.column(ci);
-            for row in 0..batch.row_count() {
-                merged[ci].push(col.get(row)?);
-            }
+/// Gather one output column straight from the source, by `u32` index.
+///
+/// `NO_ROW` marks an outer join's unmatched side. The path this replaces went
+/// through `Vec<ScalarValue>` — one boxed enum per output cell, and a `String`
+/// clone per row for text — before converting the whole thing back into a column.
+///
+/// Returns `None` for types the slow path handles, so the caller keeps its existing
+/// behaviour for those. The widening of Int32 to Int64 and Float32 to Float64
+/// matches `scalar_vec_to_col` exactly: the output schema must not change.
+fn gather_u32_typed(
+    col:     &Column,
+    indices: &[u32],
+    dt:      &DataType,
+) -> Option<(DataType, Column)> {
+    match (dt, col) {
+        (DataType::Int64, Column::Int64(c)) => {
+            Some((DataType::Int64, Column::Int64(c.gather_u32(indices))))
         }
+        (DataType::Float64, Column::Float64(c)) => {
+            Some((DataType::Float64, Column::Float64(c.gather_u32(indices))))
+        }
+        (DataType::Utf8, Column::Utf8(c)) => {
+            Some((DataType::Utf8, Column::Utf8(c.gather_u32(indices))))
+        }
+        (DataType::Date32, Column::Date32(c)) => {
+            Some((DataType::Date32, Column::Date32(c.gather_u32(indices))))
+        }
+        (DataType::Timestamp, Column::Timestamp(c)) => {
+            Some((DataType::Timestamp, Column::Timestamp(c.gather_u32(indices))))
+        }
+        // Int32/Float32 widen on this path, so they cannot reuse a gather that
+        // preserves the source type. They fall through to the boxed path.
+        _ => None,
     }
+}
 
-    let columns: Vec<Column> = merged.iter().enumerate()
-        .map(|(i, vals)| scalar_vec_to_col(vals, &schema.fields[i].data_type).1)
+
+/// Drop the columns of one join side that neither the probe nor the output needs.
+///
+/// Returns the batches unchanged when `keep` is `None` — that is the caller saying
+/// it could not prove what is read — or when nothing can be dropped, so the common
+/// case costs one scan of the schema and no copying. A `RecordBatch` clone is a
+/// refcount bump, so building the trimmed batches copies no data either; the saving
+/// is in the concatenation that follows.
+fn project_for_join(
+    batches: &[RecordBatch],
+    keys:    &[&str],
+    keep:    Option<&HashSet<String>>,
+) -> Vec<RecordBatch> {
+    let Some(keep) = keep else { return batches.to_vec() };
+    let Some(first) = batches.first() else { return batches.to_vec() };
+
+    let wanted: Vec<bool> = first
+        .schema
+        .fields
+        .iter()
+        .map(|f| {
+            keys.contains(&f.name.as_str())
+                || keep.contains(&f.name)
+                // A right-hand column may be renamed on the way out; keep it if the
+                // renamed form is what the query asked for.
+                || keep.contains(&format!("right.{}", f.name))
+        })
         .collect();
 
-    RecordBatch::new(schema, columns)
+    if wanted.iter().all(|w| *w) {
+        return batches.to_vec();
+    }
+
+    let fields: Vec<_> = first
+        .schema
+        .fields
+        .iter()
+        .zip(&wanted)
+        .filter(|(_, w)| **w)
+        .map(|(f, _)| f.clone())
+        .collect();
+    let schema = Schema::new(fields);
+
+    batches
+        .iter()
+        .map(|b| {
+            let cols: Vec<_> = b
+                .columns
+                .iter()
+                .zip(&wanted)
+                .filter(|(_, w)| **w)
+                .map(|(c, _)| std::sync::Arc::clone(c))
+                .collect();
+            RecordBatch::from_shared(schema.clone(), cols)
+                .expect("column count follows the filtered schema")
+        })
+        .collect()
+}
+
+/// Concatenate the batches of one join side.
+///
+/// Delegates to [`RecordBatch::concat`]. This used to be a local copy that pushed
+/// every cell through a `ScalarValue`; with 977 batches per side off a Parquet load
+/// it dominated every join, and the typed concat it now calls is the same one
+/// `query::sort` uses.
+fn merge_batches(batches: &[RecordBatch]) -> FalconResult<RecordBatch> {
+    if batches.is_empty() {
+        // Callers rely on an empty side producing an empty batch rather than an
+        // error, so keep that shape instead of forwarding the empty-input error.
+        return RecordBatch::new(Schema::new(vec![]), vec![]);
+    }
+    RecordBatch::concat(batches)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -546,6 +1082,220 @@ mod tests {
         table::RecordBatch,
         types::{DataType, ScalarValue},
     };
+
+    /// The typed integer path and the string path must agree exactly.
+    ///
+    /// Two implementations of the same thing is how the join ended up 100x behind
+    /// in the first place — `merge_batches` had been fixed in `query::sort` and
+    /// left slow here. This pins the two paths together for every join type.
+    #[test]
+    fn typed_and_string_key_paths_agree() {
+        let l = orders();
+        let r = users();
+        let lk = ["user_id"];
+        let rk = ["user_id"];
+
+        assert!(
+            int_keys_usable(&r, &rk, &l, &lk),
+            "null-free Int64 keys should take the typed path"
+        );
+
+        for jt in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full] {
+            let mut out = Vec::new();
+            for typed in [true, false] {
+                let (map, bloom) = build_hash_table(&r, &rk, typed).unwrap();
+                out.push(probe(&l, &r, &lk, &rk, &map, bloom.as_ref(), jt.clone(), None).unwrap());
+            }
+            let (a, b) = (&out[0], &out[1]);
+            assert_eq!(a.row_count(), b.row_count(), "{jt:?}: row count differs");
+            assert_eq!(a.schema.column_names(), b.schema.column_names(), "{jt:?}: schema differs");
+            for ci in 0..a.schema.field_count() {
+                for row in 0..a.row_count() {
+                    assert_eq!(
+                        a.column(ci).get(row).unwrap(),
+                        b.column(ci).get(row).unwrap(),
+                        "{jt:?}: value differs at column {ci}, row {row}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The parallel probe must agree with the serial one — including row order.
+    ///
+    /// Every other join test here is three rows long, so none of them reach the
+    /// 65_536-row threshold and the parallel path went unexercised. Ranges are
+    /// concatenated in order, so output order must still follow the left side.
+    #[test]
+    fn parallel_probe_matches_the_serial_contract() {
+        const LEFT_ROWS: usize = 70_000; // over PAR_PROBE_ROWS
+        const STRIDE: i64 = 5;
+
+        let l_schema = Schema::new(vec![Field::required("k", DataType::Int64)]);
+        let left = RecordBatch::new(
+            l_schema,
+            vec![ColumnBuilder::int64((0..LEFT_ROWS).map(|i| Some(i as i64)).collect())],
+        ).unwrap();
+
+        let r_schema = Schema::new(vec![
+            Field::required("k", DataType::Int64),
+            Field::required("tag", DataType::Int64),
+        ]);
+        let n_right = LEFT_ROWS / STRIDE as usize;
+        let right = RecordBatch::new(
+            r_schema,
+            vec![
+                ColumnBuilder::int64((0..n_right).map(|i| Some(i as i64 * STRIDE)).collect()),
+                ColumnBuilder::int64((0..n_right).map(|i| Some(i as i64)).collect()),
+            ],
+        ).unwrap();
+
+        let inner = execute_hash_join(
+            std::slice::from_ref(&left), std::slice::from_ref(&right),
+            &["k"], &["k"], JoinType::Inner,
+        ).unwrap();
+        assert_eq!(inner.row_count(), n_right, "inner join lost or duplicated rows");
+
+        // Left keys ascend, so a correctly ordered result has an ascending key too.
+        let k = inner.column_by_name("k").unwrap();
+        let mut prev = i64::MIN;
+        for row in 0..inner.row_count() {
+            let ScalarValue::Int64(Some(v)) = k.get(row).unwrap() else {
+                panic!("expected Int64 key")
+            };
+            assert!(v > prev, "output not in left order at row {row}: {v} after {prev}");
+            assert_eq!(v % STRIDE, 0, "row {row} has key {v}, which has no match");
+            prev = v;
+        }
+
+        let left_join = execute_hash_join(
+            std::slice::from_ref(&left), std::slice::from_ref(&right),
+            &["k"], &["k"], JoinType::Left,
+        ).unwrap();
+        assert_eq!(left_join.row_count(), LEFT_ROWS, "left join dropped unmatched rows");
+    }
+
+    /// The parallel semi/anti probe must agree with the serial one.
+    ///
+    /// The existing semi/anti coverage is a handful of rows, well under
+    /// PAR_PROBE_ROWS, so the chunked path would otherwise go unexercised — the
+    /// same gap that left the radix sort and the inner-join probe untested when
+    /// they were first parallelised.
+    #[test]
+    fn parallel_semi_anti_probe_matches_the_serial_contract() {
+        const LEFT_ROWS: usize = 70_000; // over PAR_PROBE_ROWS
+        const STRIDE: i64 = 5;
+
+        let schema = Schema::new(vec![Field::required("k", DataType::Int64)]);
+        let left = RecordBatch::new(
+            schema.clone(),
+            vec![ColumnBuilder::int64((0..LEFT_ROWS).map(|i| Some(i as i64)).collect())],
+        )
+        .unwrap();
+        let n_right = LEFT_ROWS / STRIDE as usize;
+        let right = RecordBatch::new(
+            schema,
+            vec![ColumnBuilder::int64(
+                (0..n_right).map(|i| Some(i as i64 * STRIDE)).collect(),
+            )],
+        )
+        .unwrap();
+
+        let semi = execute_hash_semi_anti_join(
+            std::slice::from_ref(&left), std::slice::from_ref(&right),
+            &["k"], &["k"], false,
+        ).unwrap();
+        assert_eq!(semi.row_count(), n_right, "semi join kept the wrong number of rows");
+
+        let anti = execute_hash_semi_anti_join(
+            std::slice::from_ref(&left), std::slice::from_ref(&right),
+            &["k"], &["k"], true,
+        ).unwrap();
+        assert_eq!(
+            anti.row_count(),
+            LEFT_ROWS - n_right,
+            "anti join kept the wrong number of rows"
+        );
+
+        // Semi keeps exactly the multiples of STRIDE, in left order.
+        let k = semi.column_by_name("k").unwrap();
+        let mut prev = i64::MIN;
+        for row in 0..semi.row_count() {
+            let ScalarValue::Int64(Some(v)) = k.get(row).unwrap() else {
+                panic!("expected Int64 key")
+            };
+            assert!(v > prev, "semi output not in left order at row {row}");
+            assert_eq!(v % STRIDE, 0, "semi kept {v}, which has no match");
+            prev = v;
+        }
+    }
+
+    /// Build and probe must hash bloom keys the same way.
+    ///
+    /// The filter may only ever say "maybe" wrongly, never "no". If the two sides
+    /// disagreed on the hash it would reject real matches, and the join would come
+    /// back short with nothing failing loudly — so this drives a typed join past the
+    /// bloom threshold and checks every match is still found.
+    #[test]
+    fn typed_bloom_hash_agrees_between_build_and_probe() {
+        // Well past BLOOM_MIN_ROWS so the filter is actually built.
+        const BUILD_ROWS: usize = 20_000;
+        const PROBE_ROWS: usize = 60_000;
+        const STRIDE: i64 = 3;
+
+        let schema = Schema::new(vec![Field::required("k", DataType::Int64)]);
+        let left = RecordBatch::new(
+            schema.clone(),
+            vec![ColumnBuilder::int64((0..PROBE_ROWS).map(|i| Some(i as i64)).collect())],
+        )
+        .unwrap();
+        let right = RecordBatch::new(
+            schema,
+            vec![ColumnBuilder::int64(
+                (0..BUILD_ROWS).map(|i| Some(i as i64 * STRIDE)).collect(),
+            )],
+        )
+        .unwrap();
+
+        let out = execute_hash_join(
+            std::slice::from_ref(&left),
+            std::slice::from_ref(&right),
+            &["k"], &["k"], JoinType::Inner,
+        )
+        .unwrap();
+
+        // Every left key that is a multiple of STRIDE and within the build range.
+        let expected = (0..PROBE_ROWS)
+            .filter(|i| *i as i64 % STRIDE == 0 && (*i as i64 / STRIDE) < BUILD_ROWS as i64)
+            .count();
+        assert_eq!(
+            out.row_count(), expected,
+            "bloom dropped matches — build and probe hashes disagree"
+        );
+    }
+
+    /// A nullable key column must stay on the string path.
+    ///
+    /// Not a performance choice: `row_key` renders NULL as the text "NULL", so the
+    /// string path joins NULL keys to each other. That is wrong per SQL, but it is
+    /// the behaviour callers have today, and a fast path that silently disagreed
+    /// with it would be worse than a slow one.
+    #[test]
+    fn nullable_keys_do_not_take_the_typed_path() {
+        let schema = Schema::new(vec![Field::nullable("k", DataType::Int64)]);
+        let with_null = RecordBatch::new(
+            schema.clone(),
+            vec![ColumnBuilder::int64(vec![Some(1), None, Some(3)])],
+        ).unwrap();
+        let no_null = RecordBatch::new(
+            schema,
+            vec![ColumnBuilder::int64(vec![Some(1), Some(2), Some(3)])],
+        ).unwrap();
+
+        assert!(!int_keys_usable(&with_null, &["k"], &no_null, &["k"]));
+        assert!(!int_keys_usable(&no_null, &["k"], &with_null, &["k"]));
+        assert!(int_keys_usable(&no_null, &["k"], &no_null, &["k"]));
+    }
 
     fn orders() -> RecordBatch {
         let schema = Schema::new(vec![
