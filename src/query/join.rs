@@ -15,7 +15,10 @@ use crate::storage::{
 ///
 /// Shared by the inner-join probe and the semi/anti one: both decide each left row
 /// independently, so one threshold covers both rather than each growing its own.
-const PAR_PROBE_ROWS: usize = 65_536;
+/// Measured at 65_536 on a machine reporting 20 threads, so ~3.3k each.
+fn par_probe_rows() -> usize {
+    crate::query::tuning::par_min_rows(3_277)
+}
 
 // ─── Join type ────────────────────────────────────────────────────────────────
 
@@ -99,7 +102,7 @@ pub fn execute_hash_semi_anti_join(
         Ok(if anti { !matched } else { matched })
     };
 
-    let keep: Vec<bool> = if n_left >= PAR_PROBE_ROWS {
+    let keep: Vec<bool> = if n_left >= par_probe_rows() {
         let chunk = (n_left / rayon::current_num_threads().max(1)).max(8_192);
         let ranges: Vec<(usize, usize)> = (0..n_left)
             .step_by(chunk)
@@ -474,7 +477,7 @@ fn probe(
     // Everything else in the engine — scan, filter, group-by — is parallel; the
     // join was the one operator still running on a single core.
     if matches!(join_type, JoinType::Inner | JoinType::Left)
-        && left.row_count() >= PAR_PROBE_ROWS
+        && left.row_count() >= par_probe_rows()
     {
         let n = left.row_count();
         let chunk = (n / rayon::current_num_threads().max(1)).max(8_192);

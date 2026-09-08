@@ -9,6 +9,7 @@ pub mod pipeline;
 pub mod select;
 pub mod sort;
 pub mod sql;
+pub(crate) mod tuning;
 pub mod udf;
 pub mod vector;
 pub mod window;

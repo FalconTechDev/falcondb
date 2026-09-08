@@ -323,7 +323,11 @@ impl Accumulator {
 /// Minimum rows in a single batch to justify intra-batch rayon parallelism in group-by.
 /// Below this the rayon task-spawn overhead dominates: 100k rows / 20 threads = 5k rows/task
 /// is too fine-grained. 512k ensures ≥25k rows per task on a 20-thread machine.
-const PAR_INTRA_GB_ROWS: usize = 524_288;
+/// Rows in a single batch before splitting the group-by scan across cores is
+/// worth it. Measured at 524_288 on a machine reporting 20 threads.
+fn par_intra_gb_rows() -> usize {
+    crate::query::tuning::par_min_rows(26_214)
+}
 
 // в”Ђв”Ђв”Ђ Fast-path batch state (parallel arrays, no boxing) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
@@ -504,7 +508,7 @@ impl GroupByExec {
 
             // Intra-batch parallel path: one large batch (e.g. from Parquet) → split into
             // rayon chunks so each thread accumulates its own local state then we merge.
-            if batches.len() == 1 && first_b.row_count() >= PAR_INTRA_GB_ROWS {
+            if batches.len() == 1 && first_b.row_count() >= par_intra_gb_rows() {
                 let batch = first_b;
                 let gb_dict = batch.column(gb_col_idx).as_utf8_column()
                     .ok_or_else(|| FalconError::InvalidQuery(format!("Expected Utf8 column '{gb_name}'")))?;
@@ -1248,11 +1252,19 @@ pub fn execute_agg_only(
     // The count is in rows, not batches: a batch is 1024 rows off a Parquet load
     // but 65_536 elsewhere, and a batch-count threshold silently means completely
     // different things depending on where the table came from.
-    const AGG_PARALLEL_MIN_ROWS: usize = 178_000;
+    // Measured at ~178k rows on a machine reporting 20 threads, so ~8.9k each.
+    // See `query::tuning` for why this is per-thread rather than absolute.
+    let agg_parallel_min_rows = crate::query::tuning::par_min_rows(8_900);
 
     /// Batches per rayon task. At ~1024 rows a batch, eight of them is roughly
     /// 8 µs of work — enough to be worth a hand-off, small enough that 12 cores
     /// still all get a share at 100k rows.
+    ///
+    /// Deriving this from a row target instead was tried, to decouple it from batch
+    /// size: it cost about 6% on full_scan/1M and int_sum/1M beyond the run's drift,
+    /// because a literal here is folded into rayon's splitting and a computed value
+    /// is not. It only mattered as scaffolding for a batch-size experiment that did
+    /// not pay off, so the constant stands.
     const AGG_MIN_BATCHES_PER_TASK: usize = 8;
 
     macro_rules! accumulate_body {
@@ -1285,7 +1297,7 @@ pub fn execute_agg_only(
 
     let total_rows: usize = batches.iter().map(|b| b.row_count()).sum();
 
-    let accumulators = if total_rows < AGG_PARALLEL_MIN_ROWS {
+    let accumulators = if total_rows < agg_parallel_min_rows {
         batches.iter().try_fold(
             aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
             |accs, batch| -> FalconResult<Vec<Accumulator>> { accumulate_body!(accs, batch) },

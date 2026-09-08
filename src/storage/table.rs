@@ -5,7 +5,10 @@ use rayon::prelude::*;
 
 /// Minimum total rows before concatenating columns in parallel is worth a rayon
 /// hand-off. Below this the copy is short enough that scheduling costs more.
-const PAR_CONCAT_ROWS: usize = 262_144;
+/// Measured at 262_144 on a machine reporting 20 threads, so ~13.1k each.
+fn par_concat_rows() -> usize {
+    crate::query::tuning::par_min_rows(13_107)
+}
 
 use super::{
     column::Column,
@@ -93,7 +96,7 @@ impl RecordBatch {
         };
         let n_cols = first.column_count();
         let total_rows: usize = batches.iter().map(|b| b.row_count()).sum();
-        let columns: FalconResult<Vec<Column>> = if n_cols > 1 && total_rows >= PAR_CONCAT_ROWS {
+        let columns: FalconResult<Vec<Column>> = if n_cols > 1 && total_rows >= par_concat_rows() {
             (0..n_cols).into_par_iter().map(concat_col).collect()
         } else {
             (0..n_cols).map(concat_col).collect()

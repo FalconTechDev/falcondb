@@ -465,8 +465,18 @@ pub fn read_parquet_projected(
             // batches it falls under the threshold and runs serially. Small batches
             // also keep each column slice inside L2 for the whole pass.
             //
-            // Raise this only together with the inter-batch strategy in
-            // `query::aggregate`, and measure `full_scan/1M` before believing it.
+            // Retested after `query::aggregate` was changed to size its rayon tasks in
+            // rows rather than batches, which was the reason for the first failure.
+            // With that fixed, 65_536-row batches do help the largest scans —
+            // full_scan/1M -14%, int_sum/1M -8%, confirming the per-batch overhead —
+            // but they still cost far more elsewhere: full_scan/100k +170%,
+            // group_by/100k +114%, group_by/1M +187%.
+            //
+            // The remaining thresholds are why. `PAR_SUM_THRESHOLD` fires inside a
+            // 65_536-row batch and enters rayon from the serial path, and the
+            // group-by still counts *batches*, so sixteen of them look like a tiny
+            // table. Raising this needs every one of those converted to rows first;
+            // until then the small batches are load-bearing.
             let reader = ParquetRecordBatchReaderBuilder::try_new(open()?)
                 .map_err(|e| FalconError::InvalidQuery(e.to_string()))?
                 .with_projection(mask.clone())

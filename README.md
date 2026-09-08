@@ -31,78 +31,113 @@ FalconDB is built from scratch to answer one question: *what does a columnar dat
 
 ## Benchmarks
 
-Measured on **Intel i7-13700H, Windows 11**. Median over 100 Criterion samples.  
-FalconDB: SQL plan cache + parallel GROUP BY (Rayon) + packed bitmask WHERE + fast scalar predicates + parallel sort.  
-DuckDB: `prepare()` + execute, version 1.x.  
-Run yourself: `cargo bench`
+Measured on **Intel i7-13700H (6 P-cores + 8 E-cores), Windows 11**, Criterion,
+median of 100 samples. Against **DuckDB 1.x**, **Polars** and **DataFusion**, all
+reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
+`cargo bench`, for reasons given under [Methodology](#methodology).
 
-### Full scan — `SELECT *`
+### Scans and aggregates
 
-| Rows      | FalconDB  | DuckDB   | Winner              |
-|-----------|-----------|----------|---------------------|
-| 10 000    | 0.44 ms   | 0.78 ms  | FalconDB **1.8×**   |
-| 100 000   | 5.6 ms    | 6.4 ms   | FalconDB **1.1×**   |
-| 1 000 000 | 60 ms     | 45 ms    | DuckDB 1.3×         |
+| | rows | FalconDB | Polars | DuckDB | DataFusion |
+|---|---|---|---|---|---|
+| `SUM(score)` | 10 k | **2.28 µs** | 12.0 µs | 221 µs | 1.71 ms |
+| | 100 k | **12.7 µs** | 21.8 µs | 343 µs | 2.25 ms |
+| | 1 M | **109 µs** | 165 µs | 512 µs | 3.15 ms |
+| `SUM(id)` (integer) | 10 k | **3.66 µs** | 10.3 µs | 232 µs | 1.85 ms |
+| | 100 k | 26.6 µs | **22.2 µs** | 332 µs | 3.02 ms |
+| | 1 M | **118 µs** | 176 µs | 498 µs | 15.3 ms |
+| `WHERE score > 50` | 10 k | **25.3 µs** | 67.3 µs | 642 µs | 1.55 ms |
+| | 100 k | **199 µs** | 206 µs | 3.94 ms | 3.30 ms |
+| | 1 M | **1.57 ms** | 4.43 ms | 24.8 ms | 21.2 ms |
 
-### Filter — `WHERE score > 50`
+### Grouping, sorting, pipelines
 
-| Rows      | FalconDB  | DuckDB   | Winner              |
-|-----------|-----------|----------|---------------------|
-| 10 000    | 0.31 ms   | 0.72 ms  | FalconDB **2.3×**   |
-| 100 000   | 3.4 ms    | 4.1 ms   | FalconDB **1.2×**   |
-| 1 000 000 | 41 ms     | 24 ms    | DuckDB 1.7×         |
+| | rows | FalconDB | Polars | DuckDB | DataFusion |
+|---|---|---|---|---|---|
+| `GROUP BY` + 3 aggregates | 10 k | **37.3 µs** | 311 µs | 1.73 ms | 2.30 ms |
+| | 100 k | **155 µs** | 1.50 ms | 3.82 ms | 2.88 ms |
+| | 1 M | **1.19 ms** | 12.6 ms | 7.44 ms | 9.60 ms |
+| `ORDER BY score DESC` | 10 k | **190 µs** | 381 µs | 1.90 ms | 1.20 ms |
+| | 100 k | 2.79 ms | **2.58 ms** | 16.0 ms | 7.07 ms |
+| `DISTINCT` | 100 k | **518 µs** | 743 µs | 2.37 ms | 1.75 ms |
+| | 1 M | **2.97 ms** | 6.43 ms | 3.89 ms | 3.91 ms |
+| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **31.9 µs** | 343 µs | 1.72 ms | 2.14 ms |
+| | 100 k | **255 µs** | 1.55 ms | 3.92 ms | 3.01 ms |
 
-> WHERE uses a fast scalar predicate path (`try_fast_mask`) that operates directly on `&[Option<T>]` slices — no `ScalarValue` boxing — then packs results into a bitmask (`Vec<u64>`, one bit per row, 8× smaller than `Vec<bool>`).  
-> The fast path flipped the 100 k result: FalconDB was **losing** (DuckDB 1.6×) and now **wins** (FalconDB 1.2×). The 1 M gap closed from 2.7× to 1.7×.
+### Joins, window functions, DML
 
-### GROUP BY + COUNT + SUM + AVG (5 groups)
+Polars is absent from the rows below: it has no `EXISTS`, no in-place
+`UPDATE`/`DELETE`, and expresses `ROW_NUMBER` through a different shape entirely.
+Timing a different formulation against ours is precisely the mistake this file
+used to make — see [Methodology](#methodology).
 
-| Rows      | FalconDB  | DuckDB   | Winner               |
-|-----------|-----------|----------|----------------------|
-| 10 000    | 44 µs     | 1.45 ms  | FalconDB **32×**     |
-| 100 000   | 0.40 ms   | 4.51 ms  | FalconDB **11×**     |
-| 1 000 000 | 4.70 ms   | 7.77 ms  | FalconDB **1.7×**    |
+| | rows | FalconDB | Polars | DuckDB | DataFusion |
+|---|---|---|---|---|---|
+| `INNER JOIN` | 100 k | 654 µs | **490 µs** | 1.68 ms | 4.93 ms |
+| | 1 M | 8.63 ms | **3.19 ms** | 8.20 ms | 23.2 ms |
+| `LEFT JOIN` | 100 k | **1.05 ms** | — | 2.42 ms | 5.08 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **1.02 ms** | — | 2.56 ms | 4.91 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **2.17 ms** | — | 2.60 ms | 5.05 ms |
+| `ROW_NUMBER() OVER` | 100 k | **6.32 ms** | — | 11.7 ms | 9.11 ms |
+| `UPDATE` (half the rows) | 100 k | **1.98 ms** | — | 3.74 ms | — |
+| `DELETE` (half the rows) | 100 k | **1.14 ms** | — | 2.74 ms | — |
 
-> **Dictionary encoding is what makes this fast.** `Utf8Column` stores each distinct
-> string once and a `u32` code per row, so `GROUP BY` assigns group ids per *dictionary
-> entry* — a handful of them — instead of hashing a string on every one of a million
-> rows. Mapping a row to its group becomes a single array index. That took 1 M-row
-> `GROUP BY` from 34.8 ms to 4.70 ms (7.4×) and flipped the last remaining loss.
->
-> Two caveats worth stating: the dictionary is built at load time, so its cost is
-> outside this measurement (deliberately — that is the point of the encoding, and it
-> is how columnar engines work, but a load-once-query-once workload sees less gain).
-> And DuckDB's numbers vary up to 3× between runs on this machine, so treat the small-
-> row multiples as "an order of magnitude" rather than a precise figure; the 1 M-row
-> comparison is the stable one.
+### Where FalconDB is behind
 
-### ORDER BY (single column, DESC)
+Ahead of every engine in 23 of 26 measured points, and ahead of DuckDB and
+DataFusion in all of them. The exceptions are all against Polars:
 
-| Rows      | FalconDB  | DuckDB   | Winner              |
-|-----------|-----------|----------|---------------------|
-| 10 000    | 1.87 ms   | 2.67 ms  | FalconDB **1.4×**   |
-| 100 000   | 22.4 ms   | 26.1 ms  | FalconDB **1.2×**   |
+| | FalconDB | Polars | |
+|---|---|---|---|
+| `INNER JOIN` 1 M | 8.63 ms | 3.19 ms | 2.7× |
+| `INNER JOIN` 100 k | 654 µs | 490 µs | 1.3× |
+| `SUM(id)` 100 k | 26.6 µs | 22.2 µs | 1.2× |
+| `ORDER BY` 100 k | 2.79 ms | 2.58 ms | 1.08× — parity |
 
-> Rayon `par_sort_unstable_by` kicks in at ≥ 65 536 rows; serial sort below that threshold.
+### How much room is actually left
 
-### End-to-end SQL pipeline — `WHERE + GROUP BY + ORDER BY`
+"Fast" against a rival says nothing about how much the hardware could do, so
+`tests/diag_bandwidth.rs` measures the floor directly: summing `f64` at working
+sets that sit in L2, in L3 and past L3.
 
-| Rows      | FalconDB  | DuckDB   | Winner              |
-|-----------|-----------|----------|---------------------|
-| 10 000    | 0.67 ms   | 1.29 ms  | FalconDB **1.9×**   |
-| 100 000   | 5.6 ms    | 4.4 ms   | DuckDB 1.3×         |
+| working set | throughput |
+|---|---|
+| 0.1 MB (L2) | 30.5 GB/s — *one* thread does 50.4; splitting costs more than it saves |
+| 8 MB (L3) | **144.9 GB/s** |
+| 256 MB (DRAM) | 57.2 GB/s |
 
-### Summary
+A 1 M-row `f64` column is 8 MB, which fits this CPU's 24 MB L3 — so that scan
+never touches DRAM, and the floor for it is **55 µs**. FalconDB takes 109 µs, so
+roughly **half the time is not the data movement**. Polars, at 165 µs, is three
+times off the same floor: everyone is far from the ceiling here, FalconDB least so.
 
-| Workload         | FalconDB wins at          | DuckDB wins at       |
-|------------------|---------------------------|----------------------|
-| Full scan        | ≤ 100 k rows              | 1 M rows (1.3×)      |
-| Filter (WHERE)   | ≤ 100 k rows              | 1 M rows (1.7×)      |
-| GROUP BY         | ≤ 100 k rows              | 1 M rows (2.6×)      |
-| ORDER BY         | all tested sizes          | —                    |
-| SQL pipeline     | 10 k rows (1.9×)          | 100 k (1.3×)         |
+This only applies to sequential reads. `GROUP BY`, joins and sorts are bound by
+random-access latency instead, and that ceiling has not been measured — quoting
+the bandwidth figure for them would flatter every engine, including this one.
 
-FalconDB beats DuckDB at every tested size up to 100 k rows across all workloads, and wins ORDER BY at all sizes. The 1 M row gap remains — DuckDB's AVX-512 SIMD and mature query optimizer dominate at that scale. FalconDB is a learning project — the goal is full control over every layer, not replacing a production database.
+### Methodology
+
+The numbers above are worth what the method is worth, and two of the corrections
+below changed the published figures by an order of magnitude.
+
+**Pinned to the P-cores.** On a hybrid CPU, rayon's threads land on a different
+P/E mix each run, and unpinned run-to-run noise on *unchanged code* measured
+25–46% — larger than most of the effects being chased. `scripts/bench.ps1` pins
+the process and raises its priority; the same comparison then lands within ~1%.
+Discard the first run: a cold one is systematically slower.
+
+**Every engine is asked the same question.** `load_polars` used to hand the timed
+closure a lazy `scan_parquet`, so every Polars iteration re-read and re-decoded
+the file while the others queried memory. Every "N× faster than Polars" figure
+published before that fix was measuring an in-memory query against a file read.
+All four engines now load once, outside the timed region.
+
+**Results are asserted, not assumed.** For a long time this suite reported the
+same ~4 µs filter at 10 k, 100 k and 1 M rows. The times were real; the data was
+not — `load_parquet` kept only the first 1024-row batch while reporting the full
+row count. A wrong-sized input produces a perfectly self-consistent measurement,
+so every FalconDB closure now asserts its row count with `assert_eq!` — never
+`debug_assert!`, which the bench profile compiles out.
 
 ---
 
@@ -284,13 +319,25 @@ falcondb/
 │   │   ├── sort.rs         ← ORDER BY (multi-key, null-aware, parallel Rayon)
 │   │   ├── join.rs         ← hash join (INNER / LEFT / RIGHT)
 │   │   ├── window.rs       ← window functions (ROW_NUMBER/RANK/LAG/LEAD/SUM/AVG…)
+│   │   ├── tuning.rs       ← parallel thresholds derived from the machine, not hard-coded
 │   │   └── sql.rs          ← SQL string → query objects (plan cache aware)
 │   ├── api/
 │   │   └── c_ffi.rs        ← C-compatible extern "C" API
 │   └── bin/
 │       └── server.rs       ← Actix-web REST server
 ├── benches/
-│   └── query_bench.rs      ← Criterion benchmarks
+│   └── query_bench.rs      ← Criterion benchmarks, four engines on one Parquet file
+├── tests/
+│   ├── diag_bandwidth.rs   ← the machine's read-bandwidth floor (L2 / L3 / DRAM)
+│   ├── diag_join_breakdown.rs  ← where a join's time actually goes
+│   ├── diag_scan_shape.rs      ← batch shape a Parquet load produces
+│   ├── diag_threshold_reach.rs ← which per-batch thresholds can ever fire
+│   └── …                       ← correctness suites
+├── scripts/
+│   ├── bench.ps1           ← pinned benchmark runner — use this, not `cargo bench`
+│   ├── bench_notify.ps1    ← posts results to Telegram
+│   └── bench_report.py     ← formats a run into a table
+├── bench-results/          ← captured output from past runs
 └── .github/workflows/
     └── ci.yml              ← test / clippy / fmt / coverage
 ```
@@ -320,17 +367,21 @@ cargo run --bin falcondb-server
 
 ## Roadmap
 
-### Performance gaps vs DuckDB
+### Where the remaining time goes
 
-FalconDB now wins every benchmarked workload. The remaining limits are structural
-rather than a single slow loop:
+FalconDB is ahead of DuckDB and DataFusion on every measured workload, so the
+open items are structural rather than a slow loop somewhere:
 
-| Limit                     | Why it matters                                        | Next step                                        |
-|---------------------------|-------------------------------------------------------|--------------------------------------------------|
-| Everything lives in RAM   | A table larger than memory simply cannot be loaded    | Spill-to-disk and lazy batch reads               |
-| No cost-based optimizer   | Join order is whatever the query text says            | Cardinality estimates from zone maps             |
-| Correlated subqueries     | Re-executed per outer row — correct but O(rows × inner) | Rewrite into a grouped join                    |
-| Numeric filter is scalar  | LLVM auto-vectorises, but nothing is hand-tuned       | Explicit AVX2 via `std::arch` with runtime detect |
+| Limit | Why it matters | Next step |
+|---|---|---|
+| Scans run at half the measured floor | 1 M-row `SUM` takes 109 µs against a 55 µs L3 bandwidth floor | Per-batch overhead: ~55 ns × 977 batches. Larger batches do recover ~10%, but every other threshold assumes 1024-row batches — see below |
+| Thresholds are calibrated, not derived | Parallel cut-offs come from measurements on *this* laptop | The coarse ones now scale with `rayon::current_num_threads()`; the model is untested on a many-core machine |
+| Batch-count thresholds remain | `PAR_SUM_THRESHOLD` and the group-by still reason in batches, so 65 536-row batches break them | Convert every threshold to rows, then raise the Parquet batch size |
+| No NUMA awareness | A thread may work on memory owned by another socket | Nothing measured yet; needs a server to measure on |
+| `INNER JOIN` trails Polars | 2.7× at 1 M rows, the largest remaining gap | Cause not yet identified — merging, index representation and probe have all been addressed |
+| Everything lives in RAM | A table larger than memory cannot be loaded | Spill-to-disk and lazy batch reads |
+| No cost-based optimizer | Join order is whatever the query text says | Cardinality estimates from zone maps |
+| `WHERE` on a right-hand join column | Not supported: the filter is applied during the scan, before the join | Pinned by a test in `tests/join_projection.rs` |
 
 ### Features not yet implemented
 

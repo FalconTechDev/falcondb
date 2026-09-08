@@ -287,7 +287,10 @@ fn apply_keeps(batches: &[RecordBatch], keeps: Vec<Vec<bool>>) -> Vec<RecordBatc
 /// left it about 2x behind Polars while the 1M case — which did split — led every
 /// rival. The merge pass costs one hash per distinct value per chunk, so it stays
 /// cheap well below this.
-const PAR_DEDUP_ROWS: usize = 32_768;
+/// Measured at 32_768 on a machine reporting 20 threads, so ~1.6k each.
+fn par_dedup_rows() -> usize {
+    crate::query::tuning::par_min_rows(1_638)
+}
 
 /// DISTINCT over a single primitive column, without per-row type dispatch.
 ///
@@ -326,7 +329,7 @@ fn dedup_single_primitive(batches: &[RecordBatch]) -> Option<Vec<Vec<bool>>> {
             // earlier chunk already had. The second pass touches only locally-kept
             // rows — at most one per distinct value per chunk — rather than all of
             // them, so the serial part shrinks with cardinality instead of row count.
-            let par = total_rows >= PAR_DEDUP_ROWS && batches.len() > 1;
+            let par = total_rows >= par_dedup_rows() && batches.len() > 1;
             if par {
                 let per_chunk: Vec<(FastSet<u64>, Vec<Vec<bool>>)> = batches
                     .par_chunks(batches.len().div_ceil(rayon::current_num_threads().max(1)).max(1))
@@ -688,13 +691,13 @@ mod tests {
     /// The parallel dedup must keep the same rows, in the same order, as the serial one.
     ///
     /// Every other DISTINCT test here is a handful of rows, so none of them reach
-    /// PAR_DEDUP_ROWS and the chunked path went unexercised. Which occurrence
+    /// par_dedup_rows() and the chunked path went unexercised. Which occurrence
     /// survives is a global fact, so a chunk boundary falling between two copies of
     /// a value is exactly the case that can go wrong.
     #[test]
     fn parallel_dedup_matches_the_serial_result() {
         let schema = Schema::new(vec![Field::required("v", DataType::Int64)]);
-        // Well over PAR_DEDUP_ROWS, split into many batches so chunks land mid-run.
+        // Well over par_dedup_rows(), split into many batches so chunks land mid-run.
         const BATCHES: usize = 200;
         const PER_BATCH: usize = 1_000;
         const DISTINCT: i64 = 97; // coprime with the batch size, so repeats straddle chunks
@@ -707,7 +710,7 @@ mod tests {
                 RecordBatch::new(schema.clone(), vec![ColumnBuilder::int64(vals)]).unwrap()
             })
             .collect();
-        assert!(BATCHES * PER_BATCH > PAR_DEDUP_ROWS, "test must reach the parallel path");
+        assert!(BATCHES * PER_BATCH > par_dedup_rows(), "test must reach the parallel path");
 
         let parallel = dedup_single_primitive(&batches).expect("Int64 takes the typed path");
 
