@@ -1276,6 +1276,11 @@ pub fn execute_agg_only(
     /// not pay off, so the constant stands.
     const AGG_MIN_BATCHES_PER_TASK: usize = 8;
 
+    // A lone batch has nothing to fan out over, so the per-column kernels may split
+    // the slice themselves. With more than one batch the fan-out happens above and a
+    // second, nested one would only contend.
+    let may_split = batches.len() == 1;
+
     macro_rules! accumulate_body {
         ($accs:expr, $batch:expr) => {{
             let mut accs = $accs;
@@ -1291,7 +1296,7 @@ pub fn execute_agg_only(
                 }
                 if let Some(idx) = maybe_idx {
                     let col = batch.column(idx);
-                    if accumulate_typed(acc, col) {
+                    if accumulate_typed(acc, col, may_split) {
                         continue;
                     }
                 }
@@ -1424,7 +1429,7 @@ fn par_sum_lanes<T: SumLane>(dense: &[T]) -> f64 {
     dense.par_chunks(PAR_SUM_CHUNK).map(sum_lanes).sum::<f64>()
 }
 
-fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
+fn accumulate_typed(acc: &mut Accumulator, col: &Column, may_split: bool) -> bool {
     use crate::storage::column::Column as C;
 
     /// Apply `$f` to every non-NULL value of a primitive column, as f64.
@@ -1471,15 +1476,19 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
         }
         Accumulator::Sum { total, valid } => {
             // Fast paths for no-null columns: a single reduction without branches.
-            // For large slices (>= 64k elements) we split into chunks and let
-            // rayon do the reduction in parallel — this lets us use all cores even
-            // when there is only one batch, recovering the ~14% gap vs DuckDB at 1M rows.
+            //
+            // A long enough slice is split across cores, but only when the caller
+            // says there is nothing else to spread the work over — `may_split` is
+            // true for a lone batch. The size test alone used to decide this, which
+            // was harmless while a Parquet load produced 1024-row batches (it never
+            // fired) and actively wrong once batches were large: every batch of a
+            // serial fold would enter its own rayon region.
             const PAR_SUM_THRESHOLD: usize = 65_536;
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
                     let dense = c.dense();
                     if !dense.is_empty() {
-                        *total += if dense.len() >= PAR_SUM_THRESHOLD {
+                        *total += if may_split && dense.len() >= PAR_SUM_THRESHOLD {
                             par_sum_lanes(dense)
                         } else {
                             sum_lanes(dense)
@@ -1493,7 +1502,7 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
                 if !c.has_nulls() {
                     let dense = c.dense();
                     if !dense.is_empty() {
-                        *total += if dense.len() >= PAR_SUM_THRESHOLD {
+                        *total += if may_split && dense.len() >= PAR_SUM_THRESHOLD {
                             par_sum_lanes(dense)
                         } else {
                             sum_lanes(dense)
@@ -1507,7 +1516,7 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
                 if !c.has_nulls() {
                     let dense = c.dense();
                     if !dense.is_empty() {
-                        *total += if dense.len() >= PAR_SUM_THRESHOLD {
+                        *total += if may_split && dense.len() >= PAR_SUM_THRESHOLD {
                             par_sum_lanes(dense)
                         } else {
                             sum_lanes(dense)
@@ -1531,7 +1540,7 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
                     let dense = c.dense();
-                    *total += if dense.len() >= 65_536 {
+                    *total += if may_split && dense.len() >= 65_536 {
                         dense.par_iter().copied().sum::<f64>()
                     } else {
                         dense.iter().copied().sum::<f64>()
@@ -1554,7 +1563,7 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
                     let dense = c.dense();
-                    let chunk_min = if dense.len() >= 65_536 {
+                    let chunk_min = if may_split && dense.len() >= 65_536 {
                         dense.par_iter().copied().reduce(|| f64::INFINITY, f64::min)
                     } else {
                         dense.iter().copied().fold(f64::INFINITY, f64::min)
@@ -1580,7 +1589,7 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column) -> bool {
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
                     let dense = c.dense();
-                    let chunk_max = if dense.len() >= 65_536 {
+                    let chunk_max = if may_split && dense.len() >= 65_536 {
                         dense.par_iter().copied().reduce(|| f64::NEG_INFINITY, f64::max)
                     } else {
                         dense.iter().copied().fold(f64::NEG_INFINITY, f64::max)
