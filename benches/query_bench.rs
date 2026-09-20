@@ -1,3 +1,29 @@
+// ## Why this benchmark sets its own allocator
+//
+// Every engine here runs in one process, so the allocator is shared and its
+// state carries between groups. On the Windows system heap that turned out to
+// be load-bearing: FalconDB's in-place join probe builds its output in per-unit
+// slices, allocated on a worker thread and freed on another, and Polars --
+// measured *after* FalconDB in the same process -- went from 3.61 ms to 8.24 ms
+// because of it. Reverting the probe brought Polars back, which is how the
+// mechanism was identified rather than guessed.
+//
+// mimalloc removes the effect: Polars returns to 2.89 ms, better than it ever
+// measured on the system heap. It is set here because a benchmark whose engines
+// can sabotage each other through the allocator is not measuring the engines.
+//
+// This is not a FalconDB optimisation and must not be read as one. Every engine
+// gained: Polars -20%, DataFusion -29%, DuckDB unchanged. Numbers taken here are
+// not comparable with numbers taken before it, which is why the whole suite was
+// re-baselined when it went in.
+//
+// It is also not a fix for the allocation pattern that exposed the problem.
+// Building a join's output in twenty 40 KB pieces instead of one 800 KB piece is
+// a real cost imposed on whatever else shares the process, and a library does not
+// get to choose the application's allocator. That remains to be fixed on its own.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // FalconDB benchmark suite — fair 4-way comparison
 //
 // All engines read from the **same Parquet file** written to a temp directory
