@@ -329,15 +329,6 @@ impl Accumulator {
     }
 }
 
-/// Minimum rows in a single batch to justify intra-batch rayon parallelism in group-by.
-/// Below this the rayon task-spawn overhead dominates: 100k rows / 20 threads = 5k rows/task
-/// is too fine-grained. 512k ensures ≥25k rows per task on a 20-thread machine.
-/// Rows in a single batch before splitting the group-by scan across cores is
-/// worth it. Measured at 524_288 on a machine reporting 20 threads.
-fn par_intra_gb_rows() -> usize {
-    crate::query::tuning::par_min_rows(26_214)
-}
-
 // в”Ђв”Ђв”Ђ Fast-path batch state (parallel arrays, no boxing) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 // Inline capacity: most analytical GROUP BY queries have ≤ 8 groups per batch.
@@ -524,8 +515,14 @@ impl GroupByExec {
             //
             // The chunks are (batch, row range) pairs, so a batch is divided without
             // being copied: `accumulate_batch` already takes a row offset.
+            //
+            // The threshold is the ordinary one for parallelising at all. It used to
+            // be far higher because this path required a single large batch; now that
+            // it divides by rows it subsumes the per-batch fan-out below — with many
+            // batches the chunks simply line up with them — so the old, stricter
+            // threshold only kept two-batch inputs on two threads.
             let total_gb_rows: usize = batches.iter().map(|b| b.row_count()).sum();
-            if total_gb_rows >= par_intra_gb_rows() {
+            if total_gb_rows >= crate::query::tuning::par_min_rows_per_batch_fanout() {
                 let n_threads = rayon::current_num_threads().max(1);
                 // Aim for a few chunks per thread so an uneven split still balances.
                 let target = (total_gb_rows / (n_threads * 2).max(1)).max(4096);
@@ -1786,7 +1783,7 @@ mod tests {
         use crate::storage::{column::ColumnBuilder, schema::{Field, Schema}, types::DataType};
 
         const DEPTS: [&str; 5] = ["eng", "sales", "hr", "ops", "legal"];
-        // Past par_intra_gb_rows() on any plausible thread count, and deliberately
+        // Past the parallel threshold on any plausible thread count, and deliberately
         // uneven so the last batch is shorter than a chunk.
         const TOTAL: usize = 700_000;
         let sizes = [400_000usize, 250_000, 50_000];
