@@ -347,3 +347,73 @@ fn is_the_merge_copy_bound_or_allocation_bound() {
         (fresh.as_secs_f64() - warm.as_secs_f64()) / fresh.as_secs_f64() * 100.0,
     );
 }
+
+
+/// Inside build+probe, which side is it?
+///
+/// The benchmark-shape breakdown says build+probe is now 3.28 ms of a 4.43 ms
+/// join -- three quarters of it. That number covers two very different things:
+/// hashing 100k build rows into a table, and probing 1M left rows against it.
+///
+/// Separated by shrinking the probe side to almost nothing. A join with the same
+/// build side and 1000 left rows does essentially all of the build work and
+/// almost none of the probe, so the difference is the probe.
+///
+/// Worth checking because the build side allocates roughly 2 MB per call -- the
+/// bucket heads, the chain, the keys and the Bloom filter -- and fresh
+/// allocations on this machine were measured at about 0.27 ms per MB, which
+/// would be a third of the whole join spent before a single row is probed.
+#[test]
+fn build_side_against_probe_side() {
+    const RIGHT_ROWS: usize = 100_000;
+    const BATCH:      usize = 65_536;
+
+    let key_only = Schema::new(vec![Field::required("k", DataType::Int64)]);
+    let make = |rows: usize, batch_rows: usize, base: i64, stride: i64| -> Vec<RecordBatch> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < rows {
+            let n = batch_rows.min(rows - start);
+            out.push(
+                RecordBatch::new(
+                    key_only.clone(),
+                    vec![ColumnBuilder::int64(
+                        (0..n).map(|i| Some(base + (start + i) as i64 * stride)).collect(),
+                    )],
+                )
+                .unwrap(),
+            );
+            start += n;
+        }
+        out
+    };
+
+    // Same build side throughout; only the probe side's size changes. Keys are
+    // disjoint so no output is built and what is left is build plus probe.
+    let right = make(RIGHT_ROWS, BATCH, 1_000_000_000, 10);
+    let big   = make(1_000_000, BATCH, 0, 1);
+    let tiny  = make(1_000, 1_000, 0, 1);
+
+    let run = |l: &[RecordBatch]| -> std::time::Duration {
+        let t = Instant::now();
+        let out = execute_hash_join(l, &right, &["k"], &["k"], JoinType::Inner).unwrap();
+        let e = t.elapsed();
+        assert_eq!(out.row_count(), 0);
+        e
+    };
+    for _ in 0..3 {
+        run(&big);
+        run(&tiny);
+    }
+    let with_big  = best(|| run(&big), 9);
+    let with_tiny = best(|| run(&tiny), 9);
+
+    println!("build side 100k, no matches:");
+    println!("  probe 1M rows  = {with_big:?}");
+    println!("  probe 1k rows  = {with_tiny:?}   (build + almost nothing)");
+    println!("  probe of 1M    = {:?}", with_big.saturating_sub(with_tiny));
+    println!(
+        "  build is {:.0}% of build+probe",
+        with_tiny.as_secs_f64() / with_big.as_secs_f64() * 100.0,
+    );
+}

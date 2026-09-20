@@ -592,7 +592,8 @@ fn build_hash_table(
         .collect::<FalconResult<_>>()?;
 
     let n = batch.row_count();
-    let mut bloom = (n >= BLOOM_MIN_ROWS).then(|| BuildFilter::with_capacity(n));
+    // EXPERIMENT: typed path skips the filter.
+    let mut bloom = (!typed && n >= BLOOM_MIN_ROWS).then(|| BuildFilter::with_capacity(n));
 
     if typed {
         let col = key_cols[0];
