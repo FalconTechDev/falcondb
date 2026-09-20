@@ -286,3 +286,64 @@ fn breakdown_in_the_benchmark_shape() {
         single.saturating_sub(no_out),
     );
 }
+
+/// Is the left-hand merge bound by copying, or by allocating?
+///
+/// `PrimitiveColumn::concat_all` reserves once and then memcpys dense slices, so
+/// 8 MB should cost roughly 8 MB / bandwidth — about 150 us here. It measures
+/// 3.2 ms, twenty times that. The suspicion is that the time is not in the copy
+/// at all but in first-touch page faults on a freshly allocated 8 MB buffer,
+/// which Windows commits lazily.
+///
+/// If so, the fix is structural — stop materialising the side — rather than
+/// making the copy faster, because the copy was never the cost.
+#[test]
+fn is_the_merge_copy_bound_or_allocation_bound() {
+    const ROWS: usize = 1_000_000;
+    const BATCH: usize = 65_536;
+
+    let parts: Vec<Vec<i64>> = (0..ROWS)
+        .step_by(BATCH)
+        .map(|s| ((s as i64)..((s + BATCH).min(ROWS)) as i64).collect())
+        .collect();
+
+    // Fresh allocation every time: what concat_all does today.
+    let fresh = best(
+        || {
+            let t = Instant::now();
+            let mut v: Vec<i64> = Vec::with_capacity(ROWS);
+            for p in &parts {
+                v.extend_from_slice(p);
+            }
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        },
+        9,
+    );
+
+    // Same copy, same total bytes, into a buffer whose pages are already faulted in.
+    let mut reused: Vec<i64> = Vec::with_capacity(ROWS);
+    reused.extend(std::iter::repeat(0).take(ROWS));
+    let warm = best(
+        || {
+            reused.clear();
+            let t = Instant::now();
+            for p in &parts {
+                reused.extend_from_slice(p);
+            }
+            let e = t.elapsed();
+            std::hint::black_box(&reused);
+            e
+        },
+        9,
+    );
+
+    println!("copy 8 MB from {} slices:", parts.len());
+    println!("  into a fresh allocation  = {fresh:?}");
+    println!("  into a warm buffer       = {warm:?}");
+    println!(
+        "  allocation share         = {:.1}%",
+        (fresh.as_secs_f64() - warm.as_secs_f64()) / fresh.as_secs_f64() * 100.0,
+    );
+}
