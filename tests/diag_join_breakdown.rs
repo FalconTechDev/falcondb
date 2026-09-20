@@ -205,3 +205,84 @@ fn join_operator_against_the_sql_path() {
         direct.saturating_sub(merges)
     );
 }
+
+/// The same join in the shape the *benchmark* actually runs.
+///
+/// The test above measures a two-column table, but `SELECT COUNT(*) FROM bench
+/// JOIN lookup ON bench.id = lookup.lid` needs only the two key columns, and
+/// `project_for_join` trims to them before merging. Its merge is therefore one
+/// 8 MB Int64 column, not three columns of mixed types — so the "merges are 27%
+/// of the join" figure above describes a shape the benchmark never reaches.
+/// Measure the shape we are actually losing on.
+///
+/// Phases are separated by changing the *input*, not by instrumenting the
+/// operator: a pre-merged left side removes the merge, and keys that cannot match
+/// remove the output build while leaving build+probe intact.
+#[test]
+fn breakdown_in_the_benchmark_shape() {
+    const LEFT_ROWS:  usize = 1_000_000;
+    const RIGHT_ROWS: usize = 100_000;
+    const BATCH:      usize = 65_536; // what the Parquet reader produces
+
+    let key_only = Schema::new(vec![Field::required("k", DataType::Int64)]);
+    let make = |rows: usize, batch_rows: usize, base: i64, stride: i64| -> Vec<RecordBatch> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < rows {
+            let n = batch_rows.min(rows - start);
+            out.push(
+                RecordBatch::new(
+                    key_only.clone(),
+                    vec![ColumnBuilder::int64(
+                        (0..n).map(|i| Some(base + (start + i) as i64 * stride)).collect(),
+                    )],
+                )
+                .unwrap(),
+            );
+            start += n;
+        }
+        out
+    };
+
+    // Left keys 0..1M; right keys 0,10,20,... so every tenth left row matches once.
+    let left_batched = make(LEFT_ROWS, BATCH, 0, 1);
+    let left_single  = make(LEFT_ROWS, LEFT_ROWS, 0, 1);
+    let right        = make(RIGHT_ROWS, BATCH, 0, 10);
+    // Same size and same batching, but disjoint from the left key range.
+    let right_miss   = make(RIGHT_ROWS, BATCH, 1_000_000_000, 10);
+
+    let run = |l: &[RecordBatch], r: &[RecordBatch]| -> (std::time::Duration, usize) {
+        let t = Instant::now();
+        let out = execute_hash_join(l, r, &["k"], &["k"], JoinType::Inner).unwrap();
+        (t.elapsed(), out.row_count())
+    };
+    for _ in 0..3 {
+        run(&left_batched, &right);
+        run(&left_single, &right);
+        run(&left_batched, &right_miss);
+    }
+
+    let (batched, n_match) = {
+        let mut best_d = None;
+        let mut rows = 0;
+        for _ in 0..7 {
+            let (d, n) = run(&left_batched, &right);
+            rows = n;
+            best_d = Some(best_d.map_or(d, |b: std::time::Duration| b.min(d)));
+        }
+        (best_d.unwrap(), rows)
+    };
+    let single = best(|| run(&left_single, &right).0, 7);
+    let no_out = best(|| run(&left_batched, &right_miss).0, 7);
+
+    println!("benchmark shape: 1M left / 100k right, one Int64 key per side");
+    println!("  output rows                       = {n_match}");
+    println!("  full join, {:>2} left batches        = {batched:?}", left_batched.len());
+    println!("  full join,  1 left batch          = {single:?}");
+    println!("  left merge (difference)           = {:?}", batched.saturating_sub(single));
+    println!("  build + probe only (no matches)   = {no_out:?}");
+    println!(
+        "  output build (difference)         = {:?}",
+        single.saturating_sub(no_out),
+    );
+}
