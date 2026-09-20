@@ -41,6 +41,7 @@ tempfile           = "3"
 polars             = { version = "0.46", features = ["lazy", "csv", "parquet", "dtype-full"] }
 duckdb             = "1"
 datafusion         = "43"
+mimalloc = { version = "0.1.52", default-features = false }
 
 
 [profile.release]

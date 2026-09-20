@@ -225,10 +225,40 @@ pub fn execute_hash_join_projected(
     let right_slim = project_for_join(right_batches, right_keys, trim);
 
     let right_merged = merge_batches(&right_slim)?;
-    let left_merged  = merge_batches(&left_slim)?;
 
-    let typed = int_keys_usable(&right_merged, right_keys, &left_merged, left_keys);
+    // Checked per batch rather than on a merged left side, so the hash table can be
+    // built before deciding whether the left side needs merging at all. Requiring
+    // every batch to qualify is the same condition: `null_count` sums over a concat.
+    let typed = left_slim
+        .iter()
+        .all(|b| int_keys_usable(&right_merged, right_keys, b, left_keys));
     let (hash_table, bloom) = build_hash_table(&right_merged, right_keys, typed)?;
+
+    // INNER and LEFT decide each left row independently and never look at a row
+    // outside its own batch, so the left side does not have to be one batch. Merging
+    // it is pure overhead, and measurement says the overhead is not the copy:
+    // concatenating 16 batches into a fresh 8 MB Int64 column costs 2.16 ms, the
+    // same copy into an already-faulted buffer costs 509 us. Three quarters of the
+    // merge is the operating system handing out pages, at roughly 2.5 GB/s against
+    // a machine that reads at 57 GB/s.
+    //
+    // Probing in place skips that allocation and its copy. What is concatenated
+    // instead is the *output*, which for a selective join is far smaller than the
+    // probe side — 100k rows where the merge moved 1M.
+    if matches!(join_type, JoinType::Inner | JoinType::Left) && left_slim.len() > 1 {
+        return probe_in_place(
+            &left_slim,
+            &right_merged,
+            left_keys,
+            right_keys,
+            &hash_table,
+            bloom.as_ref(),
+            join_type,
+            keep,
+        );
+    }
+
+    let left_merged = merge_batches(&left_slim)?;
     probe(
         &left_merged,
         &right_merged,
@@ -239,6 +269,83 @@ pub fn execute_hash_join_projected(
         join_type,
         keep,
     )
+}
+
+/// Probe the left side without concatenating it.
+///
+/// Work is split into row ranges that never cross a batch boundary, so the split
+/// is independent of how the reader happened to batch the input: one huge batch
+/// still spreads over every core, and many small ones do not each pay for a
+/// rayon hand-off.
+///
+/// Output order matches the merged path exactly — units are produced in batch
+/// order and, within a batch, in row order, which is the order a concatenated
+/// left side would have had. `probe_in_place_matches_the_merged_contract` pins
+/// that, because two implementations of one semantics have already cost this
+/// engine a 100x regression that nothing caught.
+#[allow(clippy::too_many_arguments)]
+fn probe_in_place(
+    left_batches: &[RecordBatch],
+    right:        &RecordBatch,
+    left_keys:    &[&str],
+    right_keys:   &[&str],
+    hash_table:   &JoinKeyMap,
+    bloom:        Option<&BuildFilter>,
+    join_type:    JoinType,
+    keep:         Option<&HashSet<String>>,
+) -> FalconResult<RecordBatch> {
+    let right_key_cols: Vec<&Column> = right_keys.iter()
+        .map(|k| right.column_by_name(k))
+        .collect::<FalconResult<_>>()?;
+
+    let total: usize = left_batches.iter().map(|b| b.row_count()).sum();
+    let target = (total / rayon::current_num_threads().max(1)).max(8_192);
+    let mut units: Vec<(usize, usize, usize)> = Vec::new();
+    for (bi, b) in left_batches.iter().enumerate() {
+        let n = b.row_count();
+        let mut start = 0;
+        while start < n {
+            let end = (start + target).min(n);
+            units.push((bi, start, end));
+            start = end;
+        }
+    }
+    // Every batch was empty. Fall back so the empty result still carries the
+    // schema the merged path would have produced.
+    if units.is_empty() {
+        let left_merged = merge_batches(left_batches)?;
+        return probe(
+            &left_merged, right, left_keys, right_keys, hash_table, bloom, join_type, keep,
+        );
+    }
+
+    let probe_unit = |&(bi, start, end): &(usize, usize, usize)| -> FalconResult<RecordBatch> {
+        let batch = &left_batches[bi];
+        let left_key_cols: Vec<&Column> = left_keys.iter()
+            .map(|k| batch.column_by_name(k))
+            .collect::<FalconResult<_>>()?;
+        let bloom_ok = bloom.filter(|_| filter_is_safe(&right_key_cols, &left_key_cols));
+
+        let mut li = Vec::new();
+        let mut ri = Vec::new();
+        let mut scratch = Vec::new();
+        for l_row in start..end {
+            probe_one(
+                l_row, &left_key_cols, hash_table, bloom_ok, &join_type,
+                &mut li, &mut ri, None, &mut scratch,
+            )?;
+        }
+        // Indices are row numbers inside this batch, so the output is built from
+        // the batch directly — no global numbering and no merged left side.
+        build_output(batch, right, &li, &ri, keep)
+    };
+
+    let outs: FalconResult<Vec<RecordBatch>> = if units.len() > 1 {
+        units.par_iter().map(probe_unit).collect()
+    } else {
+        units.iter().map(probe_unit).collect()
+    };
+    RecordBatch::concat(&outs?)
 }
 
 // ─── Sort-merge join ─────────────────────────────────────────────────────────
@@ -1298,6 +1405,81 @@ mod tests {
         assert!(!int_keys_usable(&with_null, &["k"], &no_null, &["k"]));
         assert!(!int_keys_usable(&no_null, &["k"], &with_null, &["k"]));
         assert!(int_keys_usable(&no_null, &["k"], &no_null, &["k"]));
+    }
+
+    /// The in-place probe must return exactly what the merged probe returns.
+    ///
+    /// Same rows, same order, same columns. The only difference between the two
+    /// paths is whether the left side was concatenated first, and that is an
+    /// implementation detail the caller must not be able to observe.
+    #[test]
+    fn probe_in_place_matches_the_merged_contract() {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+
+        let schema = Schema::new(vec![
+            Field::required("k", DataType::Int64),
+            Field::nullable("payload", DataType::Utf8),
+        ]);
+        // Keys repeat so some left rows match several right rows, and some match
+        // none — both are cases where order and cardinality could drift.
+        let rows = 5_000usize;
+        let make = |batch_rows: usize| -> Vec<RecordBatch> {
+            let mut out = Vec::new();
+            let mut start = 0;
+            while start < rows {
+                let n = batch_rows.min(rows - start);
+                out.push(
+                    RecordBatch::new(
+                        schema.clone(),
+                        vec![
+                            ColumnBuilder::int64(
+                                (0..n).map(|i| Some(((start + i) % 700) as i64)).collect(),
+                            ),
+                            ColumnBuilder::utf8_from_str(
+                                (0..n)
+                                    .map(|i| if (start + i) % 11 == 0 { None } else { Some("p") })
+                                    .collect(),
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                start += n;
+            }
+            out
+        };
+
+        let right_schema = Schema::new(vec![Field::required("rk", DataType::Int64)]);
+        let right = vec![RecordBatch::new(
+            right_schema,
+            vec![ColumnBuilder::int64((0..400).map(|i| Some(i as i64 * 3)).collect())],
+        )
+        .unwrap()];
+
+        for join_type in [JoinType::Inner, JoinType::Left] {
+            let many = make(137); // many batches -> in-place path
+            let one  = make(rows); // single batch -> merged path
+            assert!(many.len() > 1 && one.len() == 1);
+
+            let a = execute_hash_join(&many, &right, &["k"], &["rk"], join_type.clone()).unwrap();
+            let b = execute_hash_join(&one, &right, &["k"], &["rk"], join_type.clone()).unwrap();
+
+            assert_eq!(a.row_count(), b.row_count(), "{join_type:?}: row count");
+            assert_eq!(
+                a.schema.column_names(),
+                b.schema.column_names(),
+                "{join_type:?}: columns",
+            );
+            for c in 0..a.column_count() {
+                for r in 0..a.row_count() {
+                    assert_eq!(
+                        a.column(c).get(r).unwrap(),
+                        b.column(c).get(r).unwrap(),
+                        "{join_type:?}: column {c} row {r}",
+                    );
+                }
+            }
+        }
     }
 
     fn orders() -> RecordBatch {
