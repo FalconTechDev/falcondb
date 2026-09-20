@@ -517,23 +517,44 @@ impl GroupByExec {
 
             // Intra-batch parallel path: one large batch (e.g. from Parquet) → split into
             // rayon chunks so each thread accumulates its own local state then we merge.
-            if batches.len() == 1 && first_b.row_count() >= par_intra_gb_rows() {
-                let batch = first_b;
-                let gb_dict = batch.column(gb_col_idx).as_utf8_column()
-                    .ok_or_else(|| FalconError::InvalidQuery(format!("Expected Utf8 column '{gb_name}'")))?;
-                let codes = gb_dict.codes();
-                let n_rows = codes.len();
+            // Split by *work*, not by batch. Fanning out over batches gives one task
+            // each, so two 50k-row batches leave eighteen of twenty threads idle —
+            // which is what a 100k `GROUP BY` became once a Parquet load started
+            // producing 65_536-row batches instead of 1024-row ones.
+            //
+            // The chunks are (batch, row range) pairs, so a batch is divided without
+            // being copied: `accumulate_batch` already takes a row offset.
+            let total_gb_rows: usize = batches.iter().map(|b| b.row_count()).sum();
+            if total_gb_rows >= par_intra_gb_rows() {
                 let n_threads = rayon::current_num_threads().max(1);
-                let chunk_size = ((n_rows + n_threads - 1) / n_threads).max(1024);
-                let partial: FalconResult<Vec<Vec<BatchAggState>>> = codes
-                    .par_chunks(chunk_size)
-                    .enumerate()
-                    .map(|(ci, codes_chunk)| {
-                        let row_start = ci * chunk_size;
+                // Aim for a few chunks per thread so an uneven split still balances.
+                let target = (total_gb_rows / (n_threads * 2).max(1)).max(4096);
+
+                let mut work: Vec<(usize, usize, usize)> = Vec::new();
+                for (bi, b) in batches.iter().enumerate() {
+                    let rows = b.row_count();
+                    let mut start = 0;
+                    while start < rows {
+                        let end = (start + target).min(rows);
+                        work.push((bi, start, end));
+                        start = end;
+                    }
+                }
+
+                let partial: FalconResult<Vec<Vec<BatchAggState>>> = work
+                    .par_iter()
+                    .map(|&(bi, start, end)| {
+                        let batch = &batches[bi];
+                        let gb_dict = batch.column(gb_col_idx).as_utf8_column()
+                            .ok_or_else(|| FalconError::InvalidQuery(
+                                format!("Expected Utf8 column '{gb_name}'")
+                            ))?;
                         let mut local: Vec<BatchAggState> = (0..n_aggs)
                             .map(|_| BatchAggState::with_capacity(n_g))
                             .collect();
-                        self.accumulate_batch(codes_chunk, row_start, batch, &agg_col_indices, &mut local)?;
+                        self.accumulate_batch(
+                            &gb_dict.codes()[start..end], start, batch, &agg_col_indices, &mut local,
+                        )?;
                         Ok(local)
                     })
                     .collect();
@@ -1752,6 +1773,93 @@ mod tests {
                 Some(9.0), Some(8.0), Some(7.0), Some(6.0), Some(10.0),
             ]),
         ]).unwrap()
+    }
+
+    /// GROUP BY must give the same answer however the rows are split into batches.
+    ///
+    /// The parallel path divides by row ranges across batches, and every other
+    /// group-by test here is a handful of rows — well under the threshold — so none
+    /// of them reach it. A chunk boundary falling mid-batch, and a batch smaller
+    /// than one chunk, are exactly the cases that can go wrong.
+    #[test]
+    fn parallel_group_by_matches_a_single_batch() {
+        use crate::storage::{column::ColumnBuilder, schema::{Field, Schema}, types::DataType};
+
+        const DEPTS: [&str; 5] = ["eng", "sales", "hr", "ops", "legal"];
+        // Past par_intra_gb_rows() on any plausible thread count, and deliberately
+        // uneven so the last batch is shorter than a chunk.
+        const TOTAL: usize = 700_000;
+        let sizes = [400_000usize, 250_000, 50_000];
+
+        let schema = Schema::new(vec![
+            Field::required("dept", DataType::Utf8),
+            Field::required("v", DataType::Int64),
+        ]);
+        let mut batches = Vec::new();
+        let mut start = 0usize;
+        for n in sizes {
+            batches.push(RecordBatch::new(
+                schema.clone(),
+                vec![
+                    ColumnBuilder::utf8_from_str(
+                        (0..n).map(|i| Some(DEPTS[(start + i) % 5])).collect(),
+                    ),
+                    ColumnBuilder::int64((0..n).map(|i| Some((start + i) as i64)).collect()),
+                ],
+            ).unwrap());
+            start += n;
+        }
+        assert_eq!(start, TOTAL);
+
+        let exec = GroupByExec::new(
+            vec![Expr::Column("dept".into())],
+            vec![
+                AggExpr::count(Expr::Column("v".into()), "cnt"),
+                AggExpr::sum(Expr::Column("v".into()), "total"),
+            ],
+        );
+        let split = exec.execute(&batches).unwrap();
+
+        // The same rows as one batch: the serial shape, and the reference.
+        let single = vec![RecordBatch::new(
+            schema,
+            vec![
+                ColumnBuilder::utf8_from_str((0..TOTAL).map(|i| Some(DEPTS[i % 5])).collect()),
+                ColumnBuilder::int64((0..TOTAL).map(|i| Some(i as i64)).collect()),
+            ],
+        ).unwrap()];
+        let whole = exec.execute(&single).unwrap();
+
+        assert_eq!(split.row_count(), 5, "wrong number of groups");
+        assert_eq!(split.row_count(), whole.row_count());
+
+        // Compare group by group, keyed by name — group order is not guaranteed.
+        let read = |b: &RecordBatch| -> std::collections::HashMap<String, (f64, f64)> {
+            let mut m = std::collections::HashMap::new();
+            for r in 0..b.row_count() {
+                let ScalarValue::Utf8(Some(k)) = b.column(0).get(r).unwrap() else {
+                    panic!("expected a text key")
+                };
+                let c = b.column(1).get(r).unwrap().as_f64().unwrap();
+                let t = b.column(2).get(r).unwrap().as_f64().unwrap();
+                m.insert(k, (c, t));
+            }
+            m
+        };
+        let a = read(&split);
+        let b = read(&whole);
+        assert_eq!(a.len(), b.len());
+        for (k, (c, t)) in &a {
+            let (c2, t2) = b.get(k).unwrap_or_else(|| panic!("group {k} missing"));
+            assert_eq!(c, c2, "count differs for {k}");
+            assert_eq!(t, t2, "sum differs for {k}");
+        }
+
+        // And against arithmetic, so both paths being wrong the same way is caught.
+        let expected_count = (TOTAL / 5) as f64;
+        for (k, (c, _)) in &a {
+            assert_eq!(*c, expected_count, "group {k} has the wrong count");
+        }
     }
 
     #[test]
