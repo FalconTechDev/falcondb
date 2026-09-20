@@ -104,8 +104,12 @@ impl SelectQuery {
 /// Execute a SELECT query over a table and return a flat list of result batches.
 pub fn execute_select(table: &Table, query: &SelectQuery) -> FalconResult<Vec<RecordBatch>> {
     // Each batch is processed independently — parallelism here is safe.
-    // For small tables (< 32 batches) Rayon scheduling overhead dominates; use serial.
-    let processed: FalconResult<Vec<Option<RecordBatch>>> = if table.batches.len() < 32 {
+    // Small tables are done serially: rayon's scheduling would cost more than it
+    // saves. The size is counted in rows, not batches, so the decision does not
+    // change meaning with the batch shape the loader happened to produce.
+    let total_rows: usize = table.batches.iter().map(|b| b.row_count()).sum();
+    let processed: FalconResult<Vec<Option<RecordBatch>>> =
+        if total_rows < crate::query::tuning::par_min_rows_per_batch_fanout() {
         table
             .batches
             .iter()

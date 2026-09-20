@@ -14,6 +14,15 @@ use crate::storage::{
 
 use super::expr::Expr;
 
+/// Total rows across a batch list.
+///
+/// Parallel decisions are made on this rather than on `batches.len()`, so they mean
+/// the same thing whatever produced the batches.
+#[inline]
+fn rows_of(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(|b| b.row_count()).sum()
+}
+
 fn is_count_star(agg: &AggExpr) -> bool {
     matches!(agg.func, AggFunc::Count) && matches!(agg.input, Expr::Literal(_))
 }
@@ -556,7 +565,7 @@ impl GroupByExec {
                     }).collect()
                 };
             }
-            let partial_states: FalconResult<Vec<Vec<BatchAggState>>> = if batches.len() < 32 {
+            let partial_states: FalconResult<Vec<Vec<BatchAggState>>> = if rows_of(batches) < crate::query::tuning::par_min_rows_per_batch_fanout() {
                 map_batches_utf8_nonnull!(batches.iter())
             } else {
                 map_batches_utf8_nonnull!(batches.par_iter())
@@ -626,7 +635,7 @@ impl GroupByExec {
                 self.accumulate_batch(&batch_gids, 0, batch, &agg_col_indices, &mut local_states)?;
                 Ok((local_keys, local_states))
         };
-        let partials: FalconResult<Vec<(Vec<String>, Vec<BatchAggState>)>> = if batches.len() < 32 {
+        let partials: FalconResult<Vec<(Vec<String>, Vec<BatchAggState>)>> = if rows_of(batches) < crate::query::tuning::par_min_rows_per_batch_fanout() {
             batches.iter().map(batch_fn_utf8_null).collect()
         } else {
             batches.par_iter().map(batch_fn_utf8_null).collect()
@@ -701,7 +710,7 @@ impl GroupByExec {
             self.accumulate_batch(&batch_gids, 0, batch, &agg_col_indices_i, &mut local_states)?;
             Ok((local_keys, local_states))
         };
-        let partials: FalconResult<Vec<(Vec<i64>, Vec<BatchAggState>)>> = if batches.len() < 32 {
+        let partials: FalconResult<Vec<(Vec<i64>, Vec<BatchAggState>)>> = if rows_of(batches) < crate::query::tuning::par_min_rows_per_batch_fanout() {
             batches.iter().map(batch_fn_i64).collect()
         } else {
             batches.par_iter().map(batch_fn_i64).collect()
@@ -1086,7 +1095,7 @@ impl GroupByExec {
             Ok(a)
         };
 
-        let (groups, key_order, group_key_values) = if batches.len() < 32 {
+        let (groups, key_order, group_key_values) = if rows_of(batches) < crate::query::tuning::par_min_rows_per_batch_fanout() {
             batches.iter().try_fold(empty(), |mut acc, batch| -> FalconResult<Partial> {
                 self.accumulate_slow(batch, &mut acc.0, &mut acc.1, &mut acc.2)?;
                 Ok(acc)

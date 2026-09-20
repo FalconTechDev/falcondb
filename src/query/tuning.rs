@@ -40,6 +40,18 @@ pub(crate) fn par_min_rows(per_thread: usize) -> usize {
     per_thread.saturating_mul(threads())
 }
 
+/// Rows below which a per-batch fan-out is not worth entering.
+///
+/// The sites this replaces compared `batches.len() < 32`, which with the 1024-row
+/// batches a Parquet load produces means 32_768 rows. That equivalence is kept, but
+/// stated in rows: a batch count means completely different amounts of work
+/// depending on where the table came from, and sixteen 65_536-row batches — a
+/// million rows — looked to those sites like a tiny table and ran serially.
+#[inline]
+pub(crate) fn par_min_rows_per_batch_fanout() -> usize {
+    par_min_rows(1_638)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
