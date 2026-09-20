@@ -24,15 +24,39 @@
 # -Baseline together with a -Filter that reaches any other group makes criterion
 # panic ("Baseline 'x' must exist"). Either keep the filter identical to the run
 # that saved it, or save a fresh baseline and compare engines within the run.
+#
+# Refuses to run on battery. This is a laptop CPU: on battery it holds its 2.4 GHz
+# base clock instead of turbo, and every engine measures about twice as slow. That
+# is invisible in the output -- the numbers look like ordinary numbers -- and it
+# cost three full runs and two wrong conclusions before anyone checked the power
+# state. Relative comparisons within one run survive it; absolute numbers, and any
+# comparison against a baseline saved on AC, do not. Override with -AllowBattery
+# if you only need engines compared against each other inside this one run.
 
 param(
     [string]$Filter   = "",
     [string]$Save     = "",
     [string]$Baseline = "",
-    [string]$Out      = "$env:TEMP\falcon_bench.txt"
+    [string]$Out      = "$env:TEMP\falcon_bench.txt",
+    [switch]$AllowBattery
 )
 
 $ErrorActionPreference = "Stop"
+
+# BatteryStatus 1 means discharging; 2 means running on AC.
+$battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($battery -and $battery.BatteryStatus -eq 1) {
+    $msg = "On battery ($($battery.EstimatedChargeRemaining)% charge). " +
+           "This CPU drops to its 2.4 GHz base clock, so every engine measures " +
+           "roughly twice as slow and nothing here is comparable with a run made " +
+           "on AC power."
+    if (-not $AllowBattery) {
+        Write-Error "$msg`nPlug in, or pass -AllowBattery to compare engines within this run only."
+        exit 1
+    }
+    Write-Warning "$msg`nContinuing because -AllowBattery was passed: compare engines against each other, not against saved numbers."
+}
 
 $env:CARGO_TARGET_DIR = "E:\rust-target"
 $repo = Split-Path -Parent $PSScriptRoot
