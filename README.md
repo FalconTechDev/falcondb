@@ -75,12 +75,18 @@ used to make — see [Methodology](#methodology).
 |---|---|---|---|---|---|
 | `INNER JOIN` | 100 k | 654 µs | **490 µs** | 1.68 ms | 4.93 ms |
 | | 1 M | 8.63 ms | **3.19 ms** | 8.20 ms | 23.2 ms |
-| `LEFT JOIN` | 100 k | **1.05 ms** | — | 2.42 ms | 5.08 ms |
-| `SEMI JOIN` (`EXISTS`) | 100 k | **1.02 ms** | — | 2.56 ms | 4.91 ms |
-| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **2.17 ms** | — | 2.60 ms | 5.05 ms |
+| `LEFT JOIN` | 100 k | **822 µs** | — | 2.45 ms | 5.09 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **662 µs** | — | 2.35 ms | 4.77 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **1.33 ms** | — | 2.31 ms | 4.89 ms |
 | `ROW_NUMBER() OVER` | 100 k | **6.32 ms** | — | 11.7 ms | 9.11 ms |
 | `UPDATE` (half the rows) | 100 k | **1.98 ms** | — | 3.74 ms | — |
 | `DELETE` (half the rows) | 100 k | **1.14 ms** | — | 2.74 ms | — |
+
+The three join-variant rows come from one isolated run of that group, all four
+engines together. They are not comparable cell-by-cell with a full-suite run:
+the same `ANTI JOIN` measured 2.17 ms alone and 3.56 ms inside a full suite,
+and `LEFT JOIN` moves the other way. Compare engines within a run, never a
+number here against a number from a run of your own.
 
 ### Where FalconDB is behind
 
