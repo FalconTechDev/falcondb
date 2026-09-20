@@ -319,33 +319,164 @@ fn probe_in_place(
         );
     }
 
-    let probe_unit = |&(bi, start, end): &(usize, usize, usize)| -> FalconResult<RecordBatch> {
-        let batch = &left_batches[bi];
-        let left_key_cols: Vec<&Column> = left_keys.iter()
-            .map(|k| batch.column_by_name(k))
-            .collect::<FalconResult<_>>()?;
-        let bloom_ok = bloom.filter(|_| filter_is_safe(&right_key_cols, &left_key_cols));
+    // Indices are row numbers inside the unit's own batch, so nothing needs a
+    // global numbering and the left side is never merged.
+    let probe_unit =
+        |&(bi, start, end): &(usize, usize, usize)| -> FalconResult<(usize, Vec<u32>, Vec<u32>)> {
+            let batch = &left_batches[bi];
+            let left_key_cols: Vec<&Column> = left_keys.iter()
+                .map(|k| batch.column_by_name(k))
+                .collect::<FalconResult<_>>()?;
+            let bloom_ok = bloom.filter(|_| filter_is_safe(&right_key_cols, &left_key_cols));
 
-        let mut li = Vec::new();
-        let mut ri = Vec::new();
-        let mut scratch = Vec::new();
-        for l_row in start..end {
-            probe_one(
-                l_row, &left_key_cols, hash_table, bloom_ok, &join_type,
-                &mut li, &mut ri, None, &mut scratch,
-            )?;
-        }
-        // Indices are row numbers inside this batch, so the output is built from
-        // the batch directly — no global numbering and no merged left side.
-        build_output(batch, right, &li, &ri, keep)
-    };
+            let mut li = Vec::new();
+            let mut ri = Vec::new();
+            let mut scratch = Vec::new();
+            for l_row in start..end {
+                probe_one(
+                    l_row, &left_key_cols, hash_table, bloom_ok, &join_type,
+                    &mut li, &mut ri, None, &mut scratch,
+                )?;
+            }
+            Ok((bi, li, ri))
+        };
 
-    let outs: FalconResult<Vec<RecordBatch>> = if units.len() > 1 {
-        units.par_iter().map(probe_unit).collect()
+    let matches: Vec<(usize, Vec<u32>, Vec<u32>)> = if units.len() > 1 {
+        units.par_iter().map(probe_unit).collect::<FalconResult<_>>()?
     } else {
-        units.iter().map(probe_unit).collect()
+        units.iter().map(probe_unit).collect::<FalconResult<_>>()?
     };
+
+    // Preferred: one allocation per output column. The per-unit builder below is
+    // correct for every case but allocates a batch per unit and then copies the
+    // whole result again to concatenate them — two passes over the output, and an
+    // allocation pattern that measurably degrades other code in the same process.
+    if join_type == JoinType::Inner {
+        if let Some(out) = build_output_dense(left_batches, right, &matches, keep)? {
+            return Ok(out);
+        }
+    }
+
+    let outs: FalconResult<Vec<RecordBatch>> = matches
+        .par_iter()
+        .map(|(bi, li, ri)| build_output(&left_batches[*bi], right, li, ri, keep))
+        .collect();
     RecordBatch::concat(&outs?)
+}
+
+/// Can this column be gathered straight into a caller-provided slice?
+fn is_dense_gatherable(c: &Column) -> bool {
+    matches!(
+        c,
+        Column::Int32(_)
+            | Column::Int64(_)
+            | Column::Float32(_)
+            | Column::Float64(_)
+            | Column::Date32(_)
+            | Column::Timestamp(_)
+    )
+}
+
+/// Build an INNER join's output with one allocation per column.
+///
+/// Each unit fills a disjoint slice of a buffer allocated once, so the output is
+/// written exactly once. The alternative — a `RecordBatch` per unit followed by a
+/// concatenation — writes it twice and, more importantly, turns one large
+/// allocation per column into one mid-sized allocation per unit, allocated on a
+/// worker thread and freed on another. That pattern cost Polars 3.61 ms -> 8.24 ms
+/// when it ran after FalconDB in the same benchmark process; see Methodology in
+/// `README.md`.
+///
+/// Returns `None` when the shape is not one this can handle — a non-primitive
+/// column, or a source with NULLs — and the caller falls back. INNER only: LEFT
+/// emits `NO_ROW` markers, which are NULLs in the output.
+fn build_output_dense(
+    left_batches: &[RecordBatch],
+    right:        &RecordBatch,
+    matches:      &[(usize, Vec<u32>, Vec<u32>)],
+    keep:         Option<&HashSet<String>>,
+) -> FalconResult<Option<RecordBatch>> {
+    let Some(first) = left_batches.first() else { return Ok(None) };
+    let plan  = output_plan(&first.schema, &right.schema, keep);
+    let total: usize = matches.iter().map(|(_, li, _)| li.len()).sum();
+
+    // Every source this will read must be a dense primitive with no NULLs, and the
+    // left batches must agree on type. Checked up front so the fallback is chosen
+    // before any column has been built.
+    let usable = plan.iter().all(|(side, ci, _, _)| match side {
+        Side::Right => {
+            let c = right.column(*ci);
+            is_dense_gatherable(c) && c.null_count() == 0
+        }
+        Side::Left => {
+            let head = first.column(*ci);
+            is_dense_gatherable(head)
+                && left_batches.iter().all(|b| {
+                    let c = b.column(*ci);
+                    std::mem::discriminant(c) == std::mem::discriminant(head)
+                        && c.null_count() == 0
+                })
+        }
+    });
+    if !usable {
+        return Ok(None);
+    }
+
+    let mut fields  = Vec::with_capacity(plan.len());
+    let mut columns = Vec::with_capacity(plan.len());
+
+    for (side, ci, name, dt) in &plan {
+        macro_rules! dense {
+            ($variant:ident, $t:ty) => {{
+                let mut values: Vec<$t> = vec![<$t>::default(); total];
+
+                // Hand each unit the slice its own rows occupy. Units appear in
+                // batch order and, within a batch, in row order, so the slices land
+                // in the same order the merged path would have produced.
+                let mut rest: &mut [$t] = values.as_mut_slice();
+                let mut slots: Vec<&mut [$t]> = Vec::with_capacity(matches.len());
+                for (_, li, _) in matches {
+                    let (head, tail) = std::mem::take(&mut rest).split_at_mut(li.len());
+                    slots.push(head);
+                    rest = tail;
+                }
+
+                slots.par_iter_mut().zip(matches.par_iter()).for_each(
+                    |(out, (bi, li, ri))| {
+                        let (src, idx) = match side {
+                            Side::Left  => (left_batches[*bi].column(*ci), li),
+                            Side::Right => (right.column(*ci), ri),
+                        };
+                        if let Column::$variant(p) = src {
+                            p.gather_u32_into(idx, out);
+                        }
+                    },
+                );
+                drop(slots);
+                Column::$variant(PrimitiveColumn::from_non_null(values))
+            }};
+        }
+
+        let probe_src = match side {
+            Side::Left  => first.column(*ci),
+            Side::Right => right.column(*ci),
+        };
+        let col = match probe_src {
+            Column::Int32(_)     => dense!(Int32, i32),
+            Column::Int64(_)     => dense!(Int64, i64),
+            Column::Float32(_)   => dense!(Float32, f32),
+            Column::Float64(_)   => dense!(Float64, f64),
+            Column::Date32(_)    => dense!(Date32, i32),
+            Column::Timestamp(_) => dense!(Timestamp, i64),
+            // `usable` already excluded these; returning None keeps the two in
+            // agreement rather than trusting them to stay in agreement.
+            _ => return Ok(None),
+        };
+        fields.push(Field::nullable(name.as_str(), dt.clone()));
+        columns.push(col);
+    }
+
+    Ok(Some(RecordBatch::new(Schema::new(fields), columns)?))
 }
 
 // ─── Sort-merge join ─────────────────────────────────────────────────────────
@@ -648,6 +779,66 @@ fn probe(
 
 // ─── Output builder ───────────────────────────────────────────────────────────
 
+/// Which side an output column comes from.
+enum Side { Left, Right }
+
+/// Decide the join's output columns: which side each comes from, its index
+/// there, its name after the join, and its type.
+///
+/// Shared by the two output builders. It used to live inside `build_output`,
+/// which was fine while there was one builder; a second one that re-derived the
+/// same list would be a second definition of what a join returns, and this
+/// engine has already paid for two implementations of one semantics.
+fn output_plan(
+    left:  &Schema,
+    right: &Schema,
+    keep:  Option<&HashSet<String>>,
+) -> Vec<(Side, usize, String, DataType)> {
+    // Right columns keep their name unless the left side already used it.
+    let left_names: FastSet<&str> = left.column_names().into_iter().collect();
+
+    let mut plan: Vec<(Side, usize, String, DataType)> = Vec::new();
+    // A column nothing downstream reads is never built. Gathering one costs a cache
+    // miss per output row against the larger input, which for `SELECT COUNT(*)` over
+    // a join was most of the query. `keep` is `None` whenever the caller could not
+    // prove which columns are read, and then everything is built as before.
+    //
+    // Both the source name and the post-join name are accepted, so a reference that
+    // survived a rename is not pruned by accident: erring toward keeping a column
+    // costs time, dropping one the query reads is a wrong answer.
+    let wanted = |src: &str, out: &str| -> bool {
+        keep.is_none_or(|k| k.contains(src) || k.contains(out))
+    };
+
+    for (i, field) in left.fields.iter().enumerate() {
+        if wanted(&field.name, &field.name) {
+            plan.push((Side::Left, i, field.name.clone(), field.data_type.clone()));
+        }
+    }
+    for (i, field) in right.fields.iter().enumerate() {
+        let name = if left_names.contains(field.name.as_str()) {
+            format!("right.{}", field.name)
+        } else {
+            field.name.clone()
+        };
+        if wanted(&field.name, &name) {
+            plan.push((Side::Right, i, name, field.data_type.clone()));
+        }
+    }
+
+    // A batch with no columns reports zero rows, which would turn COUNT(*) into 0.
+    // Keep one column from the smaller side so the row count survives; the right
+    // side is the build side and is normally the smaller of the two.
+    if plan.is_empty() {
+        if let Some(field) = right.fields.first() {
+            plan.push((Side::Right, 0, field.name.clone(), field.data_type.clone()));
+        } else if let Some(field) = left.fields.first() {
+            plan.push((Side::Left, 0, field.name.clone(), field.data_type.clone()));
+        }
+    }
+    plan
+}
+
 fn build_output(
     left:          &RecordBatch,
     right:         &RecordBatch,
@@ -672,52 +863,7 @@ fn build_output(
     let mut fields  = Vec::new();
     let mut columns = Vec::new();
 
-    // Right columns keep their name unless the left side already used it.
-    let left_names: FastSet<&str> =
-        left.schema.column_names().into_iter().collect();
-
-    // One entry per output column: which side it comes from and its index there.
-    // Building the list first lets every column be gathered independently.
-    enum Side { Left, Right }
-    let mut plan: Vec<(Side, usize, String, DataType)> = Vec::new();
-    // A column nothing downstream reads is never built. Gathering one costs a cache
-    // miss per output row against the larger input, which for `SELECT COUNT(*)` over
-    // a join was most of the query. `keep` is `None` whenever the caller could not
-    // prove which columns are read, and then everything is built as before.
-    //
-    // Both the source name and the post-join name are accepted, so a reference that
-    // survived a rename is not pruned by accident: erring toward keeping a column
-    // costs time, dropping one the query reads is a wrong answer.
-    let wanted = |src: &str, out: &str| -> bool {
-        keep.is_none_or(|k| k.contains(src) || k.contains(out))
-    };
-
-    for (i, field) in left.schema.fields.iter().enumerate() {
-        if wanted(&field.name, &field.name) {
-            plan.push((Side::Left, i, field.name.clone(), field.data_type.clone()));
-        }
-    }
-    for (i, field) in right.schema.fields.iter().enumerate() {
-        let name = if left_names.contains(field.name.as_str()) {
-            format!("right.{}", field.name)
-        } else {
-            field.name.clone()
-        };
-        if wanted(&field.name, &name) {
-            plan.push((Side::Right, i, name, field.data_type.clone()));
-        }
-    }
-
-    // A batch with no columns reports zero rows, which would turn COUNT(*) into 0.
-    // Keep one column from the smaller side so the row count survives; the right
-    // side is the build side and is normally the smaller of the two.
-    if plan.is_empty() {
-        if let Some(field) = right.schema.fields.first() {
-            plan.push((Side::Right, 0, field.name.clone(), field.data_type.clone()));
-        } else if let Some(field) = left.schema.fields.first() {
-            plan.push((Side::Left, 0, field.name.clone(), field.data_type.clone()));
-        }
-    }
+    let plan = output_plan(&left.schema, &right.schema, keep);
 
     let gather_one = |(side, i, _name, dt): &(Side, usize, String, DataType)| -> FalconResult<Column> {
         let (col, indices) = match side {
@@ -1478,6 +1624,89 @@ mod tests {
                         "{join_type:?}: column {c} row {r}",
                     );
                 }
+            }
+        }
+    }
+
+    /// The dense output builder must agree with the general one.
+    ///
+    /// The test above uses a nullable `Utf8` payload, which `build_output_dense`
+    /// declines — so it exercises the fallback, not the fast path. This one is
+    /// all-primitive and NULL-free, which is exactly the shape the fast path
+    /// claims, and compares it against the merged path that does not use it.
+    ///
+    /// Worth its own test because the two builders write the output differently:
+    /// one fills disjoint slices of a single buffer from several threads, the
+    /// other concatenates a batch per unit. An off-by-one in the slice hand-out
+    /// would silently shift rows rather than fail.
+    #[test]
+    fn dense_output_matches_the_general_builder() {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+
+        let schema = Schema::new(vec![
+            Field::required("k", DataType::Int64),
+            Field::required("v", DataType::Float64),
+        ]);
+        let rows = 5_000usize;
+        let make = |batch_rows: usize| -> Vec<RecordBatch> {
+            let mut out = Vec::new();
+            let mut start = 0;
+            while start < rows {
+                let n = batch_rows.min(rows - start);
+                out.push(
+                    RecordBatch::new(
+                        schema.clone(),
+                        vec![
+                            ColumnBuilder::int64(
+                                (0..n).map(|i| Some(((start + i) % 700) as i64)).collect(),
+                            ),
+                            ColumnBuilder::float64(
+                                (0..n).map(|i| Some((start + i) as f64 * 0.5)).collect(),
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                );
+                start += n;
+            }
+            out
+        };
+
+        // Repeated keys on both sides, so some left rows match several right rows
+        // and the output is longer than either input. Uneven batch sizes so the
+        // last unit is a different length from the rest.
+        let right = vec![RecordBatch::new(
+            Schema::new(vec![Field::required("rk", DataType::Int64)]),
+            vec![ColumnBuilder::int64(
+                (0..800).map(|i| Some((i % 400) as i64 * 3)).collect(),
+            )],
+        )
+        .unwrap()];
+
+        let many = make(137);
+        let one = make(rows);
+        assert!(many.len() > 1 && one.len() == 1);
+
+        let dense = execute_hash_join(&many, &right, &["k"], &["rk"], JoinType::Inner).unwrap();
+        let plain = execute_hash_join(&one, &right, &["k"], &["rk"], JoinType::Inner).unwrap();
+
+        // Every matching right key appears twice, so a correct result is twice the
+        // number of matching left rows -- fan-out, not a filter. Only keys that are
+        // multiples of 3 and below 700 match, so this is well under `rows`.
+        assert!(
+            dense.row_count() > 3_000,
+            "expected fan-out over ~234 shared keys, got {}",
+            dense.row_count(),
+        );
+        assert_eq!(dense.row_count(), plain.row_count());
+        assert_eq!(dense.schema.column_names(), plain.schema.column_names());
+        for c in 0..dense.column_count() {
+            for r in 0..dense.row_count() {
+                assert_eq!(
+                    dense.column(c).get(r).unwrap(),
+                    plain.column(c).get(r).unwrap(),
+                    "column {c} row {r}",
+                );
             }
         }
     }

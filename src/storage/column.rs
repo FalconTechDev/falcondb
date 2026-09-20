@@ -818,6 +818,29 @@ impl<T: Copy + Default> PrimitiveColumn<T> {
     /// join then made a second dense copy of them to reach a fast gather. At 100k
     /// matches that bookkeeping measured around 60 ns per matched row — more than
     /// building the output columns it feeds.
+    /// Gather into a slice the caller already allocated.
+    ///
+    /// Exists so a join can allocate one buffer per output column and let each
+    /// worker fill a disjoint slice of it. Building the output in per-unit pieces
+    /// instead turns one 800 KB allocation per column into twenty of 40 KB,
+    /// allocated on a worker thread and freed on another; that pattern measurably
+    /// degraded unrelated code sharing the process, which is what
+    /// `README.md` records under Methodology.
+    ///
+    /// Handles no NULLs at all. The caller must have established that the source
+    /// has none and that no index is the NULL marker — the INNER-join case. A
+    /// caller that cannot establish it has to use [`Self::gather_u32`], which
+    /// allocates but is always correct.
+    ///
+    /// # Panics
+    /// If `out.len() != idx.len()`, or if any index is out of range.
+    pub fn gather_u32_into(&self, idx: &[u32], out: &mut [T]) {
+        assert_eq!(idx.len(), out.len(), "gather_u32_into: length mismatch");
+        for (slot, &i) in out.iter_mut().zip(idx) {
+            *slot = self.values[i as usize];
+        }
+    }
+
     pub fn gather_u32(&self, idx: &[u32]) -> Self {
         const NULL_IDX: u32 = u32::MAX;
 
