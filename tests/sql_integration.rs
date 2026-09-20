@@ -680,10 +680,39 @@ fn cte_does_not_leak_into_later_queries() {
     assert!(db.sql("SELECT dept FROM tmp").is_err());
 }
 
+/// `WITH RECURSIVE` used to be rejected, and a test asserted that. It has been
+/// implemented since (see the recursive branch in `Database::execute_plan`), so
+/// the old test was asserting a limitation that no longer existed and had been
+/// failing ever since. A red test is worse than no test: every run after it
+/// landed had to be read past, and it stopped being evidence of anything.
+///
+/// These assert what the engine actually does now.
 #[test]
-fn recursive_cte_is_rejected() {
+fn recursive_cte_marked_but_not_recursive_is_accepted() {
     let (db, _) = db_from_csv("n\n1\n", "t");
-    assert!(db.sql("WITH RECURSIVE r AS (SELECT n FROM t) SELECT n FROM r").is_err());
+    let rows = db
+        .sql("WITH RECURSIVE r AS (SELECT n FROM t) SELECT n FROM r")
+        .expect("RECURSIVE with no UNION is an ordinary CTE")
+        .to_rows();
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn recursive_cte_walks_to_a_fixed_point() {
+    let (db, _) = db_from_csv("n\n1\n", "t");
+    // Anchor yields 1; each step adds one until the guard stops it at 5.
+    let rows = db
+        .sql(
+            "WITH RECURSIVE r AS ( \
+               SELECT n FROM t \
+               UNION ALL \
+               SELECT n + 1 AS n FROM r WHERE n < 5 \
+             ) SELECT n FROM r ORDER BY n",
+        )
+        .expect("recursive CTE should evaluate")
+        .to_rows();
+    let got: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(got, vec!["1", "2", "3", "4", "5"], "expected the fixed point 1..5");
 }
 
 // ─── Scalar subqueries ────────────────────────────────────────────────────────
