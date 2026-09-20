@@ -1,4 +1,4 @@
-﻿use std::collections::HashSet;
+use std::collections::HashSet;
 
 use rayon::prelude::*;
 
@@ -1709,6 +1709,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Which output builder is faster, measured without leaving the process.
+    ///
+    /// Ignored by default: it is a measurement, not an assertion, and it takes a
+    /// second. Run it with
+    /// `cargo test --release --lib dense_vs_general -- --ignored --nocapture`.
+    ///
+    /// It exists because this machine drifts. Two criterion runs taken twenty
+    /// minutes apart disagreed by 50-90% on benchmarks the change cannot touch --
+    /// SEMI and ANTI do not go through this code at all, and they moved as much as
+    /// the ones that do. Comparing a run against another run was measuring the
+    /// laptop. Both builders are called here from one process, alternately, on
+    /// identical input, so whatever the clock is doing it is doing to both.
+    #[test]
+    #[ignore]
+    fn dense_vs_general_output_builder() {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+        use std::time::Instant;
+
+        const BATCHES:    usize = 16;
+        const BATCH_ROWS: usize = 65_536;
+        const RIGHT_ROWS: usize = 100_000;
+        const PER_UNIT:   usize = 6_250; // ~100k output rows, the benchmark's shape
+
+        let left_schema = Schema::new(vec![
+            Field::required("k", DataType::Int64),
+            Field::required("v", DataType::Int64),
+        ]);
+        let left: Vec<RecordBatch> = (0..BATCHES)
+            .map(|b| {
+                RecordBatch::new(
+                    left_schema.clone(),
+                    vec![
+                        ColumnBuilder::int64(
+                            (0..BATCH_ROWS).map(|i| Some((b * BATCH_ROWS + i) as i64)).collect(),
+                        ),
+                        ColumnBuilder::int64((0..BATCH_ROWS).map(|i| Some(i as i64)).collect()),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let right = RecordBatch::new(
+            Schema::new(vec![Field::required("rk", DataType::Int64)]),
+            vec![ColumnBuilder::int64((0..RIGHT_ROWS).map(|i| Some(i as i64)).collect())],
+        )
+        .unwrap();
+
+        // One unit per batch, indices scattered so the gather pays realistic cache
+        // misses rather than walking memory in order.
+        let matches: Vec<(usize, Vec<u32>, Vec<u32>)> = (0..BATCHES)
+            .map(|b| {
+                let li: Vec<u32> = (0..PER_UNIT)
+                    .map(|i| ((i * 7919) % BATCH_ROWS) as u32)
+                    .collect();
+                let ri: Vec<u32> = (0..PER_UNIT)
+                    .map(|i| ((i * 104_729) % RIGHT_ROWS) as u32)
+                    .collect();
+                (b, li, ri)
+            })
+            .collect();
+
+        let dense = || {
+            let t = Instant::now();
+            let out = build_output_dense(&left, &right, &matches, None).unwrap();
+            let e = t.elapsed();
+            assert!(out.is_some(), "dense builder declined the shape it is meant for");
+            assert_eq!(out.unwrap().row_count(), BATCHES * PER_UNIT);
+            e
+        };
+        let general = || {
+            let t = Instant::now();
+            let parts: FalconResult<Vec<RecordBatch>> = matches
+                .par_iter()
+                .map(|(bi, li, ri)| build_output(&left[*bi], &right, li, ri, None))
+                .collect();
+            let out = RecordBatch::concat(&parts.unwrap()).unwrap();
+            let e = t.elapsed();
+            assert_eq!(out.row_count(), BATCHES * PER_UNIT);
+            e
+        };
+
+        for _ in 0..3 {
+            dense();
+            general();
+        }
+        // Alternate, then take each side's minimum: the fastest observation is the
+        // one least polluted by whatever else the machine did during it.
+        let mut d = Vec::new();
+        let mut g = Vec::new();
+        for _ in 0..15 {
+            d.push(dense());
+            g.push(general());
+        }
+        let dmin = d.iter().min().unwrap();
+        let gmin = g.iter().min().unwrap();
+
+        println!("output build, {} rows over {BATCHES} units:", BATCHES * PER_UNIT);
+        println!("  one allocation per column = {dmin:?}");
+        println!("  batch per unit + concat   = {gmin:?}");
+        println!(
+            "  dense is {:.2}x the general builder",
+            dmin.as_secs_f64() / gmin.as_secs_f64(),
+        );
     }
 
     fn orders() -> RecordBatch {
