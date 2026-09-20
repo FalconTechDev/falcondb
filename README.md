@@ -40,29 +40,29 @@ reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `SUM(score)` | 10 k | **2.28 µs** | 12.0 µs | 221 µs | 1.71 ms |
-| | 100 k | **12.7 µs** | 21.8 µs | 343 µs | 2.25 ms |
-| | 1 M | **109 µs** | 165 µs | 512 µs | 3.15 ms |
-| `SUM(id)` (integer) | 10 k | **3.66 µs** | 10.3 µs | 232 µs | 1.85 ms |
-| | 100 k | 26.6 µs | **22.2 µs** | 332 µs | 3.02 ms |
-| | 1 M | **118 µs** | 176 µs | 498 µs | 15.3 ms |
-| `WHERE score > 50` | 10 k | **25.3 µs** | 67.3 µs | 642 µs | 1.55 ms |
-| | 100 k | **199 µs** | 206 µs | 3.94 ms | 3.30 ms |
-| | 1 M | **1.57 ms** | 4.43 ms | 24.8 ms | 21.2 ms |
+| `SUM(score)` | 10 k | **2.4 µs** | 10.4 µs | 339 µs | 1.59 ms |
+| | 100 k | **11.0 µs** | 22.7 µs | 567 µs | 1.91 ms |
+| | 1 M | **78.3 µs** | 186 µs | 781 µs | 4.13 ms |
+| `SUM(id)` (integer) | 10 k | **3.6 µs** | 9.0 µs | 367 µs | 1.81 ms |
+| | 100 k | 28.0 µs | **18.0 µs** | 532 µs | 3.67 ms |
+| | 1 M | **100 µs** | 202 µs | 606 µs | 15.0 ms |
+| `WHERE score > 50` | 10 k | **19.8 µs** | 67.0 µs | 802 µs | 2.23 ms |
+| | 100 k | **191 µs** | 207 µs | 5.00 ms | 4.94 ms |
+| | 1 M | **697 µs** | 3.48 ms | 38.6 ms | 26.2 ms |
 
 ### Grouping, sorting, pipelines
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `GROUP BY` + 3 aggregates | 10 k | **37.3 µs** | 311 µs | 1.73 ms | 2.30 ms |
-| | 100 k | **155 µs** | 1.50 ms | 3.82 ms | 2.88 ms |
-| | 1 M | **1.19 ms** | 12.6 ms | 7.44 ms | 9.60 ms |
-| `ORDER BY score DESC` | 10 k | **190 µs** | 381 µs | 1.90 ms | 1.20 ms |
-| | 100 k | 2.79 ms | **2.58 ms** | 16.0 ms | 7.07 ms |
-| `DISTINCT` | 100 k | **518 µs** | 743 µs | 2.37 ms | 1.75 ms |
-| | 1 M | **2.97 ms** | 6.43 ms | 3.89 ms | 3.91 ms |
-| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **31.9 µs** | 343 µs | 1.72 ms | 2.14 ms |
-| | 100 k | **255 µs** | 1.55 ms | 3.92 ms | 3.01 ms |
+| `GROUP BY` + 3 aggregates | 10 k | **53.0 µs** | 322 µs | 2.37 ms | 2.17 ms |
+| | 100 k | **124 µs** | 1.24 ms | 6.25 ms | 3.74 ms |
+| | 1 M | **712 µs** | 9.79 ms | 7.13 ms | 8.54 ms |
+| `ORDER BY score DESC` | 10 k | **186 µs** | 349 µs | 2.59 ms | 1.34 ms |
+| | 100 k | 2.29 ms | **1.62 ms** | 20.2 ms | 8.73 ms |
+| `DISTINCT` | 100 k | **642 µs** | 768 µs | 3.26 ms | 1.65 ms |
+| | 1 M | **2.93 ms** | 6.21 ms | 4.73 ms | 4.22 ms |
+| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **32.0 µs** | 359 µs | 2.86 ms | 2.41 ms |
+| | 100 k | **121 µs** | 1.28 ms | 6.93 ms | 2.88 ms |
 
 ### Joins, window functions, DML
 
@@ -73,32 +73,38 @@ used to make — see [Methodology](#methodology).
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `INNER JOIN` | 100 k | 654 µs | **490 µs** | 1.68 ms | 4.93 ms |
-| | 1 M | 8.63 ms | **3.19 ms** | 8.20 ms | 23.2 ms |
-| `LEFT JOIN` | 100 k | **822 µs** | — | 2.45 ms | 5.09 ms |
-| `SEMI JOIN` (`EXISTS`) | 100 k | **662 µs** | — | 2.35 ms | 4.77 ms |
-| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **1.33 ms** | — | 2.31 ms | 4.89 ms |
-| `ROW_NUMBER() OVER` | 100 k | **6.32 ms** | — | 11.7 ms | 9.11 ms |
-| `UPDATE` (half the rows) | 100 k | **1.98 ms** | — | 3.74 ms | — |
-| `DELETE` (half the rows) | 100 k | **1.14 ms** | — | 2.74 ms | — |
+| `INNER JOIN` | 100 k | 545 µs | **527 µs** | 2.16 ms | 8.46 ms |
+| | 1 M | 5.44 ms | **2.92 ms** | 15.2 ms | 31.6 ms |
+| `LEFT JOIN` | 100 k | **737 µs** | — | 3.47 ms | 7.00 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **802 µs** | — | 3.76 ms | 8.80 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **1.30 ms** | — | 3.75 ms | 9.17 ms |
+| `ROW_NUMBER() OVER` | 100 k | **4.70 ms** | — | 23.6 ms | 8.05 ms |
+| `UPDATE` (half the rows) | 100 k | **2.25 ms** | — | 5.07 ms | — |
+| `DELETE` (half the rows) | 100 k | **1.11 ms** | — | 3.52 ms | — |
 
-The three join-variant rows come from one isolated run of that group, all four
-engines together. They are not comparable cell-by-cell with a full-suite run:
-the same `ANTI JOIN` measured 2.17 ms alone and 3.56 ms inside a full suite,
-and `LEFT JOIN` moves the other way. Compare engines within a run, never a
-number here against a number from a run of your own.
 
 ### Where FalconDB is behind
 
-Ahead of every engine in 23 of 26 measured points, and ahead of DuckDB and
+Ahead of every engine in 22 of 26 measured points, and ahead of DuckDB and
 DataFusion in all of them. The exceptions are all against Polars:
 
 | | FalconDB | Polars | |
 |---|---|---|---|
-| `INNER JOIN` 1 M | 8.63 ms | 3.19 ms | 2.7× |
-| `INNER JOIN` 100 k | 654 µs | 490 µs | 1.3× |
-| `SUM(id)` 100 k | 26.6 µs | 22.2 µs | 1.2× |
-| `ORDER BY` 100 k | 2.79 ms | 2.58 ms | 1.08× — parity |
+| `INNER JOIN` 1 M | 5.44 ms | 2.92 ms | 1.9× |
+| `SUM(id)` 100 k | 28.0 µs | 18.0 µs | 1.6× |
+| `ORDER BY` 100 k | 2.29 ms | 1.62 ms | 1.4× |
+| `INNER JOIN` 100 k | 545 µs | 527 µs | 1.03× — parity |
+
+`INNER JOIN` at 1 M was 2.4× behind until the probe stopped concatenating the
+left side. What remains of that gap is the probe itself, not the plumbing
+around it.
+
+`SUM(id)` and `ORDER BY` at 100 k both *lost* ground here, and not because the
+code changed — neither was touched. Polars gained more than FalconDB did from
+the allocator change described under [Methodology](#methodology). At these sizes
+the work is tens of microseconds and allocator behaviour is a real share of it.
+Cross-check them against the 10 k and 1 M rows of the same query before reading
+much into either: at 1 M, `SUM(id)` is 2.0× ahead.
 
 ### How much room is actually left
 
@@ -137,6 +143,23 @@ closure a lazy `scan_parquet`, so every Polars iteration re-read and re-decoded
 the file while the others queried memory. Every "N× faster than Polars" figure
 published before that fix was measuring an in-memory query against a file read.
 All four engines now load once, outside the timed region.
+
+**One allocator, chosen explicitly.** All four engines run in one process, so
+they share an allocator and its state carries from one group to the next. On the
+Windows system heap that was load-bearing rather than incidental: FalconDB's join
+probe builds its output in per-unit slices, allocated on a worker thread and
+freed on another, and Polars — measured *after* FalconDB in the same process —
+went from 3.61 ms to 8.24 ms because of it. Reverting the probe brought Polars
+back, which is how the mechanism was established instead of assumed. The bench
+now sets mimalloc. Polars returns to 2.89 ms, better than it ever measured on the
+system heap; DataFusion gained 29%, DuckDB nothing.
+
+This is not a FalconDB optimisation and no figure above should be read as one.
+It does not fix the allocation pattern that exposed it either — building a join's
+output in twenty 40 KB pieces instead of one 800 KB piece is a real cost imposed
+on whatever else shares the process, and a library does not get to choose the
+application's allocator. Every number in this file was re-measured after the
+change; figures published before it are not comparable.
 
 **Results are asserted, not assumed.** For a long time this suite reported the
 same ~4 µs filter at 10 k, 100 k and 1 M rows. The times were real; the data was
