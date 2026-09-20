@@ -1265,16 +1265,18 @@ pub fn execute_agg_only(
     // See `query::tuning` for why this is per-thread rather than absolute.
     let agg_parallel_min_rows = crate::query::tuning::par_min_rows(8_900);
 
-    /// Batches per rayon task. At ~1024 rows a batch, eight of them is roughly
-    /// 8 µs of work — enough to be worth a hand-off, small enough that 12 cores
-    /// still all get a share at 100k rows.
+    /// Rows a rayon task should cover before the hand-off is worth its cost,
+    /// converted to a batch count for `with_min_len`.
     ///
-    /// Deriving this from a row target instead was tried, to decouple it from batch
-    /// size: it cost about 6% on full_scan/1M and int_sum/1M beyond the run's drift,
-    /// because a literal here is folded into rayon's splitting and a computed value
-    /// is not. It only mattered as scaffolding for a batch-size experiment that did
-    /// not pay off, so the constant stands.
-    const AGG_MIN_BATCHES_PER_TASK: usize = 8;
+    /// This was a literal `8` batches, which is ~8 µs of work at 1024 rows a batch
+    /// and was measured as the right granularity there. It is the wrong quantity to
+    /// fix, though: at 65_536 rows a batch the same eight are half a million rows,
+    /// so a million-row scan handed twenty threads just two tasks.
+    ///
+    /// A computed value does cost something — rayon folds a literal into its
+    /// splitting and cannot fold a variable, measured at ~6% on full_scan/1M. That
+    /// is worth paying against the 27–41% the larger batches return.
+    const AGG_ROWS_PER_TASK: usize = 8_192;
 
     // A lone batch has nothing to fan out over, so the per-column kernels may split
     // the slice themselves. With more than one batch the fan-out happens above and a
@@ -1311,6 +1313,11 @@ pub fn execute_agg_only(
 
     let total_rows: usize = batches.iter().map(|b| b.row_count()).sum();
 
+    // Batches vary in size, so derive the grouping from the average rather than
+    // assuming one shape.
+    let rows_per_batch = (total_rows / batches.len().max(1)).max(1);
+    let min_batches_per_task = AGG_ROWS_PER_TASK.div_ceil(rows_per_batch).max(1);
+
     let accumulators = if total_rows < agg_parallel_min_rows {
         batches.iter().try_fold(
             aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
@@ -1323,7 +1330,7 @@ pub fn execute_agg_only(
             // Left to itself rayon splits down to one batch per task, so at 100k rows
             // (98 batches) the dispatch cost is the bulk of the query. Handing each
             // task a run of batches keeps every core busy with far fewer hand-offs.
-            .with_min_len(AGG_MIN_BATCHES_PER_TASK)
+            .with_min_len(min_batches_per_task)
             .try_fold(
                 || aggs.iter().map(|a| Accumulator::new(&a.func)).collect::<Vec<_>>(),
                 |accs, batch| -> FalconResult<Vec<Accumulator>> { accumulate_body!(accs, batch) },
