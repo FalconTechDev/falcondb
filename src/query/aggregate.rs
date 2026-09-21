@@ -1450,6 +1450,139 @@ mod sum_perf {
     use super::*;
     use std::time::Instant;
 
+    /// Why does the sum kernel run at one element per cycle?
+    ///
+    /// Summing data that sits in L1 still only reaches 33.7 GB/s -- 0.237 ns a row,
+    /// about one element per cycle. Out of L1 that can only be a compute limit,
+    /// and with `target-cpu=native` an AVX2 machine should be adding four `f64` per
+    /// instruction. Eight independent accumulators is already the right shape for
+    /// that: `acc[i] += c[i]` for eight separate `i` needs no reassociation, so the
+    /// compiler is free to fuse them into two `vaddpd` without changing a single
+    /// rounding decision.
+    ///
+    /// Something stops it. The likeliest candidate is that `acc` lives on the stack
+    /// and is reloaded and stored every element instead of staying in two registers.
+    /// These variants say the same thing in different ways; whichever is fastest
+    /// tells us what the compiler needed to hear.
+    ///
+    /// Run with
+    /// `cargo test --release --lib sum_kernel_shapes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sum_kernel_shapes() {
+        use std::time::Instant;
+
+        /// Indexed rather than zipped, in case the iterator pair obscures the
+        /// fixed length.
+        fn indexed(dense: &[f64]) -> f64 {
+            let mut acc = [0.0f64; 8];
+            let mut chunks = dense.chunks_exact(8);
+            for c in &mut chunks {
+                for i in 0..8 {
+                    acc[i] += c[i];
+                }
+            }
+            let mut total: f64 = acc.iter().sum();
+            for &v in chunks.remainder() {
+                total += v;
+            }
+            total
+        }
+
+        /// Eight named accumulators, which cannot be spilled to an array.
+        fn named(dense: &[f64]) -> f64 {
+            let (mut a, mut b, mut c, mut d) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut e, mut f, mut g, mut h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let mut chunks = dense.chunks_exact(8);
+            for k in &mut chunks {
+                a += k[0];
+                b += k[1];
+                c += k[2];
+                d += k[3];
+                e += k[4];
+                f += k[5];
+                g += k[6];
+                h += k[7];
+            }
+            let mut total = ((a + b) + (c + d)) + ((e + f) + (g + h));
+            for &v in chunks.remainder() {
+                total += v;
+            }
+            total
+        }
+
+        /// Four accumulators of four lanes each: sixteen elements a step, shaped so
+        /// each accumulator is exactly one AVX2 register.
+        fn wide(dense: &[f64]) -> f64 {
+            let mut acc = [[0.0f64; 4]; 4];
+            let mut chunks = dense.chunks_exact(16);
+            for k in &mut chunks {
+                for (j, a) in acc.iter_mut().enumerate() {
+                    for i in 0..4 {
+                        a[i] += k[j * 4 + i];
+                    }
+                }
+            }
+            let mut total = 0.0;
+            for a in &acc {
+                total += a[0] + a[1] + a[2] + a[3];
+            }
+            for &v in chunks.remainder() {
+                total += v;
+            }
+            total
+        }
+
+        let n = 65_536; // 512 KB: in L2, so the memory system is not the limit
+        let data: Vec<f64> = (0..n).map(|i| (i % 1000) as f64).collect();
+
+        // Every shape must produce the same number. These differ only in how the
+        // additions are grouped, and f64 addition is not associative, so "the same"
+        // here means bit-identical -- if a variant disagrees it has reassociated
+        // and is not a drop-in replacement.
+        let base = sum_lanes(&data);
+        for (label, got) in [
+            ("indexed", indexed(&data)),
+            ("named", named(&data)),
+            ("wide", wide(&data)),
+        ] {
+            assert_eq!(base.to_bits(), got.to_bits(), "{label} changed the result");
+        }
+
+        let bench = |label: &str, f: &dyn Fn(&[f64]) -> f64| {
+            for _ in 0..5 {
+                std::hint::black_box(f(&data));
+            }
+            let reps = 600u32;
+            let t = Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(f(&data));
+            }
+            let per = t.elapsed() / reps;
+            println!(
+                "  {label:>8}: {per:>9.2?} = {:.3} ns/row, {:.1} GB/s",
+                per.as_secs_f64() * 1e9 / n as f64,
+                (n * 8) as f64 / per.as_secs_f64() / 1e9,
+            );
+            per
+        };
+
+        println!("sum kernel shapes, {n} f64 in L2:");
+        let cur = bench("current", &|d| sum_lanes(d));
+        let idx = bench("indexed", &indexed);
+        let nam = bench("named", &named);
+        let wid = bench("wide", &wide);
+        let best = [("indexed", idx), ("named", nam), ("wide", wid)]
+            .into_iter()
+            .min_by_key(|(_, d)| *d)
+            .unwrap();
+        println!(
+            "  best is {} at {:.2}x the current kernel",
+            best.0,
+            best.1.as_secs_f64() / cur.as_secs_f64(),
+        );
+    }
+
     /// Where does a parallel SUM start paying, and is the serial kernel already
     /// at its limit?
     ///
