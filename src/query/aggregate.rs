@@ -1450,6 +1450,88 @@ mod sum_perf {
     use super::*;
     use std::time::Instant;
 
+    /// Where does a parallel SUM start paying, and is the serial kernel already
+    /// at its limit?
+    ///
+    /// The aggregate threshold is 178k rows, derived from a model of
+    /// "serial 0.224 ns/row against parallel 27.4 us + 0.070 ns/row". At 100k that
+    /// says serial wins, so `SUM(id)/100k` runs on one core and takes 23.3 us,
+    /// against Polars' 14.9 us. 800 KB in 14.9 us is 54 GB/s, which is more than
+    /// one core gets from L2 on this machine -- so Polars is using several, and
+    /// the question is whether the 27.4 us hand-off cost in that model is real.
+    ///
+    /// Also checks the serial kernel against a single core's memory bandwidth
+    /// rather than against the aggregate figure. An earlier note in this repo
+    /// compared its 30 GB/s to L3's 145 GB/s and concluded the kernel was
+    /// dependency-bound. That comparison was wrong: 145 GB/s is what every core
+    /// together pulls from L3, and one core gets a fraction of it. Summing a slice
+    /// small enough to sit in L1 gives the kernel's compute ceiling honestly.
+    ///
+    /// Run with
+    /// `cargo test --release --lib sum_parallel_crossover -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sum_parallel_crossover() {
+        use std::time::Instant;
+
+        // Per-element rate at sizes that sit in L1, L2 and past both, timed in
+        // blocks rather than per call so the timer is not measuring itself.
+        println!("kernel rate by working set:");
+        for &(n, where_) in &[
+            (4_096usize, "32 KB, L1"),
+            (65_536, "512 KB, L2"),
+            (1_000_000, "8 MB, L3"),
+            (8_000_000, "64 MB, DRAM"),
+        ] {
+            let data: Vec<f64> = (0..n).map(|i| (i % 1000) as f64).collect();
+            let reps = (40_000_000 / n).max(3);
+            for _ in 0..3 { std::hint::black_box(sum_lanes(&data)); }
+            let t = Instant::now();
+            for _ in 0..reps { std::hint::black_box(sum_lanes(&data)); }
+            let per = t.elapsed() / reps as u32;
+            println!(
+                "  {n:>9} ({where_:>12}): {per:>10.2?} = {:.3} ns/row, {:.1} GB/s",
+                per.as_secs_f64() * 1e9 / n as f64,
+                (n * 8) as f64 / per.as_secs_f64() / 1e9,
+            );
+        }
+
+        // Serial and parallel in separate blocks. Interleaving them made the
+        // serial numbers non-monotonic -- rayon's workers are still spinning down
+        // when the next serial call starts, so alternating penalised one side.
+        println!("
+serial vs parallel (blocked, min of 15):");
+        for &n in &[50_000usize, 100_000, 150_000, 178_000, 300_000, 600_000, 1_000_000] {
+            let data: Vec<f64> = (0..n).map(|i| (i % 1000) as f64).collect();
+            assert!(
+                (sum_lanes(&data) - par_sum_lanes(&data)).abs() < 1.0,
+                "serial and parallel sums disagree at {n}",
+            );
+
+            for _ in 0..5 { std::hint::black_box(sum_lanes(&data)); }
+            let mut sv = Vec::new();
+            for _ in 0..15 {
+                let t = Instant::now();
+                std::hint::black_box(sum_lanes(&data));
+                sv.push(t.elapsed());
+            }
+            for _ in 0..5 { std::hint::black_box(par_sum_lanes(&data)); }
+            let mut pv = Vec::new();
+            for _ in 0..15 {
+                let t = Instant::now();
+                std::hint::black_box(par_sum_lanes(&data));
+                pv.push(t.elapsed());
+            }
+            let sm = *sv.iter().min().unwrap();
+            let pm = *pv.iter().min().unwrap();
+            let gb = |d: std::time::Duration| (n * 8) as f64 / d.as_secs_f64() / 1e9;
+            println!(
+                "  {n:>9} rows: serial {sm:>9.2?} ({:>5.1} GB/s)  parallel {pm:>9.2?} ({:>5.1} GB/s)  {:.2}x",
+                gb(sm), gb(pm), pm.as_secs_f64() / sm.as_secs_f64(),
+            );
+        }
+    }
+
     /// What does widening every integer to `f64` cost a `SUM`?
     ///
     /// `SUM(id)` at 100k rows is the one benchmark point never investigated:
@@ -1478,9 +1560,12 @@ mod sum_perf {
     /// 2^53 comes out 12 short -- and that is a correctness argument to be made on
     /// its own.
     ///
-    /// It also relocates the real headroom. 30 GB/s against an L3 that measures
-    /// 145 GB/s means this kernel is not memory-bound at all; it is limited by its
-    /// own dependency chains, and that is where a faster SUM would come from.
+    /// A claim made here earlier was wrong and is corrected in
+    /// `sum_parallel_crossover`: this note read 30 GB/s against L3's 145 GB/s and
+    /// concluded the kernel was limited by its own dependency chains. But 145 GB/s
+    /// is what every core together pulls from L3; one core gets a fraction of that,
+    /// and comparing a single-threaded kernel against an aggregate figure says
+    /// nothing. The serial kernel may well be at its own memory limit already.
     ///
     /// Run with
     /// `cargo test --release --lib integer_sum_accumulator -- --ignored --nocapture`.
