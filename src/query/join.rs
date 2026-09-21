@@ -960,7 +960,25 @@ impl IntHashTable {
     }
 
     /// Build the table in parallel, producing byte-for-byte what the serial
-    /// insert loop produces.
+    /// insert loop produces -- and measurably slower than it.
+    ///
+    /// Kept, behind `cfg(test)`, because the idea is an obvious one to have and
+    /// the measurement says not to: 0.93x serial at two partitions, 0.97x at
+    /// four, and worse above that, against a serial build of 767us. A 7% best
+    /// case on a build that is a quarter of the join is about 1.5% of a join,
+    /// for atomics and a second code path. `parallel_build_speed` prints the
+    /// table.
+    ///
+    /// Why it loses is the shape, not the tuning. Partitioning by bucket makes
+    /// every thread examine every row to find the ones it owns, so total work is
+    /// O(partitions x rows) where the serial loop is O(rows). Per-row work here
+    /// is a multiply and a compare, far too little to pay for being looked at
+    /// twelve times. Something that wins has to keep total work at O(rows) -- a
+    /// radix partition of the rows in one pass, then chains built per partition
+    /// -- which is a real piece of engineering rather than a tweak.
+    ///
+    /// What the exercise did establish is that identity is achievable: see
+    /// below.
     ///
     /// The build runs on one thread while the probe runs on all of them, so it
     /// weighs on a join more than its cost suggests: 1.03 ms of a 4.43 ms 1M-row
@@ -982,7 +1000,13 @@ impl IntHashTable {
     /// The price is that every thread computes `bucket` for every row and keeps
     /// only the rows it owns: arithmetic on a value already in a register, traded
     /// against a scattered write it would otherwise have to synchronise on.
+    #[cfg(test)]
     fn build_parallel(col: &Column, n: usize) -> Self {
+        Self::build_parallel_with(col, n, rayon::current_num_threads().max(1))
+    }
+
+    #[cfg(test)]
+    fn build_parallel_with(col: &Column, n: usize, parts: usize) -> Self {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
         let buckets = (n.max(1) * 2).next_power_of_two();
@@ -993,8 +1017,7 @@ impl IntHashTable {
         let heads: Vec<AtomicU32> = (0..buckets).map(|_| AtomicU32::new(NO_ROW)).collect();
         let next:  Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NO_ROW)).collect();
 
-        let parts = rayon::current_num_threads().max(1);
-        let span  = buckets.div_ceil(parts);
+        let span = buckets.div_ceil(parts);
         (0..parts).into_par_iter().for_each(|p| {
             let lo = p * span;
             let hi = ((p + 1) * span).min(buckets);
@@ -2242,13 +2265,16 @@ mod tests {
             std::hint::black_box(&table);
             e
         };
-        let parallel = || {
-            let t = Instant::now();
-            let table = IntHashTable::build_parallel(col, ROWS);
-            let e = t.elapsed();
-            std::hint::black_box(&table);
-            e
+        let parallel_with = |parts: usize| {
+            move || {
+                let t = Instant::now();
+                let table = IntHashTable::build_parallel_with(col, ROWS, parts);
+                let e = t.elapsed();
+                std::hint::black_box(&table);
+                e
+            }
         };
+        let parallel = parallel_with(rayon::current_num_threads().max(1));
 
         for _ in 0..3 {
             serial();
@@ -2267,6 +2293,16 @@ mod tests {
         println!("  serial   = {sm:?}");
         println!("  parallel = {pm:?}");
         println!("  parallel is {:.2}x serial", pm.as_secs_f64() / sm.as_secs_f64());
+
+        // Is the loss the partition count or the approach? Fewer partitions means
+        // less rescanning but less parallelism.
+        for parts in [2usize, 4, 6, 8, 12] {
+            let f = parallel_with(parts);
+            for _ in 0..3 { f(); }
+            let best = (0..9).map(|_| f()).min().unwrap();
+            println!("  {parts:>2} partitions = {best:?}  ({:.2}x serial)",
+                     best.as_secs_f64() / sm.as_secs_f64());
+        }
     }
 
     fn orders() -> RecordBatch {
