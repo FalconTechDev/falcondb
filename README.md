@@ -40,29 +40,29 @@ reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `SUM(score)` | 10 k | **2.4 µs** | 10.4 µs | 339 µs | 1.59 ms |
-| | 100 k | **11.0 µs** | 22.7 µs | 567 µs | 1.91 ms |
-| | 1 M | **78.3 µs** | 186 µs | 781 µs | 4.13 ms |
-| `SUM(id)` (integer) | 10 k | **3.6 µs** | 9.0 µs | 367 µs | 1.81 ms |
-| | 100 k | 28.0 µs | **18.0 µs** | 532 µs | 3.67 ms |
-| | 1 M | **100 µs** | 202 µs | 606 µs | 15.0 ms |
-| `WHERE score > 50` | 10 k | **19.8 µs** | 67.0 µs | 802 µs | 2.23 ms |
-| | 100 k | **191 µs** | 207 µs | 5.00 ms | 4.94 ms |
-| | 1 M | **697 µs** | 3.48 ms | 38.6 ms | 26.2 ms |
+| `SUM(score)` | 10 k | **1.4 µs** | 8.3 µs | 212 µs | 1.54 ms |
+| | 100 k | **8.6 µs** | 18.4 µs | 338 µs | 1.48 ms |
+| | 1 M | **63.4 µs** | 156 µs | 486 µs | 2.58 ms |
+| `SUM(id)` (integer) | 10 k | **2.9 µs** | 7.4 µs | 212 µs | 1.44 ms |
+| | 100 k | 23.3 µs | **14.9 µs** | 363 µs | 2.39 ms |
+| | 1 M | **82.4 µs** | 165 µs | 480 µs | 11.6 ms |
+| `WHERE score > 50` | 10 k | **16.2 µs** | 54.1 µs | 567 µs | 1.15 ms |
+| | 100 k | **123 µs** | 170 µs | 3.92 ms | 2.92 ms |
+| | 1 M | **656 µs** | 2.18 ms | 24.2 ms | 17.0 ms |
 
 ### Grouping, sorting, pipelines
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `GROUP BY` + 3 aggregates | 10 k | **53.0 µs** | 322 µs | 2.37 ms | 2.17 ms |
-| | 100 k | **124 µs** | 1.24 ms | 6.25 ms | 3.74 ms |
-| | 1 M | **712 µs** | 9.79 ms | 7.13 ms | 8.54 ms |
-| `ORDER BY score DESC` | 10 k | **186 µs** | 349 µs | 2.59 ms | 1.34 ms |
-| | 100 k | 2.29 ms | **1.62 ms** | 20.2 ms | 8.73 ms |
-| `DISTINCT` | 100 k | **642 µs** | 768 µs | 3.26 ms | 1.65 ms |
-| | 1 M | **2.93 ms** | 6.21 ms | 4.73 ms | 4.22 ms |
-| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **32.0 µs** | 359 µs | 2.86 ms | 2.41 ms |
-| | 100 k | **121 µs** | 1.28 ms | 6.93 ms | 2.88 ms |
+| `GROUP BY` + 3 aggregates | 10 k | **42.8 µs** | 265 µs | 1.42 ms | 1.59 ms |
+| | 100 k | **103 µs** | 1.14 ms | 3.84 ms | 2.16 ms |
+| | 1 M | **650 µs** | 9.67 ms | 6.93 ms | 7.30 ms |
+| `ORDER BY score DESC` | 10 k | **245 µs** | 288 µs | 1.87 ms | 892 µs |
+| | 100 k | 1.76 ms | **1.32 ms** | 15.4 ms | 6.39 ms |
+| `DISTINCT` | 100 k | **507 µs** | 633 µs | 1.81 ms | 1.29 ms |
+| | 1 M | **2.31 ms** | 5.66 ms | 3.91 ms | 3.11 ms |
+| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **22.6 µs** | 292 µs | 1.92 ms | 1.53 ms |
+| | 100 k | **99.1 µs** | 1.19 ms | 3.65 ms | 2.02 ms |
 
 ### Joins, window functions, DML
 
@@ -73,15 +73,14 @@ used to make — see [Methodology](#methodology).
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `INNER JOIN` | 100 k | **340 µs** | 429 µs | 1.73 ms | 3.91 ms |
-| | 1 M | 3.51 ms | **2.62 ms** | 7.81 ms | 16.9 ms |
-| `LEFT JOIN` | 100 k | **778 µs** | — | 2.44 ms | 3.99 ms |
-| `SEMI JOIN` (`EXISTS`) | 100 k | **752 µs** | — | 2.52 ms | 4.34 ms |
-| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **1.14 ms** | — | 2.37 ms | 4.31 ms |
-| `ROW_NUMBER() OVER` | 100 k | **4.70 ms** | — | 23.6 ms | 8.05 ms |
-| `UPDATE` (half the rows) | 100 k | **2.25 ms** | — | 5.07 ms | — |
-| `DELETE` (half the rows) | 100 k | **1.11 ms** | — | 3.52 ms | — |
-
+| `INNER JOIN` | 100 k | **332 µs** | 435 µs | 1.66 ms | 3.66 ms |
+| | 1 M | 3.54 ms | **2.58 ms** | 8.21 ms | 16.4 ms |
+| `LEFT JOIN` | 100 k | **680 µs** | — | 2.33 ms | 4.15 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **645 µs** | — | 2.29 ms | 3.88 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **926 µs** | — | 2.27 ms | 4.02 ms |
+| `ROW_NUMBER() OVER` | 100 k | **3.58 ms** | — | 11.8 ms | 5.70 ms |
+| `UPDATE` (half the rows) | 100 k | **1.86 ms** | — | 3.57 ms | — |
+| `DELETE` (half the rows) | 100 k | **884 µs** | — | 2.54 ms | — |
 
 ### Where FalconDB is behind
 
@@ -90,28 +89,25 @@ DataFusion in all of them. The exceptions are all against Polars:
 
 | | FalconDB | Polars | |
 |---|---|---|---|
-| `INNER JOIN` 1 M | 3.51 ms | 2.62 ms | 1.3× |
-| `SUM(id)` 100 k | 28.0 µs | 18.0 µs | 1.6× |
-| `ORDER BY` 100 k | 2.29 ms | 1.62 ms | 1.4× |
+| `SUM(id)` 100 k | 23.3 µs | 14.9 µs | 1.6× |
+| `INNER JOIN` 1 M | 3.54 ms | 2.58 ms | 1.4× |
+| `ORDER BY` 100 k | 1.76 ms | 1.32 ms | 1.3× |
 
-`INNER JOIN` at 1 M was 2.4× behind before the join work: the probe stopped
-concatenating the left side, and the output is now built in one allocation per
-column instead of one batch per work unit. At 100 k the same changes turned a
-1.03× loss into a 1.26× win.
+All three were worse before. `INNER JOIN` at 1 M was 2.4× behind until the probe
+stopped concatenating the left side and the output moved to one allocation per
+column; at 100 k the same work turned a loss into a 1.3× win. `ORDER BY` was
+1.4× behind before the sort changed — see below.
 
-What is left of the 1 M gap is the probe and the build, not the plumbing.
-Of a 4.43 ms join, building the hash table is about 1.0 ms and runs on one
-thread while the probe runs on all of them. Parallelising it by bucket was
-tried and measured slower — see `IntHashTable::build_parallel`, kept behind
-`cfg(test)` with the numbers. A version that wins needs a single-pass radix
-partition, so that total work stays O(rows).
+What is left of the join gap is the build and the probe, not the plumbing. Of a
+4.4 ms 1 M-row join, building the hash table is about 1.0 ms and runs on one
+thread while the probe uses every core. Two ways of parallelising it were tried
+and both measured slower, the second after removing the first one's algorithmic
+flaw; the conclusion was that the build is not compute-bound at all but spends
+its time allocating and filling ~2.2 MB per join. See
+`IntHashTable::build_parallel` and `build_radix`, kept behind `cfg(test)` with
+the numbers.
 
-`SUM(id)` and `ORDER BY` at 100 k both *lost* ground here, and not because the
-code changed — neither was touched. Polars gained more than FalconDB did from
-the allocator change described under [Methodology](#methodology). At these sizes
-the work is tens of microseconds and allocator behaviour is a real share of it.
-Cross-check them against the 10 k and 1 M rows of the same query before reading
-much into either: at 1 M, `SUM(id)` is 2.0× ahead.
+`SUM(id)` is the one point never yet investigated.
 
 ### How much room is actually left
 
@@ -168,17 +164,15 @@ on whatever else shares the process, and a library does not get to choose the
 application's allocator. Every number in this file was re-measured after the
 change; figures published before it are not comparable.
 
-**The join rows were measured later than the rest.** Every table above is taken
-within a single run, so the engines in any one row are comparable with each
-other — that is the comparison this file makes. The join rows come from a later
-run than the scan and aggregate rows, because the join code changed after the
-suite baseline was taken and the rest did not. Numbers are not comparable
-*across* the two: this laptop drifted up to 1.6× between runs minutes apart on
-identical code, which is larger than most of the effects being chased here. Two
-consequences worth stating plainly. Benchmarks in different rows should not be
-divided by each other. And any optimisation small enough to be interesting has
-to be measured by calling both versions inside one process, alternately — which
-is what the `#[ignore]`d measurement tests in `src/query/join.rs` do.
+**Every number above comes from one run.** Engines in a row are therefore
+comparable with each other, which is the comparison this file makes. Numbers
+are not comparable *across* runs: this laptop drifted up to 1.6× between runs
+minutes apart on identical code, which is larger than most of the effects worth
+chasing here. Two consequences worth stating plainly. Benchmarks in different
+rows should not be divided by one another. And any optimisation small enough to
+be interesting has to be measured by calling both versions inside one process,
+alternately — which is what the `#[ignore]`d measurement tests in
+`src/query/join.rs` and `src/query/sort.rs` do.
 
 **Results are asserted, not assumed.** For a long time this suite reported the
 same ~4 µs filter at 10 k, 100 k and 1 M rows. The times were real; the data was
@@ -422,8 +416,8 @@ open items are structural rather than a slow loop somewhere:
 
 | Limit | Why it matters | Next step |
 |---|---|---|
-| Scans run above the measured floor | 1 M-row `SUM` takes 78 µs against a 55 µs L3 bandwidth floor | Per-batch overhead. Closer than it was, and the remaining gap is small enough that it is now hard to measure on this machine |
-| A join's hash table is built on one thread | ~1.0 ms of a 4.43 ms 1 M-row join, while the probe uses every core | Needs a single-pass radix partition. Partitioning by bucket was tried and is slower — it makes total work O(partitions × rows); see `IntHashTable::build_parallel` |
+| Scans run above the measured floor | 1 M-row `SUM` takes 63 µs against a 55 µs L3 bandwidth floor | Per-batch overhead. Within 15% of the floor, and the remainder is now smaller than this machine's run-to-run drift |
+| A join's hash table is built on one thread | ~1.0 ms of a 4.4 ms 1 M-row join, while the probe uses every core | Not a parallelism problem. Partitioning by bucket and a single-pass radix partition were both tried and both measured slower; the build spends its time allocating and filling ~2.2 MB per join. The next thing to try is allocating less — one bucket per row instead of two, and dropping the `keys` array, which duplicates the key column |
 | Thresholds are calibrated, not derived | Parallel cut-offs come from measurements on *this* laptop | The coarse ones now scale with `rayon::current_num_threads()`; the model is untested on a many-core machine |
 | Batch-count thresholds remain | `PAR_SUM_THRESHOLD` and the group-by still reason in batches, so 65 536-row batches break them | Convert every threshold to rows, then raise the Parquet batch size |
 | No NUMA awareness | A thread may work on memory owned by another socket | Nothing measured yet; needs a server to measure on |
