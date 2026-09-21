@@ -592,8 +592,7 @@ fn build_hash_table(
         .collect::<FalconResult<_>>()?;
 
     let n = batch.row_count();
-    // EXPERIMENT: typed path skips the filter.
-    let mut bloom = (!typed && n >= BLOOM_MIN_ROWS).then(|| BuildFilter::with_capacity(n));
+    let mut bloom = (n >= BLOOM_MIN_ROWS).then(|| BuildFilter::with_capacity(n));
 
     if typed {
         let col = key_cols[0];
@@ -1814,6 +1813,291 @@ mod tests {
         println!(
             "  dense is {:.2}x the general builder",
             dmin.as_secs_f64() / gmin.as_secs_f64(),
+        );
+    }
+
+    /// Does the Bloom filter earn its place on the typed (integer) path?
+    ///
+    /// Its documented purpose is the *string* path, where every probe row builds
+    /// a `String` key before the table is consulted and a rejection skips that
+    /// allocation. The typed path has no such allocation: a miss there is one
+    /// read of `heads`. The filter adds two reads, so on paper it could be pure
+    /// overhead -- plus roughly 200 KB allocated and 100k insertions on the build
+    /// side of every join.
+    ///
+    /// `probe_one` already takes `bloom: Option<&BuildFilter>`, so both answers
+    /// can be measured from one process by passing `Some` or `None`. That matters
+    /// more than usual here: this machine drifted 1.6x between two runs of the
+    /// same diagnostic minutes apart, which is larger than the effect being
+    /// looked for. Anything compared across process runs on it is noise.
+    ///
+    /// Run with
+    /// `cargo test --release --lib bloom_filter_on_the_typed_path -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bloom_filter_on_the_typed_path() {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+        use std::time::Instant;
+
+        const RIGHT_ROWS: usize = 100_000;
+        const LEFT_ROWS:  usize = 1_000_000;
+
+        let key = |name: &str, vals: Vec<i64>| {
+            RecordBatch::new(
+                Schema::new(vec![Field::required(name, DataType::Int64)]),
+                vec![ColumnBuilder::int64(vals.into_iter().map(Some).collect())],
+            )
+            .unwrap()
+        };
+
+        // Build side keys 0,10,20,... so a tenth of the probe side matches: the
+        // benchmark's selectivity. A run where nothing matches flatters the filter,
+        // because then it answers every row without the table being touched.
+        let right = key("rk", (0..RIGHT_ROWS as i64).map(|i| i * 10).collect());
+        let left  = key("k", (0..LEFT_ROWS as i64).collect());
+
+        let right_key_cols: Vec<&Column> = vec![right.column(0)];
+        let left_key_cols:  Vec<&Column> = vec![left.column(0)];
+
+        let (table, filter) = build_hash_table(&right, &["rk"], true).unwrap();
+        let filter = filter.expect("100k rows should be over BLOOM_MIN_ROWS");
+
+        let probe_all = |bloom: Option<&BuildFilter>| -> (std::time::Duration, usize) {
+            let mut li = Vec::new();
+            let mut ri = Vec::new();
+            let mut scratch = Vec::new();
+            let t = Instant::now();
+            for row in 0..LEFT_ROWS {
+                probe_one(
+                    row, &left_key_cols, &table, bloom, &JoinType::Inner,
+                    &mut li, &mut ri, None, &mut scratch,
+                )
+                .unwrap();
+            }
+            (t.elapsed(), li.len())
+        };
+
+        // Both answers must be identical -- the filter is an accelerator, and one
+        // that changed the result would be a correctness bug, not a slow path.
+        let (_, with_n)    = probe_all(Some(&filter));
+        let (_, without_n) = probe_all(None);
+        assert_eq!(with_n, without_n, "the filter changed the join result");
+        assert_eq!(with_n, RIGHT_ROWS, "expected one match per build row");
+
+        let mut on  = Vec::new();
+        let mut off = Vec::new();
+        for _ in 0..5 {
+            on.push(probe_all(Some(&filter)).0);
+            off.push(probe_all(None).0);
+        }
+        let on_min  = on.iter().min().unwrap();
+        let off_min = off.iter().min().unwrap();
+
+        // Build cost of the filter itself, measured the same alternating way.
+        let mut b_on  = Vec::new();
+        let mut b_off = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let f = BuildFilter::with_capacity(RIGHT_ROWS);
+            std::hint::black_box(&f);
+            b_on.push(t.elapsed());
+
+            let t = Instant::now();
+            let (tb, _) = build_hash_table(&right, &["rk"], true).unwrap();
+            std::hint::black_box(&tb);
+            b_off.push(t.elapsed());
+        }
+
+        println!("probe of {LEFT_ROWS} rows, 1 in 10 matching:");
+        println!("  filter on  = {on_min:?}");
+        println!("  filter off = {off_min:?}");
+        println!(
+            "  filter makes the probe {:.2}x",
+            on_min.as_secs_f64() / off_min.as_secs_f64(),
+        );
+        println!("  allocating the filter alone = {:?}", b_on.iter().min().unwrap());
+        println!("  whole build incl. filter    = {:?}", b_off.iter().min().unwrap());
+    }
+
+    /// What does building the hash table actually spend its time on?
+    ///
+    /// The build runs on one thread while the probe runs on all of them, so it is
+    /// a larger share of a join than its cost suggests: about 1.2 ms of a 4.4 ms
+    /// 1M-row join, none of it parallel. Before parallelising it, find out how
+    /// much of it is even the insert loop -- `IntHashTable::with_rows` allocates
+    /// the bucket heads and fills them with a sentinel, and allocation on this
+    /// machine was measured at roughly 0.27 ms per fresh megabyte.
+    ///
+    /// Measured in one process, alternating, for the reason given on
+    /// `bloom_filter_on_the_typed_path`.
+    ///
+    /// Run with
+    /// `cargo test --release --lib hash_table_build_breakdown -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn hash_table_build_breakdown() {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+
+        let right = RecordBatch::new(
+            Schema::new(vec![Field::required("rk", DataType::Int64)]),
+            vec![ColumnBuilder::int64((0..ROWS as i64).map(|i| Some(i * 10)).collect())],
+        )
+        .unwrap();
+        let col = right.column(0);
+
+        let alloc_only = || {
+            let t = Instant::now();
+            let table = IntHashTable::with_rows(ROWS);
+            let e = t.elapsed();
+            std::hint::black_box(&table);
+            e
+        };
+        let alloc_and_insert = || {
+            let t = Instant::now();
+            let mut table = IntHashTable::with_rows(ROWS);
+            for row in 0..ROWS {
+                table.insert(int_key(col, row), row);
+            }
+            let e = t.elapsed();
+            std::hint::black_box(&table);
+            e
+        };
+        let whole_build = || {
+            let t = Instant::now();
+            let built = build_hash_table(&right, &["rk"], true).unwrap();
+            let e = t.elapsed();
+            std::hint::black_box(&built);
+            e
+        };
+
+        for _ in 0..3 {
+            alloc_only();
+            alloc_and_insert();
+            whole_build();
+        }
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut c = Vec::new();
+        for _ in 0..9 {
+            a.push(alloc_only());
+            b.push(alloc_and_insert());
+            c.push(whole_build());
+        }
+        let (a, b, c) = (
+            *a.iter().min().unwrap(),
+            *b.iter().min().unwrap(),
+            *c.iter().min().unwrap(),
+        );
+
+        println!("build side, {ROWS} rows:");
+        println!("  allocate the table       = {a:?}");
+        println!("  allocate + insert        = {b:?}   (insert alone {:?})", b.saturating_sub(a));
+        println!("  whole build incl. filter = {c:?}   (filter adds {:?})", c.saturating_sub(b));
+        println!(
+            "  allocation is {:.0}% of the build",
+            a.as_secs_f64() / c.as_secs_f64() * 100.0,
+        );
+    }
+
+    /// Is 16 bits per key the right size for the filter?
+    ///
+    /// It is the hottest randomly-addressed structure in a join: touched twice per
+    /// build row and twice per probe row. At 16 bits per key, 100k keys make a
+    /// 256 KB filter; at 8 they make 128 KB, which halves the footprint on both
+    /// sides at the cost of a higher false-positive rate. A false positive costs
+    /// one hash-table lookup -- exactly what the filter was avoiding -- so the
+    /// trade is only worth taking if the cache win is bigger than the extra
+    /// lookups, which is a question for a measurement rather than for arithmetic.
+    ///
+    /// `with_capacity` derives the size from a key count, so halving the count
+    /// passed to it is how 8-bits-per-key is obtained without touching the
+    /// production constant.
+    ///
+    /// Run with
+    /// `cargo test --release --lib bloom_filter_sizing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bloom_filter_sizing() {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+        use std::time::Instant;
+
+        const RIGHT_ROWS: usize = 100_000;
+        const LEFT_ROWS:  usize = 1_000_000;
+
+        let right = RecordBatch::new(
+            Schema::new(vec![Field::required("rk", DataType::Int64)]),
+            vec![ColumnBuilder::int64((0..RIGHT_ROWS as i64).map(|i| Some(i * 10)).collect())],
+        )
+        .unwrap();
+        let left = RecordBatch::new(
+            Schema::new(vec![Field::required("k", DataType::Int64)]),
+            vec![ColumnBuilder::int64((0..LEFT_ROWS as i64).map(Some).collect())],
+        )
+        .unwrap();
+        let left_key_cols: Vec<&Column> = vec![left.column(0)];
+        let col = right.column(0);
+
+        let (table, _) = build_hash_table(&right, &["rk"], true).unwrap();
+
+        let make_filter = |bits_per_key: usize| {
+            let mut f = BuildFilter::with_capacity(RIGHT_ROWS * bits_per_key / 16);
+            let t = Instant::now();
+            for row in 0..RIGHT_ROWS {
+                f.insert(int_key_hash(int_key(col, row)));
+            }
+            (f, t.elapsed())
+        };
+
+        let probe_all = |bloom: &BuildFilter| -> (std::time::Duration, usize) {
+            let mut li = Vec::new();
+            let mut ri = Vec::new();
+            let mut scratch = Vec::new();
+            let t = Instant::now();
+            for row in 0..LEFT_ROWS {
+                probe_one(
+                    row, &left_key_cols, &table, Some(bloom), &JoinType::Inner,
+                    &mut li, &mut ri, None, &mut scratch,
+                )
+                .unwrap();
+            }
+            (t.elapsed(), li.len())
+        };
+
+        let (wide, _)   = make_filter(16);
+        let (narrow, _) = make_filter(8);
+
+        // A smaller filter may say "maybe" more often, but it must never say "no"
+        // to a key that is present -- the result has to be identical either way.
+        let (_, n_wide)   = probe_all(&wide);
+        let (_, n_narrow) = probe_all(&narrow);
+        assert_eq!(n_wide, RIGHT_ROWS);
+        assert_eq!(n_narrow, RIGHT_ROWS, "narrower filter dropped matches");
+
+        let mut pw = Vec::new();
+        let mut pn = Vec::new();
+        let mut bw = Vec::new();
+        let mut bn = Vec::new();
+        for _ in 0..5 {
+            pw.push(probe_all(&wide).0);
+            pn.push(probe_all(&narrow).0);
+            bw.push(make_filter(16).1);
+            bn.push(make_filter(8).1);
+        }
+        let pw = *pw.iter().min().unwrap();
+        let pn = *pn.iter().min().unwrap();
+        let bw = *bw.iter().min().unwrap();
+        let bn = *bn.iter().min().unwrap();
+
+        println!("filter sizing, {RIGHT_ROWS} keys / {LEFT_ROWS} probes:");
+        println!("  16 bits/key (256 KB): build {bw:?}, probe {pw:?}");
+        println!("   8 bits/key (128 KB): build {bn:?}, probe {pn:?}");
+        println!(
+            "  narrow is {:.2}x on build, {:.2}x on probe",
+            bn.as_secs_f64() / bw.as_secs_f64(),
+            pn.as_secs_f64() / pw.as_secs_f64(),
         );
     }
 
