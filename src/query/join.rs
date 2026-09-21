@@ -1012,6 +1012,119 @@ impl IntHashTable {
     /// The price is that every thread computes `bucket` for every row and keeps
     /// only the rows it owns: arithmetic on a value already in a register, traded
     /// against a scattered write it would otherwise have to synchronise on.
+    /// Build the table in parallel with a radix partition, keeping total work at
+    /// O(rows) and reproducing the serial chains byte for byte.
+    ///
+    /// `build_parallel` below partitions by bucket, which makes every thread look
+    /// at every row to find the ones it owns -- O(partitions x rows), and measured
+    /// slower than the serial loop. This instead makes one pass over the rows to
+    /// decide where each belongs, then gives each thread a contiguous run of rows
+    /// that are already its own.
+    ///
+    /// Five phases, none of them O(partitions x rows):
+    ///   1. keys, and from them each row's bucket partition (parallel over rows)
+    ///   2. count rows per (row chunk, bucket partition) -- a P x P matrix, not
+    ///      one counter per bucket, so it stays in cache
+    ///   3. prefix-sum those counts, partition-major and chunk-minor
+    ///   4. scatter row ids into one scratch array at those offsets
+    ///   5. each thread walks its partition's slice of scratch and links the
+    ///      chains for its own buckets
+    ///
+    /// Order survives all of it. Phase 3 lays chunks out in ascending order within
+    /// a partition, and phase 4 preserves row order within a chunk, so phase 5
+    /// sees rows in ascending order exactly as the serial loop did. That is what
+    /// `parallel_build_is_identical_to_serial` checks -- not that the matches
+    /// agree, but that `heads` and `next` are the same arrays, because chain order
+    /// decides the order of a join's output rows.
+    ///
+    /// The atomics carry no contention: a row belongs to one bucket, a bucket to
+    /// one partition, and a partition to one thread, so no two threads ever touch
+    /// the same slot. They are here only because the compiler cannot see that.
+    #[cfg(test)]
+    fn build_radix(col: &Column, n: usize) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+        let buckets = (n.max(1) * 2).next_power_of_two();
+        let mask = buckets - 1;
+
+        let keys: Vec<i64> = (0..n).into_par_iter().map(|r| int_key(col, r)).collect();
+        if n == 0 {
+            return Self {
+                mask,
+                heads: vec![NO_ROW; buckets],
+                next:  Vec::new(),
+                keys,
+            };
+        }
+
+        let parts  = rayon::current_num_threads().max(1);
+        let span   = buckets.div_ceil(parts);
+        let chunk  = n.div_ceil(parts);
+        let chunks = n.div_ceil(chunk);
+
+        // Phase 2: how many rows each chunk sends to each partition.
+        let counts: Vec<Vec<u32>> = (0..chunks)
+            .into_par_iter()
+            .map(|c| {
+                let lo = c * chunk;
+                let hi = ((c + 1) * chunk).min(n);
+                let mut local = vec![0u32; parts];
+                for &k in &keys[lo..hi] {
+                    local[bucket_with(mask, k) / span] += 1;
+                }
+                local
+            })
+            .collect();
+
+        // Phase 3: partition-major, chunk-minor. A partition's rows end up
+        // contiguous, and within it the chunks stay in ascending order.
+        let mut offsets    = vec![vec![0u32; parts]; chunks];
+        let mut part_start = vec![0u32; parts + 1];
+        let mut running    = 0u32;
+        for p in 0..parts {
+            part_start[p] = running;
+            for (c, off) in offsets.iter_mut().enumerate() {
+                off[p] = running;
+                running += counts[c][p];
+            }
+        }
+        part_start[parts] = running;
+        debug_assert_eq!(running as usize, n, "radix partition lost rows");
+
+        // Phase 4: scatter.
+        let scratch: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NO_ROW)).collect();
+        (0..chunks).into_par_iter().for_each(|c| {
+            let lo = c * chunk;
+            let hi = ((c + 1) * chunk).min(n);
+            let mut cur = offsets[c].clone();
+            for (r, &k) in (lo..hi).zip(&keys[lo..hi]) {
+                let p = bucket_with(mask, k) / span;
+                scratch[cur[p] as usize].store(r as u32, Relaxed);
+                cur[p] += 1;
+            }
+        });
+
+        // Phase 5: link the chains, one partition per thread.
+        let heads: Vec<AtomicU32> = (0..buckets).map(|_| AtomicU32::new(NO_ROW)).collect();
+        let next:  Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NO_ROW)).collect();
+        (0..parts).into_par_iter().for_each(|p| {
+            let (lo, hi) = (part_start[p] as usize, part_start[p + 1] as usize);
+            for slot in &scratch[lo..hi] {
+                let row = slot.load(Relaxed) as usize;
+                let b = bucket_with(mask, keys[row]);
+                next[row].store(heads[b].load(Relaxed), Relaxed);
+                heads[b].store(row as u32, Relaxed);
+            }
+        });
+
+        Self {
+            mask,
+            heads: heads.into_iter().map(|a| a.into_inner()).collect(),
+            next:  next.into_iter().map(|a| a.into_inner()).collect(),
+            keys,
+        }
+    }
+
     #[cfg(test)]
     fn build_parallel(col: &Column, n: usize) -> Self {
         Self::build_parallel_with(col, n, rayon::current_num_threads().max(1))
@@ -2231,12 +2344,16 @@ mod tests {
             for row in 0..n {
                 serial.insert(int_key(col, row), row);
             }
-            let parallel = IntHashTable::build_parallel(col, n);
+            for (label, built) in [
+                ("bucket-partitioned", IntHashTable::build_parallel(col, n)),
+                ("radix", IntHashTable::build_radix(col, n)),
+            ] {
+                let parallel = built;
 
-            assert_eq!(serial.mask, parallel.mask, "n={n}: mask");
-            assert_eq!(serial.keys, parallel.keys, "n={n}: keys");
-            assert_eq!(serial.heads, parallel.heads, "n={n}: bucket heads");
-            assert_eq!(serial.next, parallel.next, "n={n}: chains");
+            assert_eq!(serial.mask, parallel.mask, "n={n} {label}: mask");
+            assert_eq!(serial.keys, parallel.keys, "n={n} {label}: keys");
+            assert_eq!(serial.heads, parallel.heads, "n={n} {label}: bucket heads");
+            assert_eq!(serial.next, parallel.next, "n={n} {label}: chains");
 
             // And the thing those arrays exist for.
             for key in [0i64, 10, 30, 12_345, -1] {
@@ -2244,8 +2361,13 @@ mod tests {
                 let mut b = Vec::new();
                 serial.collect_matches(key, &mut a);
                 parallel.collect_matches(key, &mut b);
-                assert_eq!(a, b, "n={n}: matches for {key}");
-                assert_eq!(serial.contains(key), parallel.contains(key), "n={n}: contains {key}");
+                assert_eq!(a, b, "n={n} {label}: matches for {key}");
+                assert_eq!(
+                    serial.contains(key),
+                    parallel.contains(key),
+                    "n={n} {label}: contains {key}",
+                );
+            }
             }
         }
     }
@@ -2305,6 +2427,24 @@ mod tests {
         println!("  serial   = {sm:?}");
         println!("  parallel = {pm:?}");
         println!("  parallel is {:.2}x serial", pm.as_secs_f64() / sm.as_secs_f64());
+
+        let radix = || {
+            let t = Instant::now();
+            let table = IntHashTable::build_radix(col, ROWS);
+            let e = t.elapsed();
+            std::hint::black_box(&table);
+            e
+        };
+        for _ in 0..3 {
+            radix();
+            serial();
+        }
+        let mut rv = Vec::new();
+        for _ in 0..9 {
+            rv.push(radix());
+        }
+        let rm = *rv.iter().min().unwrap();
+        println!("  radix    = {rm:?}  ({:.2}x serial)", rm.as_secs_f64() / sm.as_secs_f64());
 
         // Is the loss the partition count or the approach? Fewer partitions means
         // less rescanning but less parallelism.
