@@ -250,17 +250,20 @@ pub(crate) fn f64_sort_key(v: f64) -> u64 {
 }
 
 /// Unsigned key that an LSD radix sort can decompose into 8-bit digits.
+#[cfg(test)]
 trait RadixKey: Ord + Copy + Send + Default {
     const PASSES: usize;
     fn digit(self, pass: usize) -> usize;
 }
 
+#[cfg(test)]
 impl RadixKey for u64 {
     const PASSES: usize = 8;
     #[inline(always)]
     fn digit(self, pass: usize) -> usize { ((self >> (pass * 8)) & 0xFF) as usize }
 }
 
+#[cfg(test)]
 impl RadixKey for u32 {
     const PASSES: usize = 4;
     #[inline(always)]
@@ -268,12 +271,43 @@ impl RadixKey for u32 {
 }
 
 /// Below this, the radix scratch allocation costs more than pdqsort's comparisons.
+#[cfg(test)]
 const RADIX_MIN_ROWS: usize = 8_192;
 
 /// Sort (Ord-key, row) pairs ascending — branchless, no closure, no NaN special case.
-fn sort_pairs_ord<T: RadixKey>(pairs: &mut Vec<(T, u32)>) {
-    if pairs.len() >= RADIX_MIN_ROWS {
-        radix_sort_pairs(pairs);
+/// Minimum pairs before the sort is worth handing to rayon.
+///
+/// Measured on scattered `f64` keys: parallel is 1.34x serial at 8k rows, 0.80x
+/// at 16k, 0.34x at 100k. The crossover sits between 8k and 16k, so 12k, divided
+/// by the thread count so the constant travels to a machine with a different one.
+fn par_sort_min_rows() -> usize {
+    crate::query::tuning::par_min_rows(600)
+}
+
+/// Sort (key, row) pairs.
+///
+/// Sorts the whole tuple, so equal keys fall back to the row index and the result
+/// is the same order a stable sort would give. That is why an unstable sort is
+/// safe here, and why the radix sort it replaced could be dropped without
+/// changing any query's output -- `radix_against_pdqsort` asserts the two agree.
+///
+/// This used to be an LSD radix sort above 8192 rows. Measured against the
+/// standard library's sort on 100k pairs, across three distributions:
+///
+/// | keys                        | radix  | sort_unstable | par_sort_unstable |
+/// |-----------------------------|--------|---------------|-------------------|
+/// | 100 distinct (the benchmark)| 1.58ms | 2.31ms        | **1.14ms**        |
+/// | all distinct, ordered       | 2.47ms | **133us**     | 153us             |
+/// | all distinct, scattered     | 3.26ms | 2.35ms        | **864us**         |
+///
+/// The radix sort lost on every one of them. It looked defensible only on the
+/// benchmark's column, which holds a hundred distinct values -- and even there it
+/// was beaten. On already-ordered input it is 18x slower, because pdqsort detects
+/// sortedness and a radix sort makes all eight passes regardless; ordered and
+/// nearly-ordered columns are ordinary in analytical data, not a corner case.
+fn sort_pairs_ord<T: Ord + Copy + Send>(pairs: &mut [(T, u32)]) {
+    if pairs.len() >= par_sort_min_rows() {
+        pairs.par_sort_unstable();
     } else {
         pairs.sort_unstable();
     }
@@ -284,6 +318,7 @@ fn sort_pairs_ord<T: RadixKey>(pairs: &mut Vec<(T, u32)>) {
 /// All pass histograms are built in a single scan so that passes whose digit is
 /// constant across every key can be skipped — for real float columns the high
 /// exponent bytes rarely vary, which typically removes half the passes.
+#[cfg(test)]
 fn radix_sort_pairs<T: RadixKey>(pairs: &mut Vec<(T, u32)>) {
     let n = pairs.len();
     let mut counts = vec![[0usize; 256]; T::PASSES];
@@ -332,7 +367,7 @@ fn sort_pairs<T: PartialOrd + Copy + Send>(pairs: &mut Vec<(T, u32)>, desc: bool
         let ord = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
         if desc { ord.reverse() } else { ord }
     };
-    if pairs.len() >= 65_536 {
+    if pairs.len() >= par_sort_min_rows() {
         pairs.par_sort_unstable_by(cmp);
     } else {
         pairs.sort_unstable_by(cmp);
@@ -556,6 +591,30 @@ mod perf {
         let pr = (0..9).map(|_| time_par()).min().unwrap();
         println!("  par_sort_unstable = {pr:?}  ({:.2}x the serial radix)",
                  pr.as_secs_f64() / r.as_secs_f64());
+        }
+
+        // Where does handing the sort to rayon start paying? A threshold guessed
+        // rather than measured is how this file ended up with several that
+        // described how the code used to work.
+        println!("
+--- serial vs parallel crossover (scattered keys) ---");
+        for n in [1_000usize, 4_000, 8_000, 16_000, 32_000, 64_000, 100_000] {
+            let ks: Vec<u64> = (0..n)
+                .map(|i| {
+                    let h = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    !f64_sort_key((h >> 11) as f64 * 1.0e-6)
+                })
+                .collect();
+            let mk = || -> Vec<(u64, u32)> {
+                ks.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect()
+            };
+            let ser = || { let mut v = mk(); let t = Instant::now(); v.sort_unstable(); let e = t.elapsed(); std::hint::black_box(&v); e };
+            let par = || { let mut v = mk(); let t = Instant::now(); v.par_sort_unstable(); let e = t.elapsed(); std::hint::black_box(&v); e };
+            for _ in 0..3 { ser(); par(); }
+            let sm = (0..9).map(|_| ser()).min().unwrap();
+            let pm = (0..9).map(|_| par()).min().unwrap();
+            println!("  {n:>7} rows: serial {sm:>10.2?}  parallel {pm:>10.2?}  ({:.2}x)",
+                     pm.as_secs_f64() / sm.as_secs_f64());
         }
     }
 
