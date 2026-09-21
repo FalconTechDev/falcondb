@@ -423,6 +423,197 @@ fn compare_scalar(a: &ScalarValue, b: &ScalarValue, nulls_last: bool) -> std::cm
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod perf {
+    use super::*;
+    use crate::storage::{
+        column::ColumnBuilder,
+        schema::{Field, Schema},
+        types::DataType,
+    };
+    use std::time::Instant;
+
+    /// Radix against pdqsort, and both against building the pairs.
+    ///
+    /// Producing the sorted indices is 75% of a 100k `ORDER BY`. This splits that
+    /// into the scan that builds the (key, row) pairs and the sort itself, and
+    /// compares the two sorts on identical input. `RADIX_MIN_ROWS` sends anything
+    /// over 8192 rows to the radix sort; whether that is the right call at 100k is
+    /// a measurement, and it has not been made at this size with this key.
+    ///
+    /// An LSD radix over a `u64` key is up to eight passes, each reading and
+    /// scattering 1.6 MB of pairs. `sort_unstable` is one pass of comparisons over
+    /// data that stays in cache. Which wins depends on how many passes the keys
+    /// actually need, which is why the skip-constant-digits optimisation exists
+    /// and why it has to be measured rather than assumed.
+    ///
+    /// Run with
+    /// `cargo test --release --lib radix_against_pdqsort -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn radix_against_pdqsort() {
+        const ROWS: usize = 100_000;
+
+        // The benchmark's key: `score` is (i % 100) + 0.5 as f64, sorted
+        // descending, so the keys are bit-flipped before sorting.
+        let keys: Vec<u64> = (0..ROWS)
+            .map(|i| !f64_sort_key((i % 100) as f64 + 0.5))
+            .collect();
+        let fresh = || -> Vec<(u64, u32)> {
+            keys.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect()
+        };
+
+        // Both sorts must agree, or the faster one is irrelevant.
+        let mut a = fresh();
+        let mut b = fresh();
+        radix_sort_pairs(&mut a);
+        b.sort_unstable();
+        assert_eq!(a, b, "radix and pdqsort disagree on the sorted order");
+
+        let time_radix = || {
+            let mut v = fresh();
+            let t = Instant::now();
+            radix_sort_pairs(&mut v);
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        };
+        let time_pdq = || {
+            let mut v = fresh();
+            let t = Instant::now();
+            v.sort_unstable();
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        };
+        let time_build = || {
+            let t = Instant::now();
+            let v = fresh();
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        };
+
+        for _ in 0..3 {
+            time_radix();
+            time_pdq();
+            time_build();
+        }
+        let mut r = Vec::new();
+        let mut q = Vec::new();
+        let mut bl = Vec::new();
+        for _ in 0..9 {
+            r.push(time_radix());
+            q.push(time_pdq());
+            bl.push(time_build());
+        }
+        let (r, q, bl) = (
+            *r.iter().min().unwrap(),
+            *q.iter().min().unwrap(),
+            *bl.iter().min().unwrap(),
+        );
+
+        println!("{ROWS} (u64, u32) pairs, 100 distinct keys:");
+        println!("  build the pairs = {bl:?}");
+        println!("  radix sort      = {r:?}");
+        println!("  sort_unstable   = {q:?}");
+        println!("  radix is {:.2}x pdqsort", r.as_secs_f64() / q.as_secs_f64());
+    }
+
+    /// Where does `ORDER BY` spend its time at the size we lose on?
+    ///
+    /// `order_by/100k` is 2.29 ms against Polars' 1.62 ms -- a 0.67 ms gap, larger
+    /// in absolute terms than anything the join build work was chasing. The
+    /// existing `tests/diag_sort_breakdown.rs` splits merge from sort, but it
+    /// builds 1024-row batches while the Parquet reader produces 65 536-row ones,
+    /// so at 100k rows the benchmark has two batches and the merge it measures is
+    /// not the merge the benchmark pays. This splits the part that remains.
+    ///
+    /// Measured in one process, alternating: this machine drifts further between
+    /// runs than the effect being looked for.
+    ///
+    /// Run with
+    /// `cargo test --release --lib sort_phase_breakdown -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sort_phase_breakdown() {
+        const ROWS: usize = 100_000;
+
+        // The benchmark's shape: three columns, sorted on one Float64 descending,
+        // and the whole row gathered afterwards.
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("id", DataType::Int64),
+                Field::required("dept", DataType::Utf8),
+                Field::required("score", DataType::Float64),
+            ]),
+            vec![
+                ColumnBuilder::int64((0..ROWS as i64).map(Some).collect()),
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS).map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5])).collect(),
+                ),
+                ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 100) as f64 + 0.5)).collect()),
+            ],
+        )
+        .unwrap();
+        let exprs = vec![SortExpr::desc(Expr::Column("score".into()))];
+
+        let indices_only = || {
+            let t = Instant::now();
+            let idx = try_typed_sort(&batch, &exprs, None).unwrap();
+            let e = t.elapsed();
+            assert!(idx.is_some(), "the typed path should take this column");
+            (e, idx.unwrap())
+        };
+        let (_, idx) = indices_only();
+        assert_eq!(idx.len(), ROWS);
+
+        let gather_only = || {
+            let t = Instant::now();
+            let out = gather(&batch, &idx).unwrap();
+            let e = t.elapsed();
+            assert_eq!(out.row_count(), ROWS);
+            e
+        };
+        let whole = || {
+            let t = Instant::now();
+            let out = execute_sort(std::slice::from_ref(&batch), &exprs).unwrap();
+            let e = t.elapsed();
+            assert_eq!(out.row_count(), ROWS);
+            e
+        };
+
+        for _ in 0..3 {
+            indices_only();
+            gather_only();
+            whole();
+        }
+        let mut i = Vec::new();
+        let mut g = Vec::new();
+        let mut w = Vec::new();
+        for _ in 0..9 {
+            i.push(indices_only().0);
+            g.push(gather_only());
+            w.push(whole());
+        }
+        let (i, g, w) = (
+            *i.iter().min().unwrap(),
+            *g.iter().min().unwrap(),
+            *w.iter().min().unwrap(),
+        );
+
+        println!("ORDER BY score DESC, {ROWS} rows, 3 columns:");
+        println!("  produce the sorted indices = {i:?}");
+        println!("  gather the rows            = {g:?}");
+        println!("  whole execute_sort         = {w:?}");
+        println!(
+            "  indices are {:.0}% of it, gather {:.0}%",
+            i.as_secs_f64() / w.as_secs_f64() * 100.0,
+            g.as_secs_f64() / w.as_secs_f64() * 100.0,
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
