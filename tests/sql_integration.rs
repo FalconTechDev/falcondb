@@ -716,7 +716,6 @@ fn recursive_cte_marked_but_not_recursive_is_accepted() {
 /// Diagnosing that is a SQL-semantics fix, not a performance one, so it is not
 /// being done inside the optimisation work that found it.
 #[test]
-#[ignore]
 fn recursive_cte_walks_to_a_fixed_point() {
     let (db, _) = db_from_csv("n\n1\n", "t");
     // Anchor yields 1; each step adds one until the guard stops it at 5.
@@ -732,6 +731,43 @@ fn recursive_cte_walks_to_a_fixed_point() {
         .to_rows();
     let got: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
     assert_eq!(got, vec!["1", "2", "3", "4", "5"], "expected the fixed point 1..5");
+}
+
+/// The recursive term is matched to the anchor by position, not by name, so it
+/// does not need to alias its output back to the anchor's column name.
+#[test]
+fn recursive_cte_matches_the_anchor_by_position_not_name() {
+    let (db, _) = db_from_csv("n
+1
+", "t");
+    let rows = db
+        .sql(
+            "WITH RECURSIVE r AS (                SELECT n FROM t                UNION ALL                SELECT n + 1 FROM r WHERE n < 5              ) SELECT n FROM r ORDER BY n",
+        )
+        .expect("an unaliased recursive term should still bind to the anchor's column")
+        .to_rows();
+    let got: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(got, vec!["1", "2", "3", "4", "5"]);
+}
+
+/// A recursive term with no stopping predicate has no fixed point. It must be
+/// rejected by the iteration cap rather than run until the process dies.
+#[test]
+fn non_terminating_recursive_cte_hits_the_iteration_guard() {
+    let (db, _) = db_from_csv("n
+1
+", "t");
+    let res = db.sql(
+        "WITH RECURSIVE r AS (            SELECT n FROM t            UNION ALL            SELECT n + 1 AS n FROM r          ) SELECT n FROM r",
+    );
+    let Err(err) = res else {
+        panic!("a CTE with no fixed point should be rejected, not hang");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("fixed point") && msg.contains(&falcondb::db::MAX_RECURSIVE_ITERS.to_string()),
+        "expected the guard's message, got: {msg}"
+    );
 }
 
 // ─── Scalar subqueries ────────────────────────────────────────────────────────

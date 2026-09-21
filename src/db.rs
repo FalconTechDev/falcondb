@@ -1237,7 +1237,7 @@ fn execute_plan(
     for (name, cte_plan, recursive) in &parsed.ctes {
         if !recursive {
             let cte_batches = execute_plan(cte_plan, tables, &scope, indices)?;
-            scope.insert(name.clone(), Arc::new(table_from_batches(name, cte_batches)));
+            scope.insert(name.clone(), Arc::new(table_from_batches(name, cte_batches)?));
         } else {
             // WITH RECURSIVE: iterative evaluation.
             // The CTE plan's set_ops should be [(UnionAll|Distinct, recursive_part)].
@@ -1254,26 +1254,40 @@ fn execute_plan(
                 None => {
                     // No UNION — just a non-recursive CTE marked recursive (harmless)
                     let cte_batches = execute_plan(cte_plan, tables, &scope, indices)?;
-                    scope.insert(name.clone(), Arc::new(table_from_batches(name, cte_batches)));
+                    scope.insert(name.clone(), Arc::new(table_from_batches(name, cte_batches)?));
                     continue;
                 }
             };
 
-            // 1. Execute anchor.
+            // 1. Execute anchor. Its column names are the CTE's column names.
             let anchor_batches = execute_plan(&anchor_plan, tables, &scope, indices)?;
+            let cte_columns: Vec<String> = anchor_batches
+                .first()
+                .map(|b| b.schema.fields.iter().map(|f| f.name.clone()).collect())
+                .unwrap_or_default();
             let mut all_batches: Vec<RecordBatch> = anchor_batches.clone();
             let mut prev_batches = anchor_batches;
 
-            const MAX_RECURSIVE_ITERS: usize = 1_000_000;
+            let mut converged = false;
             for _iter in 0..MAX_RECURSIVE_ITERS {
                 if prev_batches.is_empty() || prev_batches.iter().all(|b| b.row_count() == 0) {
+                    converged = true;
                     break;
                 }
                 // Expose the previous result as the CTE for this iteration.
-                scope.insert(name.clone(), Arc::new(table_from_batches(name, prev_batches.clone())));
+                scope.insert(name.clone(), Arc::new(table_from_batches(name, prev_batches.clone())?));
 
-                let new_batches = execute_plan(&rec_plan, tables, &scope, indices)?;
+                // The recursive term is matched to the anchor by position, so its
+                // output is renamed to the anchor's column names before it is
+                // accumulated or fed back in. Without this, an unaliased `n + 1`
+                // would be exposed as a column called "n + 1" and the next pass
+                // would not find `n`.
+                let new_batches = rename_batches_positionally(
+                    execute_plan(&rec_plan, tables, &scope, indices)?,
+                    &cte_columns,
+                )?;
                 if new_batches.is_empty() || new_batches.iter().all(|b| b.row_count() == 0) {
+                    converged = true;
                     break;
                 }
 
@@ -1298,6 +1312,7 @@ fn execute_plan(
                         filter_batch_by_mask(&b, &keep)
                     }).collect();
                     if fresh.is_empty() || fresh.iter().all(|b| b.row_count() == 0) {
+                        converged = true;
                         break;
                     }
                     all_batches.extend(fresh.clone());
@@ -1308,7 +1323,13 @@ fn execute_plan(
                 }
             }
 
-            scope.insert(name.clone(), Arc::new(table_from_batches(name, all_batches)));
+            if !converged {
+                return Err(FalconError::InvalidQuery(format!(
+                    "recursive CTE '{name}' did not reach a fixed point within                      {MAX_RECURSIVE_ITERS} iterations"
+                )));
+            }
+
+            scope.insert(name.clone(), Arc::new(table_from_batches(name, all_batches)?));
         }
     }
 
@@ -1861,8 +1882,158 @@ fn apply_set_op(
     }
 }
 
+/// How many times a recursive CTE's recursive term may run before the query is
+/// rejected.
+///
+/// A recursive term that keeps producing rows — `SELECT n + 1 FROM r` with no
+/// stopping predicate — has no fixed point, and every pass materialises another
+/// table. The cap turns that into an error the caller can see instead of a hang.
+pub const MAX_RECURSIVE_ITERS: usize = 1_000;
+
+/// Rename a set of batches' columns positionally.
+///
+/// Used to match a recursive CTE's recursive term to the names its anchor term
+/// established. Types are left alone; `unify_batch_schemas` widens those.
+fn rename_batches_positionally(
+    batches: Vec<RecordBatch>,
+    names:   &[String],
+) -> FalconResult<Vec<RecordBatch>> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            if batch.schema.fields.len() != names.len() {
+                return Err(FalconError::InvalidQuery(format!(
+                    "recursive term returns {} column(s) but the anchor term returns {}",
+                    batch.schema.fields.len(), names.len()
+                )));
+            }
+            if batch.schema.fields.iter().zip(names).all(|(f, n)| f.name == *n) {
+                return Ok(batch);
+            }
+            let fields = batch.schema.fields.iter().zip(names)
+                .map(|(f, n)| crate::storage::schema::Field::new(n.clone(), f.data_type.clone(), f.nullable))
+                .collect();
+            RecordBatch::from_shared(
+                crate::storage::schema::Schema::new(fields),
+                batch.columns.clone(),
+            )
+        })
+        .collect()
+}
+
+/// The type both sides of a set operation can be read as.
+///
+/// Only widening is allowed: an integer can be read as a float, and anything
+/// can stand in for a column that was all-NULL. Everything else is a genuine
+/// type clash and is reported rather than papered over.
+fn unify_data_type(
+    a: &crate::storage::types::DataType,
+    b: &crate::storage::types::DataType,
+) -> Option<crate::storage::types::DataType> {
+    use crate::storage::types::DataType as D;
+    if a == b {
+        return Some(a.clone());
+    }
+    Some(match (a, b) {
+        (D::Null, other) | (other, D::Null) => other.clone(),
+        (D::Int32, D::Int64) | (D::Int64, D::Int32) => D::Int64,
+        (D::Float32, D::Float64) | (D::Float64, D::Float32) => D::Float64,
+        (D::Int32 | D::Int64, D::Float32 | D::Float64)
+        | (D::Float32 | D::Float64, D::Int32 | D::Int64) => D::Float64,
+        _ => return None,
+    })
+}
+
+/// Re-read a column under a wider type, per `unify_data_type`.
+fn cast_column(
+    col: &crate::storage::column::Column,
+    to:  &crate::storage::types::DataType,
+) -> Option<crate::storage::column::Column> {
+    use crate::storage::column::{Column, PrimitiveColumn};
+    use crate::storage::types::DataType as D;
+    if col.data_type() == *to {
+        return Some(col.clone());
+    }
+    let vals: Vec<crate::storage::types::ScalarValue> =
+        (0..col.len()).map(|r| col.get(r).unwrap_or(crate::storage::types::ScalarValue::Null)).collect();
+    Some(match to {
+        D::Int64   => Column::Int64(PrimitiveColumn::new(vals.iter().map(|v| v.as_i64()).collect())),
+        D::Float64 => Column::Float64(PrimitiveColumn::new(vals.iter().map(|v| v.as_f64()).collect())),
+        _ => return None,
+    })
+}
+
+/// Bring a set of result batches under one schema.
+///
+/// Column *names* come from the first batch positionally — that is the SQL rule
+/// for set operations and for recursive CTEs, where the anchor term names the
+/// columns and the recursive term is matched by position, not by name. Column
+/// *types* are widened to whatever both sides can be read as, because the same
+/// expression can yield a different type per branch (`n` is an integer, `n + 1`
+/// evaluates as a float).
+///
+/// Without this, batches from different branches disagree and cannot be stored
+/// in a single table.
+fn unify_batch_schemas(batches: Vec<RecordBatch>) -> FalconResult<Vec<RecordBatch>> {
+    let Some(first) = batches.first() else { return Ok(batches) };
+    if batches.iter().all(|b| b.schema == first.schema) {
+        return Ok(batches);
+    }
+
+    let width = first.schema.fields.len();
+    if let Some(bad) = batches.iter().find(|b| b.schema.fields.len() != width) {
+        return Err(FalconError::InvalidQuery(format!(
+            "set operation branches have different column counts: {width} vs {}",
+            bad.schema.fields.len()
+        )));
+    }
+
+    let mut fields = first.schema.fields.clone();
+    for batch in &batches[1..] {
+        for (i, field) in fields.iter_mut().enumerate() {
+            let other = &batch.schema.fields[i];
+            field.data_type = unify_data_type(&field.data_type, &other.data_type)
+                .ok_or_else(|| FalconError::InvalidQuery(format!(
+                    "set operation branches disagree on the type of column '{}': {:?} vs {:?}",
+                    field.name, field.data_type, other.data_type
+                )))?;
+            field.nullable |= other.nullable;
+        }
+    }
+    let schema = crate::storage::schema::Schema::new(fields);
+
+    batches
+        .into_iter()
+        .map(|batch| {
+            if batch.schema == schema {
+                return Ok(batch);
+            }
+            let columns: Vec<Arc<crate::storage::column::Column>> = batch.columns.iter().zip(&schema.fields)
+                .map(|(col, field)| {
+                    if col.data_type() == field.data_type {
+                        Ok(col.clone())
+                    } else {
+                        cast_column(col, &field.data_type).map(Arc::new).ok_or_else(|| {
+                            FalconError::InvalidQuery(format!(
+                                "cannot read column '{}' as {:?}", field.name, field.data_type
+                            ))
+                        })
+                    }
+                })
+                .collect::<FalconResult<_>>()?;
+            RecordBatch::from_shared(schema.clone(), columns)
+        })
+        .collect()
+}
+
 /// Collect result batches into a table so a CTE can be queried like any other.
-fn table_from_batches(name: &str, batches: Vec<RecordBatch>) -> Table {
+///
+/// The batches are reconciled to one schema first: they can come from different
+/// branches of a set operation, and a `Table` holds exactly one schema. An
+/// append that still fails after that is a real bug, so it is propagated rather
+/// than dropping the rows.
+fn table_from_batches(name: &str, batches: Vec<RecordBatch>) -> FalconResult<Table> {
+    let batches = unify_batch_schemas(batches)?;
     let schema = batches
         .first()
         .map(|b| b.schema.clone())
@@ -1870,10 +2041,9 @@ fn table_from_batches(name: &str, batches: Vec<RecordBatch>) -> Table {
 
     let mut table = Table::new(name, schema);
     for batch in batches {
-        // Batches come straight from the sub-plan, so the schema already matches.
-        let _ = table.append_batch(batch);
+        table.append_batch(batch)?;
     }
-    table
+    Ok(table)
 }
 
 /// Keep only the rows where `mask[i] == true`.
