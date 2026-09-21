@@ -447,8 +447,20 @@ fn build_output_dense(
                             Side::Left  => (left_batches[*bi].column(*ci), li),
                             Side::Right => (right.column(*ci), ri),
                         };
-                        if let Column::$variant(p) = src {
-                            p.gather_u32_into(idx, out);
+                        // A mismatch here would leave the output full of default
+                        // values -- a wrong answer that looks like data. `usable`
+                        // has already established the variant, but the check and
+                        // the use are far apart, so say so loudly rather than
+                        // trusting a future edit to keep them in step. A silently
+                        // dropped mismatch is exactly how `table_from_batches`
+                        // lost every row of a recursive CTE.
+                        match src {
+                            Column::$variant(p) => p.gather_u32_into(idx, out),
+                            other => unreachable!(
+                                "build_output_dense: `usable` accepted {:?} but the                                  gather expected {}",
+                                other.data_type(),
+                                stringify!($variant),
+                            ),
                         }
                     },
                 );
