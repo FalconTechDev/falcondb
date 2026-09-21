@@ -1445,6 +1445,117 @@ impl SumLane for i32 {
     fn to_f64(self) -> f64 { self as f64 }
 }
 
+#[cfg(test)]
+mod sum_perf {
+    use super::*;
+    use std::time::Instant;
+
+    /// What does widening every integer to `f64` cost a `SUM`?
+    ///
+    /// `SUM(id)` at 100k rows is the one benchmark point never investigated:
+    /// 23.3 us against Polars' 14.9 us. That is 34 GB/s against their 54 GB/s on
+    /// a machine whose DRAM measures 57 GB/s -- they are at the hardware limit and
+    /// we are not. `SUM` over `i64` at 1M also runs 30% slower than `SUM` over
+    /// `f64` at the same size, for the same eight bytes a row, which points at the
+    /// kernel rather than at threading.
+    ///
+    /// `SumLane::to_f64` converts each element before adding it. Integer lanes
+    /// would skip the conversion and vectorise as four `i64` adds per AVX2
+    /// instruction instead of four `f64` adds plus four conversions.
+    ///
+    /// This measures only what the change is worth. It does not make it: summing
+    /// integers in `i64` overflows where widening silently loses precision past
+    /// 2^53, and which of those a query engine should do is a semantics decision,
+    /// not a performance one.
+    ///
+    /// Measured: it is worth nothing. Integer accumulation runs at 1.02-1.05x the
+    /// widening kernel -- marginally *slower*, not faster. Both sit at 28-30 GB/s
+    /// at 100k and 1M rows. The conversion is free; it hides under the loads.
+    ///
+    /// That settles a question that had been open on performance grounds: there
+    /// are none. If SUM over integers should accumulate in `i64`, the reason is
+    /// that widening silently loses precision -- summing eight values just past
+    /// 2^53 comes out 12 short -- and that is a correctness argument to be made on
+    /// its own.
+    ///
+    /// It also relocates the real headroom. 30 GB/s against an L3 that measures
+    /// 145 GB/s means this kernel is not memory-bound at all; it is limited by its
+    /// own dependency chains, and that is where a faster SUM would come from.
+    ///
+    /// Run with
+    /// `cargo test --release --lib integer_sum_accumulator -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn integer_sum_accumulator() {
+        fn sum_i64_lanes(dense: &[i64]) -> i64 {
+            let mut acc = [0i64; SUM_LANES];
+            let mut chunks = dense.chunks_exact(SUM_LANES);
+            for c in &mut chunks {
+                for (a, &v) in acc.iter_mut().zip(c.iter()) {
+                    *a = a.wrapping_add(v);
+                }
+            }
+            let mut total: i64 = acc.iter().fold(0i64, |a, &b| a.wrapping_add(b));
+            for &v in chunks.remainder() {
+                total = total.wrapping_add(v);
+            }
+            total
+        }
+
+        for &n in &[100_000usize, 1_000_000] {
+            let data: Vec<i64> = (0..n as i64).map(|i| i % 1_000).collect();
+
+            // Same answer at this magnitude, which is the point: the difference
+            // only appears past 2^53, and that is where the decision lives.
+            assert_eq!(sum_lanes(&data) as i64, sum_i64_lanes(&data));
+
+            let widen = || {
+                let t = Instant::now();
+                let v = sum_lanes(&data);
+                let e = t.elapsed();
+                std::hint::black_box(v);
+                e
+            };
+            let native = || {
+                let t = Instant::now();
+                let v = sum_i64_lanes(&data);
+                let e = t.elapsed();
+                std::hint::black_box(v);
+                e
+            };
+
+            for _ in 0..5 {
+                widen();
+                native();
+            }
+            let mut w = Vec::new();
+            let mut m = Vec::new();
+            for _ in 0..15 {
+                w.push(widen());
+                m.push(native());
+            }
+            let w = *w.iter().min().unwrap();
+            let m = *m.iter().min().unwrap();
+            let gb = |d: std::time::Duration| (n * 8) as f64 / d.as_secs_f64() / 1e9;
+
+            println!("SUM over {n} i64:");
+            println!("  widened to f64 = {w:?}  ({:.1} GB/s)", gb(w));
+            println!("  accumulated i64 = {m:?}  ({:.1} GB/s)", gb(m));
+            println!("  native is {:.2}x the widening kernel", m.as_secs_f64() / w.as_secs_f64());
+        }
+
+        // And the precision the widening silently costs, which is the other half
+        // of the decision.
+        let big: Vec<i64> = (0..8).map(|i| (1i64 << 53) + i).collect();
+        let widened = sum_lanes(&big) as i64;
+        let exact = sum_i64_lanes(&big);
+        println!("\nsum of eight values just past 2^53:");
+        println!("  widened  = {widened}");
+        println!("  exact    = {exact}");
+        println!("  off by     {}", exact - widened);
+    }
+}
+
 /// Rows per rayon task when summing one large slice.
 const PAR_SUM_CHUNK: usize = 16_384;
 
