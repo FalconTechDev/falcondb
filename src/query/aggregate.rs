@@ -1407,8 +1407,19 @@ fn sum_lanes<T: SumLane>(dense: &[T]) -> f64 {
     let mut acc = [0.0f64; SUM_LANES];
     let mut chunks = dense.chunks_exact(SUM_LANES);
     for c in &mut chunks {
-        for (a, &v) in acc.iter_mut().zip(c.iter()) {
-            *a += v.to_f64();
+        // Indexed, not zipped. The two say the same thing, and the result is
+        // bit-identical -- eight independent accumulators need no reassociation,
+        // so nothing about rounding changes. But the zipped form measured
+        // 25.0 GB/s against 42.8 GB/s for this one on data sitting in L2, a 42%
+        // difference on the kernel underneath every SUM, AVG, COUNT and the
+        // fused filter+sum. `sum_kernel_shapes` measures the two, and asserts
+        // they agree bit for bit.
+        //
+        // Eight named accumulators, which looks like the version most likely to
+        // stay in registers, measured 15.3 GB/s -- worse than either.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..SUM_LANES {
+            acc[i] += c[i].to_f64();
         }
     }
     let mut total = acc.iter().sum::<f64>();
