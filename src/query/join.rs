@@ -1013,7 +1013,21 @@ impl IntHashTable {
     /// only the rows it owns: arithmetic on a value already in a register, traded
     /// against a scattered write it would otherwise have to synchronise on.
     /// Build the table in parallel with a radix partition, keeping total work at
-    /// O(rows) and reproducing the serial chains byte for byte.
+    /// O(rows) and reproducing the serial chains byte for byte -- and still
+    /// slower than the serial loop, at 1.60x it.
+    ///
+    /// That result is the useful part. `build_parallel` lost because its total
+    /// work was O(partitions x rows); this one fixes exactly that and does not
+    /// win, which says the insert loop was never the bottleneck. What a build
+    /// actually spends its time on is allocating and filling roughly 2.2 MB per
+    /// join -- 1 MB of bucket heads, 400 KB of chain links, 800 KB of keys -- plus,
+    /// for either parallel version, copying the atomic arrays back into plain ones.
+    /// Parallelism cannot help with memory that has to be touched once either way.
+    ///
+    /// So the next thing worth trying on the build side is allocating less, not
+    /// spreading the work wider: one bucket per row instead of two, and dropping
+    /// the `keys` array, which duplicates data the key column already holds.
+    /// Both are measurable with the harness in this module.
     ///
     /// `build_parallel` below partitions by bucket, which makes every thread look
     /// at every row to find the ones it owns -- O(partitions x rows), and measured
