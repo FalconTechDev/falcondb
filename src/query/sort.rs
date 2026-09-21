@@ -453,11 +453,32 @@ mod perf {
     fn radix_against_pdqsort() {
         const ROWS: usize = 100_000;
 
-        // The benchmark's key: `score` is (i % 100) + 0.5 as f64, sorted
-        // descending, so the keys are bit-flipped before sorting.
-        let keys: Vec<u64> = (0..ROWS)
-            .map(|i| !f64_sort_key((i % 100) as f64 + 0.5))
-            .collect();
+        // Three distributions, because both algorithms are data-sensitive and
+        // picking one from a single artificial column would be fitting the engine
+        // to the benchmark. Radix skips passes whose digit never varies; pdqsort
+        // handles heavy duplication well. They are strongest on opposite inputs.
+        for (label, keys) in [
+            (
+                "100 distinct (the benchmark's column)",
+                (0..ROWS).map(|i| !f64_sort_key((i % 100) as f64 + 0.5)).collect::<Vec<u64>>(),
+            ),
+            (
+                "all distinct, already ordered",
+                (0..ROWS).map(|i| !f64_sort_key(i as f64 + 0.5)).collect::<Vec<u64>>(),
+            ),
+            (
+                "all distinct, scattered",
+                (0..ROWS)
+                    .map(|i| {
+                        // Cheap deterministic scatter; no rand dependency.
+                        let h = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                        !f64_sort_key((h >> 11) as f64 * 1.0e-6)
+                    })
+                    .collect::<Vec<u64>>(),
+            ),
+        ] {
+        println!("
+--- {label} ---");
         let fresh = || -> Vec<(u64, u32)> {
             keys.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect()
         };
@@ -517,6 +538,25 @@ mod perf {
         println!("  radix sort      = {r:?}");
         println!("  sort_unstable   = {q:?}");
         println!("  radix is {:.2}x pdqsort", r.as_secs_f64() / q.as_secs_f64());
+
+        // The radix sort runs on one thread. Twelve threads doing more total work
+        // may still finish sooner -- the only way to know is to ask.
+        let time_par = || {
+            let mut v = fresh();
+            let t = Instant::now();
+            v.par_sort_unstable();
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        };
+        let mut check = fresh();
+        check.par_sort_unstable();
+        assert_eq!(check, b, "parallel sort disagrees on the sorted order");
+        for _ in 0..3 { time_par(); }
+        let pr = (0..9).map(|_| time_par()).min().unwrap();
+        println!("  par_sort_unstable = {pr:?}  ({:.2}x the serial radix)",
+                 pr.as_secs_f64() / r.as_secs_f64());
+        }
     }
 
     /// Where does `ORDER BY` spend its time at the size we lose on?
