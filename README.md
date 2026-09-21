@@ -20,7 +20,7 @@ FalconDB is built from scratch to answer one question: *what does a columnar dat
 - **DDL** — `CREATE TABLE`, `DROP TABLE` (with `IF [NOT] EXISTS`), `ALTER TABLE ADD/DROP COLUMN`. Schemas can now be defined entirely in SQL — no CSV file required.
 - **EXPLAIN** — `EXPLAIN <any-statement>` returns the query plan as a result set: Scan, Filter, GroupBy, Window, Sort, Limit, and Join nodes. No side effects.
 - **DML** — `INSERT`, `UPDATE`, `DELETE`. Mutations are copy-on-write: because columns are `Arc`-shared, batches a statement does not touch are carried over as pointer copies and only affected batches are rebuilt.
-- **CTEs and scalar subqueries** — `WITH a AS (…), b AS (SELECT … FROM a)` and `WHERE x > (SELECT AVG(x) FROM t)`.
+- **CTEs and scalar subqueries** — `WITH a AS (…), b AS (SELECT … FROM a)`, `WITH RECURSIVE`, and `WHERE x > (SELECT AVG(x) FROM t)`.
 - **B-tree and hash indices** — range queries and point lookups without touching the storage layer.
 - **Write-ahead log** — crash recovery with CRC32-verified records. DML is journalled statement-by-statement; load your base data, then call `db.recover()` to replay. Sound because FalconDB's DML is deterministic (`INSERT` takes literals only, `UPDATE`/`DELETE` expressions are pure functions of stored data) — adding something like `NOW()` would require switching to row-image logging.
 - **Native binary format** — `.fdb` files: header + compressed columns, ~2× smaller than CSV.
@@ -418,7 +418,8 @@ open items are structural rather than a slow loop somewhere:
 |----------------------|--------|----------------------------------------------------|
 | Window functions     | ✅     | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG/LEAD`, `SUM/AVG/MIN/MAX OVER (PARTITION BY … ORDER BY …)` |
 | INSERT / UPDATE / DELETE | ✅ | Copy-on-write over `Arc`-shared columns; returns `rows_affected` |
-| CTE (`WITH`)         | ✅     | Non-recursive; materialised in declaration order, so a CTE can reference an earlier one. `WITH RECURSIVE` is rejected |
+| CTE (`WITH`)         | ✅     | Materialised in declaration order, so a CTE can reference an earlier one |
+| `WITH RECURSIVE`     | ✅     | Anchor `UNION [ALL]` recursive term, iterated to a fixed point. The recursive term is matched to the anchor by position, so it need not alias its columns. Capped at 1,000 iterations — a recursion with no fixed point is rejected with an error rather than run unbounded. Only a single anchor/recursive pair per CTE; more terms, or `INTERSECT`/`EXCEPT` between them, are rejected rather than silently dropped |
 | Scalar subqueries    | ✅     | `WHERE x > (SELECT AVG(x) FROM t)` — folded to a literal once, before evaluation. Empty result → NULL; >1 row → error |
 | WAL integration for DML | ✅  | Statement-based logging + `recover()` replay          |
 | `IN (SELECT …)` / `EXISTS` | ✅ | Uncorrelated: folded to an IN-list / boolean literal before evaluation |
@@ -428,6 +429,7 @@ open items are structural rather than a slow loop somewhere:
 | Zone maps (batch statistics) | ✅ | Per-batch min/max/null bounds computed once at load; a selective `WHERE` skips whole batches without reading a value. Pruning is conservative — it never skips a batch that could hold a match |
 | EXPLAIN              | ✅   | `EXPLAIN <stmt>` returns a plan table: Scan / Filter / GroupBy / Sort / Limit |
 | Cost-based optimizer | ❌   | Join reordering, predicate pushdown across joins       |
+| Integer arithmetic   | ⚠️     | `+ - * /` evaluate in `f64` and yield a `Float64` column, even for integer operands. Values print the same up to 2^53, but a column's type can widen across a `UNION`, and very large integers lose precision |
 | Vectorised SIMD      | ❌     | Explicit AVX2/AVX-512 for arithmetic and comparisons |
 | Python bindings      | ❌     | PyO3 wrapper — `import falcondb`                   |
 

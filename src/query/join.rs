@@ -956,11 +956,66 @@ impl IntHashTable {
     /// were used directly.
     #[inline(always)]
     fn bucket(&self, key: i64) -> usize {
-        let mut h = key as u64;
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^= h >> 33;
-        (h as usize) & self.mask
+        bucket_with(self.mask, key)
+    }
+
+    /// Build the table in parallel, producing byte-for-byte what the serial
+    /// insert loop produces.
+    ///
+    /// The build runs on one thread while the probe runs on all of them, so it
+    /// weighs on a join more than its cost suggests: 1.03 ms of a 4.43 ms 1M-row
+    /// join, none of it parallel.
+    ///
+    /// Partitioned by bucket rather than by row. Every bucket belongs to exactly
+    /// one partition and every row to exactly one bucket, so no two threads ever
+    /// touch the same `heads` slot or the same `next` slot. The atomics carry no
+    /// contention; they are here only because the compiler cannot see that
+    /// disjointness, and on x86 a relaxed load or store is an ordinary one.
+    ///
+    /// Rows are visited in ascending order within a partition -- the order the
+    /// serial loop used -- so the chains come out identical rather than merely
+    /// equivalent. That matters beyond tidiness: chain order within a bucket
+    /// decides the order of a join's output rows, and an engine that reorders
+    /// results between runs is a worse thing than a slow one.
+    /// `parallel_build_is_identical_to_serial` asserts the arrays match exactly.
+    ///
+    /// The price is that every thread computes `bucket` for every row and keeps
+    /// only the rows it owns: arithmetic on a value already in a register, traded
+    /// against a scattered write it would otherwise have to synchronise on.
+    fn build_parallel(col: &Column, n: usize) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+        let buckets = (n.max(1) * 2).next_power_of_two();
+        let mask = buckets - 1;
+
+        let keys: Vec<i64> = (0..n).into_par_iter().map(|r| int_key(col, r)).collect();
+
+        let heads: Vec<AtomicU32> = (0..buckets).map(|_| AtomicU32::new(NO_ROW)).collect();
+        let next:  Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NO_ROW)).collect();
+
+        let parts = rayon::current_num_threads().max(1);
+        let span  = buckets.div_ceil(parts);
+        (0..parts).into_par_iter().for_each(|p| {
+            let lo = p * span;
+            let hi = ((p + 1) * span).min(buckets);
+            if lo >= hi {
+                return;
+            }
+            for (row, &k) in keys.iter().enumerate() {
+                let b = bucket_with(mask, k);
+                if b >= lo && b < hi {
+                    next[row].store(heads[b].load(Relaxed), Relaxed);
+                    heads[b].store(row as u32, Relaxed);
+                }
+            }
+        });
+
+        Self {
+            mask,
+            heads: heads.into_iter().map(|a| a.into_inner()).collect(),
+            next:  next.into_iter().map(|a| a.into_inner()).collect(),
+            keys,
+        }
     }
 
     #[inline]
@@ -1066,6 +1121,18 @@ fn int_keys_usable(
 }
 
 // ─── Bloom filter over the build side ────────────────────────────────────────
+
+/// Mixes an i64 into a bucket. Join keys are very often dense runs like
+/// 0, 10, 20, ..., which would pile into a handful of buckets if the low bits
+/// were used directly.
+#[inline(always)]
+fn bucket_with(mask: usize, key: i64) -> usize {
+    let mut h = key as u64;
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    (h as usize) & mask
+}
 
 /// A Bloom filter of the build side's join keys.
 ///
@@ -2099,6 +2166,107 @@ mod tests {
             bn.as_secs_f64() / bw.as_secs_f64(),
             pn.as_secs_f64() / pw.as_secs_f64(),
         );
+    }
+
+    fn int_key_batch(name: &str, vals: Vec<i64>) -> RecordBatch {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+        RecordBatch::new(
+            Schema::new(vec![Field::required(name, DataType::Int64)]),
+            vec![ColumnBuilder::int64(vals.into_iter().map(Some).collect())],
+        )
+        .unwrap()
+    }
+
+    /// The parallel build must produce the same table, not an equivalent one.
+    ///
+    /// Chain order within a bucket decides the order of a join's output rows, so
+    /// "the same matches in some order" is not good enough -- it would make query
+    /// results depend on how work happened to be split. Asserting the arrays
+    /// themselves is the strongest statement available and costs nothing.
+    ///
+    /// Duplicate keys are the case that matters: a bucket with one row cannot
+    /// have its order changed.
+    #[test]
+    fn parallel_build_is_identical_to_serial() {
+        for &(n, period) in &[(1usize, 1i64), (7, 3), (1000, 97), (50_000, 977)] {
+            let batch = int_key_batch("k", (0..n as i64).map(|i| (i % period) * 10).collect());
+            let col = batch.column(0);
+
+            let mut serial = IntHashTable::with_rows(n);
+            for row in 0..n {
+                serial.insert(int_key(col, row), row);
+            }
+            let parallel = IntHashTable::build_parallel(col, n);
+
+            assert_eq!(serial.mask, parallel.mask, "n={n}: mask");
+            assert_eq!(serial.keys, parallel.keys, "n={n}: keys");
+            assert_eq!(serial.heads, parallel.heads, "n={n}: bucket heads");
+            assert_eq!(serial.next, parallel.next, "n={n}: chains");
+
+            // And the thing those arrays exist for.
+            for key in [0i64, 10, 30, 12_345, -1] {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                serial.collect_matches(key, &mut a);
+                parallel.collect_matches(key, &mut b);
+                assert_eq!(a, b, "n={n}: matches for {key}");
+                assert_eq!(serial.contains(key), parallel.contains(key), "n={n}: contains {key}");
+            }
+        }
+    }
+
+    /// Is building the table in parallel actually faster?
+    ///
+    /// Measured in one process, alternating, for the reason given on
+    /// `bloom_filter_on_the_typed_path`: this machine drifts further between
+    /// runs than the effect being looked for.
+    ///
+    /// Run with
+    /// `cargo test --release --lib parallel_build_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn parallel_build_speed() {
+        use std::time::Instant;
+        const ROWS: usize = 100_000;
+
+        let batch = int_key_batch("k", (0..ROWS as i64).map(|i| i * 10).collect());
+        let col = batch.column(0);
+
+        let serial = || {
+            let t = Instant::now();
+            let mut table = IntHashTable::with_rows(ROWS);
+            for row in 0..ROWS {
+                table.insert(int_key(col, row), row);
+            }
+            let e = t.elapsed();
+            std::hint::black_box(&table);
+            e
+        };
+        let parallel = || {
+            let t = Instant::now();
+            let table = IntHashTable::build_parallel(col, ROWS);
+            let e = t.elapsed();
+            std::hint::black_box(&table);
+            e
+        };
+
+        for _ in 0..3 {
+            serial();
+            parallel();
+        }
+        let mut sv = Vec::new();
+        let mut pv = Vec::new();
+        for _ in 0..9 {
+            sv.push(serial());
+            pv.push(parallel());
+        }
+        let sm = *sv.iter().min().unwrap();
+        let pm = *pv.iter().min().unwrap();
+
+        println!("hash table build, {ROWS} rows:");
+        println!("  serial   = {sm:?}");
+        println!("  parallel = {pm:?}");
+        println!("  parallel is {:.2}x serial", pm.as_secs_f64() / sm.as_secs_f64());
     }
 
     fn orders() -> RecordBatch {

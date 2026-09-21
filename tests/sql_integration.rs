@@ -770,6 +770,21 @@ fn non_terminating_recursive_cte_hits_the_iteration_guard() {
     );
 }
 
+/// A second set operation in the CTE body would have been silently ignored.
+#[test]
+fn recursive_cte_with_extra_set_op_is_rejected() {
+    let (db, _) = db_from_csv("n
+1
+", "t");
+    let res = db.sql(
+        "WITH RECURSIVE r AS (            SELECT n FROM t            UNION ALL            SELECT n + 1 AS n FROM r WHERE n < 5            UNION ALL            SELECT n FROM t          ) SELECT n FROM r",
+    );
+    let Err(err) = res else {
+        panic!("extra set operations must be rejected, not dropped");
+    };
+    assert!(err.to_string().contains("set operations"), "got: {err}");
+}
+
 // ─── Scalar subqueries ────────────────────────────────────────────────────────
 
 #[test]

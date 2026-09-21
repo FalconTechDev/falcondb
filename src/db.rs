@@ -1242,14 +1242,30 @@ fn execute_plan(
             // WITH RECURSIVE: iterative evaluation.
             // The CTE plan's set_ops should be [(UnionAll|Distinct, recursive_part)].
             // We run the anchor first, then iterate the recursive part until no new rows.
+            // Only one recursive term is handled. Taking just the first set op and
+            // ignoring the rest would silently drop query terms, so reject it.
+            if cte_plan.set_ops.len() > 1 {
+                return Err(FalconError::InvalidQuery(format!(
+                    "recursive CTE '{name}' has {} set operations; only a single                      anchor UNION [ALL] recursive term is supported",
+                    cte_plan.set_ops.len()
+                )));
+            }
             let (anchor_plan, rec_plan, is_union_all) = match cte_plan.set_ops.first() {
                 Some((op, rec)) => {
+                    use crate::query::sql::SetOp;
+                    let is_union_all = match op {
+                        SetOp::UnionAll      => true,
+                        SetOp::UnionDistinct => false,
+                        other => return Err(FalconError::InvalidQuery(format!(
+                            "recursive CTE '{name}' must combine its terms with                              UNION or UNION ALL, not {other:?}"
+                        ))),
+                    };
                     let anchor = crate::query::sql::ParsedQuery {
                         set_ops: vec![],
                         ctes:    vec![],
                         ..cte_plan.clone()
                     };
-                    (anchor, rec.clone(), matches!(op, crate::query::sql::SetOp::UnionAll))
+                    (anchor, rec.clone(), is_union_all)
                 }
                 None => {
                     // No UNION — just a non-recursive CTE marked recursive (harmless)
