@@ -722,8 +722,16 @@ mod merge_perf {
     ///   constant path as well               1.61ms    0.7x
     /// ```
     ///
-    /// The string update now beats the float one, because the float case here is
-    /// `score = score + 1` -- not a constant, so it still evaluates per row.
+    /// The string update now beats the float one. A note in the commit that
+    /// landed this said the float case still evaluated per row; that was wrong.
+    /// `score = score + 1` takes `eval_dense_f64`, which computes straight into
+    /// an `f64` buffer and never boxes a value.
+    ///
+    /// What the float case does pay is two full-column allocations per batch --
+    /// one for the computed values and one for the copy being spliced into -- and
+    /// it computes the expression for every row before discarding the result for
+    /// the rows the filter did not select. The string constant path does neither,
+    /// which is the whole of the difference.
     ///
     /// Run with
     /// `cargo test --release --lib update_by_column_type -- --ignored --nocapture`.
