@@ -438,26 +438,16 @@ fn assemble<T>(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Concatenate the batches to be sorted.
+///
+/// Delegates to [`RecordBatch::concat`]. This used to be a private copy of it
+/// that walked the columns one at a time, which meant it never saw the parallel
+/// path that lives there -- so correcting `par_concat_rows` had no effect on a
+/// sort until this was pointed at the shared implementation. The same shape of
+/// mistake cost this engine a 100x join regression once: two implementations of
+/// one operation, only one of which gets fixed.
 fn merge_batches(batches: &[RecordBatch]) -> FalconResult<RecordBatch> {
-    if batches.len() == 1 {
-        return Ok(batches[0].clone());
-    }
-
-    let schema    = batches[0].schema.clone();
-    let col_count = schema.field_count();
-
-    // Typed bulk concat, one column at a time. The previous implementation pushed
-    // every value through `ScalarValue`, which allocated an enum per cell (and cloned
-    // every String) before converting the whole thing back — O(rows × cols) boxing
-    // for what is really a memcpy per column.
-    let columns: FalconResult<Vec<Column>> = (0..col_count)
-        .map(|ci| {
-            let parts: Vec<&Column> = batches.iter().map(|b| b.column(ci)).collect();
-            Column::concat(&parts)
-        })
-        .collect();
-
-    RecordBatch::new(schema, columns?)
+    RecordBatch::concat(batches)
 }
 
 fn compare_scalar(a: &ScalarValue, b: &ScalarValue, nulls_last: bool) -> std::cmp::Ordering {
