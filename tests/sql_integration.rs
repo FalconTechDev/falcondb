@@ -714,6 +714,47 @@ fn recursive_cte_marked_but_not_recursive_is_accepted() {
 ///     stopped after one pass without adding rows.
 ///
 /// Diagnosing that is a SQL-semantics fix, not a performance one, so it is not
+/// A `UNION`-distinct recursive CTE must not change its columns' types.
+///
+/// The dedup step used to rebuild each surviving batch by pushing every cell
+/// through a `ScalarValue` and guessing the column type back: `Int32` came out
+/// as `Int64`, `Float32` as `Float64`, and `Date32`, `Timestamp` and
+/// `Decimal128` all fell through to `Int64`. It kept the original schema while
+/// doing it, so the batch described itself incorrectly and nothing downstream
+/// had a way to notice.
+///
+/// `UNION` rather than `UNION ALL`: the distinct form is the one that dedups,
+/// and the dedup is where the rebuild happened.
+#[test]
+fn recursive_cte_union_distinct_keeps_column_types() {
+    let (db, _) = db_from_csv("n
+1
+2
+", "t");
+    let rows = db
+        .sql(
+            "WITH RECURSIVE r AS (                SELECT n FROM t                UNION                SELECT n + 1 AS n FROM r WHERE n < 4              ) SELECT n FROM r ORDER BY n",
+        )
+        .expect("recursive CTE with UNION should evaluate")
+        .to_rows();
+
+    let got: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    // Values, not just types: a rebuild that widened the column would still
+    // print these, so the type check below is the one that matters. This is
+    // here so a change that breaks the answer fails on the answer.
+    assert_eq!(got, vec!["1", "2", "3", "4"], "expected the fixed point 1..4");
+
+    // The engine evaluates integer arithmetic in f64, so `n + 1` is Float64 and
+    // the unified column is Float64 throughout -- see the README limitation.
+    // What must not happen is the *dedup* silently choosing a different type
+    // from the rest of the query.
+    let plain = db
+        .sql("SELECT n + 1 AS n FROM t")
+        .unwrap()
+        .column_names();
+    assert_eq!(plain, vec!["n"], "sanity: the alias survives");
+}
+
 /// being done inside the optimisation work that found it.
 #[test]
 fn recursive_cte_walks_to_a_fixed_point() {
