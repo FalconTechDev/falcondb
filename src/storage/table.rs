@@ -11,11 +11,13 @@ use rayon::prelude::*;
 /// rows, so a handful of tasks each copying a column; measured on three columns
 /// in two batches:
 ///
+/// ```text
 ///     5_000 rows   5.17x  (rayon overhead against a 3us copy)
 ///    20_000 rows   0.70x
 ///    50_000 rows   0.76x
 ///   100_000 rows   0.78x
 ///   300_000 rows   0.55x
+/// ```
 ///
 /// The crossover sits between 5k and 20k, so 20k, divided by the thread count in
 /// keeping with the rest of `query::tuning` -- though note the work here scales
