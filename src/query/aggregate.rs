@@ -1836,12 +1836,18 @@ serial vs parallel (mean of a repetition block):");
     #[test]
     #[ignore]
     fn integer_sum_accumulator() {
+        // Indexed, matching `sum_lanes` exactly. An earlier version of this test
+        // wrote the loop with `zip` while `sum_lanes` used indexing, so it was
+        // comparing two things at once -- accumulator type and loop shape -- and
+        // the shape alone is worth 7%. Whatever this measures now is the
+        // accumulator.
         fn sum_i64_lanes(dense: &[i64]) -> i64 {
             let mut acc = [0i64; SUM_LANES];
             let mut chunks = dense.chunks_exact(SUM_LANES);
             for c in &mut chunks {
-                for (a, &v) in acc.iter_mut().zip(c.iter()) {
-                    *a = a.wrapping_add(v);
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..SUM_LANES {
+                    acc[i] = acc[i].wrapping_add(c[i]);
                 }
             }
             let mut total: i64 = acc.iter().fold(0i64, |a, &b| a.wrapping_add(b));
@@ -1887,7 +1893,21 @@ serial vs parallel (mean of a repetition block):");
             let m = *m.iter().min().unwrap();
             let gb = |d: std::time::Duration| (n * 8) as f64 / d.as_secs_f64() / 1e9;
 
+            // Same kernel over f64 data, as a reference: if integers are slower
+            // than floats at the same width, the conversion is the reason.
+            let fdata: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+            let float_ref = {
+                for _ in 0..5 { std::hint::black_box(sum_lanes(&fdata)); }
+                let reps = (5_000_000 / n).max(20) as u32;
+                let t = Instant::now();
+                for _ in 0..reps { std::hint::black_box(sum_lanes(&fdata)); }
+                t.elapsed() / reps
+            };
             println!("SUM over {n} i64:");
+            println!(
+                "  same kernel over f64 = {float_ref:?}  ({:.1} GB/s)",
+                (n * 8) as f64 / float_ref.as_secs_f64() / 1e9,
+            );
             println!("  widened to f64 = {w:?}  ({:.1} GB/s)", gb(w));
             println!("  accumulated i64 = {m:?}  ({:.1} GB/s)", gb(m));
             println!("  native is {:.2}x the widening kernel", m.as_secs_f64() / w.as_secs_f64());
