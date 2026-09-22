@@ -1466,6 +1466,62 @@ impl SumLane for i32 {
 }
 
 #[cfg(test)]
+mod int_sum {
+    use super::*;
+
+    /// Below 2^53 the integer path must give exactly what the float path gave.
+    #[test]
+    fn agrees_with_the_float_path_on_ordinary_data() {
+        for n in [0usize, 1, 3, 4, 7, 8, 1000, 65_536] {
+            let data: Vec<i64> = (0..n as i64).map(|i| (i % 997) - 498).collect();
+            assert_eq!(
+                sum_i64(&data).to_bits(),
+                sum_lanes(&data).to_bits(),
+                "n={n}",
+            );
+            assert_eq!(par_sum_i64(&data).to_bits(), sum_i64(&data).to_bits(), "n={n} parallel");
+        }
+    }
+
+    /// Past 2^53 it must be closer to the truth, not merely different.
+    #[test]
+    fn is_more_accurate_past_the_float_limit() {
+        let data: Vec<i64> = (0..8).map(|i| (1i64 << 53) + i).collect();
+        let exact: i128 = data.iter().map(|&v| v as i128).sum();
+
+        let new = sum_i64(&data) as i128;
+        let old = sum_lanes(&data) as i128;
+        assert_eq!(new, exact as f64 as i128, "should be the correctly rounded total");
+        assert!(
+            (new - exact).abs() < (old - exact).abs(),
+            "new {new} should be closer to {exact} than old {old}",
+        );
+    }
+
+    /// A sum that leaves i64's range must fall back rather than wrap. Wrapping
+    /// would be a silently wrong answer, which is the one outcome not allowed.
+    #[test]
+    fn falls_back_instead_of_wrapping_on_overflow() {
+        let data = vec![i64::MAX, i64::MAX, i64::MAX, i64::MAX, 1, 2, 3];
+        assert!(checked_sum_i64(&data).is_none(), "this must not fit in i64");
+
+        let got = sum_i64(&data);
+        assert_eq!(got.to_bits(), sum_lanes(&data).to_bits(), "must equal the f64 path");
+        assert!(got > 3.6e19, "and must be the large positive total, not a wrapped one");
+    }
+
+    /// The remainder past the last full chunk of four has to be counted too.
+    #[test]
+    fn counts_the_tail_of_a_ragged_slice() {
+        for n in 0..24usize {
+            let data: Vec<i64> = (1..=n as i64).collect();
+            let expected = (n as i64 * (n as i64 + 1)) / 2;
+            assert_eq!(sum_i64(&data), expected as f64, "n={n}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod sum_perf {
     use super::*;
     use std::time::Instant;
@@ -2288,6 +2344,59 @@ serial vs parallel (mean of a repetition block):");
     }
 }
 
+/// Sum an integer column, in `i64` where that is exact and in `f64` where it is
+/// not.
+///
+/// Integers accumulated in `f64` lose precision above 2^53, and they do it
+/// silently: summing eight values just past that boundary lands 12 away from the
+/// truth, where one correct rounding at the end lands 4 away. Accumulating in
+/// `i64` fixes that and is faster -- but `i64` overflows, which `f64` never does.
+///
+/// So do both. The checked integer path answers whenever it can, and when a sum
+/// would leave `i64`'s range this falls back to exactly what the engine did
+/// before. No query gains a failure mode it did not have; the common case gets
+/// the better answer and the faster one.
+///
+/// Measured against the previous `f64` kernel, four runs: 0.82x, 0.87x, 0.89x,
+/// 0.92x. The unchecked version is faster still (0.45-0.70x) but wraps silently
+/// on overflow, which is not a thing a database may do. `i128`, which cannot
+/// overflow at all, runs 1.41-1.49x and is not worth it.
+/// `integer_accumulator_options` measures all of them.
+fn sum_i64(dense: &[i64]) -> f64 {
+    match checked_sum_i64(dense) {
+        Some(total) => total as f64,
+        None => sum_lanes(dense),
+    }
+}
+
+/// Four lanes, because four `i64` is one AVX2 register and the loop stops
+/// vectorising at eight -- the opposite of what floats want, which is why
+/// `SUM_LANES` cannot serve both.
+fn checked_sum_i64(dense: &[i64]) -> Option<i64> {
+    let mut acc = [0i64; 4];
+    let mut chunks = dense.chunks_exact(4);
+    for c in &mut chunks {
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..4 {
+            acc[i] = acc[i].checked_add(c[i])?;
+        }
+    }
+    let mut total = 0i64;
+    for &a in &acc {
+        total = total.checked_add(a)?;
+    }
+    for &v in chunks.remainder() {
+        total = total.checked_add(v)?;
+    }
+    Some(total)
+}
+
+/// Parallel counterpart. Each chunk decides for itself, so one chunk overflowing
+/// costs that chunk a fallback rather than the whole column.
+fn par_sum_i64(dense: &[i64]) -> f64 {
+    dense.par_chunks(PAR_SUM_CHUNK).map(sum_i64).sum::<f64>()
+}
+
 /// Rows per rayon task when summing one large slice.
 const PAR_SUM_CHUNK: usize = 16_384;
 
@@ -2371,9 +2480,9 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column, may_split: bool) -> boo
                     let dense = c.dense();
                     if !dense.is_empty() {
                         *total += if may_split && dense.len() >= PAR_SUM_THRESHOLD {
-                            par_sum_lanes(dense)
+                            par_sum_i64(dense)
                         } else {
-                            sum_lanes(dense)
+                            sum_i64(dense)
                         };
                         *valid = true;
                     }
