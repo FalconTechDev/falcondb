@@ -976,6 +976,21 @@ struct IntHashTable {
 const NO_ROW: u32 = u32::MAX;
 
 impl IntHashTable {
+    /// Slots hold `row + 1`, and 0 means empty.
+    ///
+    /// The obvious encoding is the row number with `u32::MAX` for empty, which is
+    /// what this used. It costs a megabyte of stores per build to write that
+    /// sentinel everywhere, and the allocator cannot help: only a zero fill can
+    /// be served by asking the OS for pages it has already zeroed.
+    ///
+    /// Measured on the 1 MB bucket array: allocating it zeroed takes 3us against
+    /// ~300us filled with `u32::MAX`, and 204us against 292us once the scattered
+    /// writes a build actually performs are included -- the page faults move into
+    /// the writes rather than disappearing, but the explicit fill does disappear.
+    ///
+    /// The cost is one addition on each side. `NO_ROW` keeps its meaning outside
+    /// this struct, where it marks a NULL in a join's output indices; that is a
+    /// different array with a different job.
     fn with_rows(n: usize, key_col: Arc<Column>) -> Self {
         // Two buckets per row keeps chains short without wasting much memory.
         // One per row was measured and loses: it saves 300us of build and costs
@@ -985,8 +1000,8 @@ impl IntHashTable {
         let buckets = (n.max(1) * 2).next_power_of_two();
         Self {
             mask:  buckets - 1,
-            heads: vec![NO_ROW; buckets],
-            next:  vec![NO_ROW; n],
+            heads: vec![0u32; buckets],
+            next:  vec![0u32; n],
             key_col,
         }
     }
@@ -1093,7 +1108,7 @@ impl IntHashTable {
         if n == 0 {
             return Self {
                 mask,
-                heads: vec![NO_ROW; buckets],
+                heads: vec![0u32; buckets],
                 next:  Vec::new(),
                 key_col: col,
             };
@@ -1134,7 +1149,7 @@ impl IntHashTable {
         debug_assert_eq!(running as usize, n, "radix partition lost rows");
 
         // Phase 4: scatter.
-        let scratch: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NO_ROW)).collect();
+        let scratch: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
         (0..chunks).into_par_iter().for_each(|c| {
             let lo = c * chunk;
             let hi = ((c + 1) * chunk).min(n);
@@ -1147,15 +1162,15 @@ impl IntHashTable {
         });
 
         // Phase 5: link the chains, one partition per thread.
-        let heads: Vec<AtomicU32> = (0..buckets).map(|_| AtomicU32::new(NO_ROW)).collect();
-        let next:  Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NO_ROW)).collect();
+        let heads: Vec<AtomicU32> = (0..buckets).map(|_| AtomicU32::new(0)).collect();
+        let next:  Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
         (0..parts).into_par_iter().for_each(|p| {
             let (lo, hi) = (part_start[p] as usize, part_start[p + 1] as usize);
             for slot in &scratch[lo..hi] {
                 let row = slot.load(Relaxed) as usize;
                 let b = bucket_with(mask, keys[row]);
                 next[row].store(heads[b].load(Relaxed), Relaxed);
-                heads[b].store(row as u32, Relaxed);
+                heads[b].store(row as u32 + 1, Relaxed);
             }
         });
 
@@ -1195,7 +1210,7 @@ impl IntHashTable {
                 let b = bucket_with(mask, k);
                 if b >= lo && b < hi {
                     next[row].store(heads[b].load(Relaxed), Relaxed);
-                    heads[b].store(row as u32, Relaxed);
+                    heads[b].store(row as u32 + 1, Relaxed);
                 }
             }
         });
@@ -1213,15 +1228,15 @@ impl IntHashTable {
         debug_assert!(row < self.next.len(), "build row out of range");
         let b = self.bucket(key);
         self.next[row] = self.heads[b];
-        self.heads[b] = row as u32;
+        self.heads[b] = row as u32 + 1;
     }
 
     /// Append every build-side row matching `key`.
     #[inline]
     fn collect_matches(&self, key: i64, out: &mut Vec<usize>) {
         let mut cur = self.heads[self.bucket(key)];
-        while cur != NO_ROW {
-            let row = cur as usize;
+        while cur != 0 {
+            let row = cur as usize - 1;
             if int_key(&self.key_col, row) == key {
                 out.push(row);
             }
@@ -1232,8 +1247,8 @@ impl IntHashTable {
     #[inline]
     fn contains(&self, key: i64) -> bool {
         let mut cur = self.heads[self.bucket(key)];
-        while cur != NO_ROW {
-            let row = cur as usize;
+        while cur != 0 {
+            let row = cur as usize - 1;
             if int_key(&self.key_col, row) == key {
                 return true;
             }
@@ -2431,8 +2446,8 @@ mod tests {
             for row in 0..PROBE {
                 let key = int_key(lcol, row);
                 let mut cur = table.heads[bucket_with(table.mask, key)];
-                while cur != NO_ROW {
-                    let r = cur as usize;
+                while cur != 0 {
+                    let r = cur as usize - 1;
                     if int_key(&rcol, r) == key {
                         hits += 1;
                     }
@@ -2447,8 +2462,8 @@ mod tests {
             for row in 0..PROBE {
                 let key = int_key(lcol, row);
                 let mut cur = table.heads[bucket_with(table.mask, key)];
-                while cur != NO_ROW {
-                    let r = cur as usize;
+                while cur != 0 {
+                    let r = cur as usize - 1;
                     if keys[r] == key {
                         hits += 1;
                     }
@@ -2486,6 +2501,83 @@ mod tests {
         );
     }
 
+    /// Does a zero-filled bucket array allocate faster than a sentinel-filled one?
+    ///
+    /// `heads` is 1 MB at 100k build rows and is filled with `u32::MAX` to mean
+    /// "empty". Allocation is 274us of a 1.06ms build, the largest part of it
+    /// after the inserts themselves.
+    ///
+    /// A `vec![0u32; n]` can be served by asking the allocator for zeroed memory,
+    /// which the OS hands over already zeroed; a `vec![u32::MAX; n]` has to be
+    /// written. If that gap is real, the sentinel could be 0 with rows stored as
+    /// `row + 1` -- a cost of one addition per lookup against a megabyte of
+    /// stores per build.
+    ///
+    /// Run with
+    /// `cargo test --release --lib zeroed_bucket_array -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn zeroed_bucket_array() {
+        use std::time::Instant;
+        const BUCKETS: usize = 262_144; // what 100k build rows ask for
+
+        let sentinel = || {
+            let t = Instant::now();
+            let v = vec![NO_ROW; BUCKETS];
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        };
+        let zeroed = || {
+            let t = Instant::now();
+            let v = vec![0u32; BUCKETS];
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        };
+        // Allocation is only half the question: the array is then written to
+        // scattered positions, and a lazily-zeroed one faults its pages in then.
+        let zeroed_then_touched = || {
+            let t = Instant::now();
+            let mut v = vec![0u32; BUCKETS];
+            let mut i = 0usize;
+            while i < BUCKETS {
+                v[i] = 1;
+                i += 16; // one write per cache line, as a scattered build would
+            }
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        };
+        let sentinel_then_touched = || {
+            let t = Instant::now();
+            let mut v = vec![NO_ROW; BUCKETS];
+            let mut i = 0usize;
+            while i < BUCKETS {
+                v[i] = 1;
+                i += 16;
+            }
+            let e = t.elapsed();
+            std::hint::black_box(&v);
+            e
+        };
+
+        let bench = |label: &str, f: &dyn Fn() -> std::time::Duration| {
+            for _ in 0..3 { f(); }
+            let best = (0..15).map(|_| f()).min().unwrap();
+            println!("  {label:>28}: {best:>9.2?}");
+            best
+        };
+
+        println!("{BUCKETS} u32 buckets (1 MB):");
+        let s = bench("filled with u32::MAX", &sentinel);
+        let z = bench("filled with 0", &zeroed);
+        let st = bench("MAX, then written", &sentinel_then_touched);
+        let zt = bench("0, then written", &zeroed_then_touched);
+        println!("  allocation alone: zeroed is {:.2}x", z.as_secs_f64() / s.as_secs_f64());
+        println!("  including the writes: {:.2}x", zt.as_secs_f64() / st.as_secs_f64());
+    }
+
     /// How many buckets per row should the join table have?
     ///
     /// `with_rows` allocates two buckets per row, so 100k build rows take a 1 MB
@@ -2514,8 +2606,8 @@ mod tests {
             let buckets = (n.max(1) * per_row).next_power_of_two();
             let mut t = IntHashTable {
                 mask: buckets - 1,
-                heads: vec![NO_ROW; buckets],
-                next: vec![NO_ROW; n],
+                heads: vec![0u32; buckets],
+                next: vec![0u32; n],
                 key_col: Arc::clone(&col),
             };
             for row in 0..n {
