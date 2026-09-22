@@ -516,6 +516,54 @@ fn splice_typed(
             ScalarValue::Float32(Some(x)) => Some(*x),
             _ => None,
         }),
+
+        // A dictionary column splices by code, not by string. Without this arm a
+        // string UPDATE fell to the general path, which reads every row as a
+        // `ScalarValue::Utf8` -- a heap allocation per row of the table, whether
+        // the row is being changed or not. Measured on 100k rows with half of
+        // them updated: 23.99ms against 2.34ms for the same UPDATE on a Float64
+        // column, so 10x, and the benchmark suite never reached it because its
+        // DML group updates a float.
+        Column::Utf8(c) => {
+            let mut dict: Vec<String> = c.dict().to_vec();
+            let mut codes: Vec<u32> = c.codes().to_vec();
+            // The dictionary is small -- distinct values, not rows -- and an
+            // UPDATE usually writes one repeated value, so this map is built once
+            // and hit thereafter.
+            let mut lookup: crate::query::hash::FastMap<String, u32> = dict
+                .iter()
+                .enumerate()
+                .map(|(i, sval)| (sval.clone(), i as u32))
+                .collect();
+
+            for (row, keep) in selected.iter().enumerate() {
+                if !keep {
+                    continue;
+                }
+                match computed.get(row) {
+                    Some(ScalarValue::Utf8(Some(sval))) => {
+                        let code = match lookup.get(sval) {
+                            Some(&code) => code,
+                            None => {
+                                let code = dict.len() as u32;
+                                dict.push(sval.clone());
+                                lookup.insert(sval.clone(), code);
+                                code
+                            }
+                        };
+                        codes[row] = code;
+                    }
+                    Some(ScalarValue::Utf8(None)) | Some(ScalarValue::Null) => {
+                        codes[row] = Utf8Column::NULL;
+                    }
+                    // Anything else means the expression did not produce a
+                    // string; the general path knows how to report that.
+                    _ => return None,
+                }
+            }
+            Some(Column::Utf8(Utf8Column::from_parts(std::sync::Arc::new(dict), codes)))
+        }
+
         _ => None,
     }
 }
@@ -793,10 +841,64 @@ mod tests {
         let mismatched = vec![ScalarValue::Utf8(Some("x".into())), ScalarValue::Int64(Some(9))];
         assert!(splice_typed(&src, &mismatched, &selected).is_none());
 
-        // Text is not a primitive dense column here.
-        let text = ColumnBuilder::utf8_from_str(vec![Some("a"), Some("b")]);
-        let text_vals = vec![ScalarValue::Utf8(Some("z".into())), ScalarValue::Utf8(Some("b".into()))];
-        assert!(splice_typed(&text, &text_vals, &selected).is_none());
+        // Boolean has no dense splice, so it still declines.
+        let flags = ColumnBuilder::boolean(vec![Some(true), Some(false)]);
+        let flag_vals = vec![ScalarValue::Boolean(Some(false)), ScalarValue::Boolean(Some(true))];
+        assert!(splice_typed(&flags, &flag_vals, &selected).is_none());
+    }
+
+    /// Text is spliced by dictionary code, and the result has to match what the
+    /// general path would have produced.
+    ///
+    /// This used to be part of `typed_splice_declines_what_it_cannot_model`:
+    /// text was on the declined list, and a string UPDATE cost 10x what the same
+    /// update on a float column cost, because the fallback reads every row of the
+    /// table as a `ScalarValue::Utf8` -- one heap allocation per row, changed or
+    /// not.
+    #[test]
+    fn typed_splice_handles_text_by_code() {
+        let selected = vec![true, false, true, false];
+        let text = ColumnBuilder::utf8_from_str(vec![Some("a"), Some("b"), Some("c"), Some("d")]);
+
+        // One value already in the dictionary, one that is not.
+        let vals = vec![
+            ScalarValue::Utf8(Some("b".into())),
+            ScalarValue::Utf8(Some("ignored".into())),
+            ScalarValue::Utf8(Some("brand new".into())),
+            ScalarValue::Utf8(Some("ignored".into())),
+        ];
+        let got = splice_typed(&text, &vals, &selected).expect("text should splice");
+        let expect = ["b", "b", "brand new", "d"];
+        for (row, want) in expect.iter().enumerate() {
+            assert_eq!(
+                got.get(row).unwrap(),
+                ScalarValue::Utf8(Some((*want).into())),
+                "row {row}",
+            );
+        }
+
+        // Writing a NULL into a column that had none must be visible as a NULL,
+        // not as whatever string the code happens to point at.
+        let to_null = vec![
+            ScalarValue::Utf8(None),
+            ScalarValue::Utf8(Some("x".into())),
+            ScalarValue::Null,
+            ScalarValue::Utf8(Some("x".into())),
+        ];
+        let got = splice_typed(&text, &to_null, &selected).expect("text should splice");
+        assert!(got.get(0).unwrap().is_null(), "row 0 should be NULL");
+        assert!(got.get(2).unwrap().is_null(), "row 2 should be NULL");
+        assert_eq!(got.get(1).unwrap(), ScalarValue::Utf8(Some("b".into())), "row 1 untouched");
+        assert_eq!(got.null_count(), 2, "and the column should know it has NULLs");
+
+        // A non-string value must still be declined rather than coerced.
+        let wrong = vec![
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Utf8(Some("x".into())),
+            ScalarValue::Utf8(Some("y".into())),
+            ScalarValue::Utf8(Some("z".into())),
+        ];
+        assert!(splice_typed(&text, &wrong, &selected).is_none());
     }
 
     fn make_table() -> Table {

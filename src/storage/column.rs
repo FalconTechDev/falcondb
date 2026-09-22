@@ -1354,7 +1354,19 @@ impl Utf8Column {
         Self { dict: Arc::clone(&self.dict), codes, has_nulls }
     }
 
-    fn from_parts(dict: Arc<Vec<String>>, codes: Vec<u32>) -> Self {
+    /// Build from a dictionary and the codes that index it.
+    ///
+    /// `has_nulls` is derived rather than taken: a column that claims to have no
+    /// NULLs while holding a `NULL` code would send `filter` and `gather_u32`
+    /// down their dense paths and emit a garbage string for that row.
+    ///
+    /// # Panics
+    /// In debug builds, if a code is neither `Self::NULL` nor a valid index.
+    pub(crate) fn from_parts(dict: Arc<Vec<String>>, codes: Vec<u32>) -> Self {
+        debug_assert!(
+            codes.iter().all(|&c| c == NULL_CODE || (c as usize) < dict.len()),
+            "every code must be NULL or index the dictionary",
+        );
         let has_nulls = codes.iter().any(|&c| c == NULL_CODE);
         Self { dict, codes, has_nulls }
     }
@@ -1382,6 +1394,9 @@ impl Utf8Column {
     pub fn get(&self, index: usize) -> Option<String> {
         self.get_str(index).map(str::to_string)
     }
+
+    /// The code that marks a NULL. Not an index into [`Utf8Column::dict`].
+    pub const NULL: u32 = NULL_CODE;
 
     /// The distinct strings, in first-seen order.
     pub fn dict(&self) -> &[String] {
