@@ -1404,32 +1404,13 @@ const SUM_LANES: usize = 8;
 /// *more* accurate, not less — it is a step toward pairwise summation.
 #[inline]
 fn sum_lanes<T: SumLane>(dense: &[T]) -> f64 {
-    // The lane count that vectorises best depends on the element type, so it
-    // cannot be one shared constant. Measured on 512 KB of each:
-    //
-    //   f64 data:  8 lanes 7.10us,  4 lanes 13.12us
-    //   i64 data:  8 lanes 24.02us, 4 lanes 18.89us
-    //
-    // Four `i64` is exactly one AVX2 register; at eight the integer loop stops
-    // vectorising and costs 3.4x what the float one does on the same bytes.
-    // Floats want the opposite -- eight lanes gives them two registers' worth of
-    // independent chains to hide the latency of `vaddpd`.
-    //
-    // `T::LANES` is a constant per instantiation, so this match folds away.
-    match T::LANES {
-        4 => sum_lanes_n::<4, T>(dense),
-        _ => sum_lanes_n::<8, T>(dense),
-    }
-}
-
-fn sum_lanes_n<const N: usize, T: SumLane>(dense: &[T]) -> f64 {
-    let mut acc = [0.0f64; N];
-    let mut chunks = dense.chunks_exact(N);
+    let mut acc = [0.0f64; SUM_LANES];
+    let mut chunks = dense.chunks_exact(SUM_LANES);
     for c in &mut chunks {
         // Indexed, not zipped. The two say the same thing and the result is
-        // bit-identical -- N independent accumulators need no reassociation, so
-        // nothing about rounding changes. The zipped form measures 7% slower on
-        // an unthrottled machine; `sum_kernel_shapes` checks both, and asserts
+        // bit-identical -- eight independent accumulators need no reassociation,
+        // so nothing about rounding changes. The zipped form measures 7% slower
+        // on an unthrottled machine; `sum_kernel_shapes` checks both and asserts
         // they agree bit for bit.
         //
         // An earlier note here said 42%. That reading was taken while the laptop
@@ -1438,8 +1419,15 @@ fn sum_lanes_n<const N: usize, T: SumLane>(dense: &[T]) -> f64 {
         // this kernel: a ratio taken inside one run is not automatically safe on
         // a machine that throttles, which is what the rest of this repo's
         // measurement notes lean on.
+        //
+        // Eight lanes for every type. Making the count depend on the element type
+        // was tried -- four `i64` is exactly one AVX2 register, and one reading
+        // showed 27% -- but repeated four times it came out 1.08x, 1.02x, 0.98x,
+        // 1.02x: nothing, and the first reading was noise. `integer_kernel_shapes`
+        // keeps both shapes so that comparison can be repeated rather than
+        // trusted.
         #[allow(clippy::needless_range_loop)]
-        for i in 0..N {
+        for i in 0..SUM_LANES {
             acc[i] += c[i].to_f64();
         }
     }
@@ -1457,31 +1445,22 @@ fn sum_lanes_n<const N: usize, T: SumLane>(dense: &[T]) -> f64 {
 /// `v as f64` did exactly this, so the trait keeps that behaviour rather than
 /// changing what SUM means on wide integers.
 trait SumLane: Copy + Sync {
-    /// Accumulator lanes that vectorise best for this element type. Measured,
-    /// not assumed -- see `sum_lanes` and `integer_kernel_shapes`. Only `i64` has
-    /// been measured at four; the other integer widths keep eight until someone
-    /// measures them.
-    const LANES: usize;
     fn to_f64(self) -> f64;
 }
 
 impl SumLane for f64 {
-    const LANES: usize = 8;
     #[inline(always)]
     fn to_f64(self) -> f64 { self }
 }
 impl SumLane for f32 {
-    const LANES: usize = 8;
     #[inline(always)]
     fn to_f64(self) -> f64 { self as f64 }
 }
 impl SumLane for i64 {
-    const LANES: usize = 4;
     #[inline(always)]
     fn to_f64(self) -> f64 { self as f64 }
 }
 impl SumLane for i32 {
-    const LANES: usize = 8;
     #[inline(always)]
     fn to_f64(self) -> f64 { self as f64 }
 }
