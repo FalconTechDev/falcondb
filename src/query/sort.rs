@@ -666,7 +666,7 @@ mod perf {
 
         // The two gathers must produce the same rows, or the faster one is moot.
         for c in 0..batch.column_count() {
-            let a = batch.column(c).gather_u32(&narrow);
+            let a = batch.column(c).gather_u32(&narrow).unwrap();
             let b = batch.column(c).filter_by_indices(&wide).unwrap();
             assert_eq!(a.len(), b.len(), "column {c}: length");
             for r in (0..a.len()).step_by(997) {
@@ -702,7 +702,7 @@ mod perf {
             "gather by u32",
             &|| {
                 for c in 0..batch.column_count() {
-                    std::hint::black_box(batch.column(c).gather_u32(&narrow));
+                    std::hint::black_box(batch.column(c).gather_u32(&narrow).unwrap());
                 }
             },
             60,

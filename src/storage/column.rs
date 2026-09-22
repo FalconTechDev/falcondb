@@ -89,6 +89,36 @@ impl Column {
         })
     }
 
+    /// Gather rows by `u32` index.
+    ///
+    /// A batch cannot hold more rows than a `u32` addresses, so sorted row
+    /// numbers arrive four bytes wide. Widening them to `usize` to reach
+    /// [`Self::filter_by_indices`] costs a pass over the indices and doubles the
+    /// array that the gather then walks alongside the column it is reading.
+    ///
+    /// `Boolean` has no narrow gather of its own and widens here instead, so this
+    /// is never worse than the `usize` path and is usually better.
+    pub fn gather_u32(&self, idx: &[u32]) -> FalconResult<Column> {
+        Ok(match self {
+            Column::Int32(c)      => Column::Int32(c.gather_u32(idx)),
+            Column::Int64(c)      => Column::Int64(c.gather_u32(idx)),
+            Column::Float32(c)    => Column::Float32(c.gather_u32(idx)),
+            Column::Float64(c)    => Column::Float64(c.gather_u32(idx)),
+            Column::Utf8(c)       => Column::Utf8(c.gather_u32(idx)),
+            Column::Date32(c)     => Column::Date32(c.gather_u32(idx)),
+            Column::Timestamp(c)  => Column::Timestamp(c.gather_u32(idx)),
+            Column::Decimal128(c) => Column::Decimal128(Decimal128Column {
+                inner:     c.inner.gather_u32(idx),
+                precision: c.precision,
+                scale:     c.scale,
+            }),
+            Column::Boolean(_) => {
+                let wide: Vec<usize> = idx.iter().map(|&i| i as usize).collect();
+                return self.filter_by_indices(&wide);
+            }
+        })
+    }
+
     /// Returns a new column containing only the rows where the boolean mask is true.
     pub fn filter_by_mask(&self, mask: &[bool]) -> FalconResult<Column> {
         let indices: Vec<usize> = mask
@@ -843,6 +873,21 @@ impl<T: Copy + Default> PrimitiveColumn<T> {
 
     pub fn gather_u32(&self, idx: &[u32]) -> Self {
         const NULL_IDX: u32 = u32::MAX;
+
+        // Nothing can be NULL on either side: a straight gather, no bitmap.
+        //
+        // `filter` has had this path for the `usize` form all along; this one did
+        // not, and checked validity and wrote a bitmap bit for every output row
+        // even when the source had no NULLs at all. That made gathering by `u32`
+        // measure 1.96x the `usize` form -- 738us against 377us over three 100k
+        // columns -- which looked like an argument against narrow indices and was
+        // really this.
+        //
+        // Scanning `idx` for the NULL marker costs one vectorisable pass over
+        // four bytes a row, against a branch and a bitmap write per row.
+        if !self.has_nulls() && !idx.iter().any(|&i| i == NULL_IDX) {
+            return Self::from_non_null(idx.iter().map(|&i| self.values[i as usize]).collect());
+        }
 
         let mut values = Vec::with_capacity(idx.len());
         let mut bits = vec![0u64; idx.len().div_ceil(64)];
