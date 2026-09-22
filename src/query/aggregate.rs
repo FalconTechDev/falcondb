@@ -1628,6 +1628,142 @@ mod sum_perf {
         );
     }
 
+    /// Three ways to accumulate a SUM over integers, against what we do now.
+    ///
+    /// Summing `i64` at four lanes is roughly 1.7x the current kernel, repeatably.
+    /// What it costs is a promise: today SUM over integers never overflows and is
+    /// silently approximate past 2^53; an `i64` accumulator is exact and overflows
+    /// past 9.2e18.
+    ///
+    /// There is a third option that is better than either, if it is fast enough.
+    /// An `i128` accumulator cannot overflow on any real input -- reaching it
+    /// needs more than 2^63 rows -- and converting the exact total to `f64` once
+    /// at the end is *more* accurate than accumulating in `f64`, which rounds on
+    /// every element. So it is exact, adds no failure mode, changes no result type
+    /// and improves the answer. The only question is what it costs, which is what
+    /// this measures.
+    ///
+    /// Run with
+    /// `cargo test --release --lib integer_accumulator_options -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn integer_accumulator_options() {
+        use std::time::Instant;
+
+        /// What production does today: widen each element, eight f64 lanes.
+        fn current(dense: &[i64]) -> f64 {
+            let mut acc = [0.0f64; 8];
+            let mut chunks = dense.chunks_exact(8);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..8 {
+                    acc[i] += c[i] as f64;
+                }
+            }
+            let mut total: f64 = acc.iter().sum();
+            for &v in chunks.remainder() {
+                total += v as f64;
+            }
+            total
+        }
+
+        /// Exact, fast, overflows past 9.2e18.
+        fn native_i64(dense: &[i64]) -> f64 {
+            let mut acc = [0i64; 4];
+            let mut chunks = dense.chunks_exact(4);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..4 {
+                    acc[i] = acc[i].wrapping_add(c[i]);
+                }
+            }
+            let mut total = acc.iter().fold(0i64, |a, &b| a.wrapping_add(b));
+            for &v in chunks.remainder() {
+                total = total.wrapping_add(v);
+            }
+            total as f64
+        }
+
+        /// Exact, and unreachable overflow: 2^127 needs more than 2^63 rows.
+        fn native_i128<const N: usize>(dense: &[i64]) -> f64 {
+            let mut acc = [0i128; N];
+            let mut chunks = dense.chunks_exact(N);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..N {
+                    acc[i] += c[i] as i128;
+                }
+            }
+            let mut total: i128 = acc.iter().sum();
+            for &v in chunks.remainder() {
+                total += v as i128;
+            }
+            total as f64
+        }
+
+        let n = 65_536;
+        let data: Vec<i64> = (0..n as i64).map(|i| i % 1_000).collect();
+
+        // Below 2^53 every option must give the same f64 bits. Above it they must
+        // not: that difference is the entire point.
+        let base = current(&data);
+        for (label, got) in [
+            ("native_i64", native_i64(&data)),
+            ("native_i128 x2", native_i128::<2>(&data)),
+            ("native_i128 x4", native_i128::<4>(&data)),
+            ("native_i128 x8", native_i128::<8>(&data)),
+        ] {
+            assert_eq!(base.to_bits(), got.to_bits(), "{label} disagrees below 2^53");
+        }
+
+        // Past 2^53 the three diverge, and it is worth being precise about how.
+        // None of them can return an exact integer: SUM yields f64, and integers
+        // above 2^53 have no f64 representation. What an exact accumulator buys is
+        // one correct rounding at the end instead of a rounding error accumulated
+        // on every element. Exactness would need SUM over integers to return i64,
+        // which is a different change from this one.
+        let big: Vec<i64> = (0..8).map(|i| (1i64 << 53) + i).collect();
+        let exact: i128 = big.iter().map(|&v| v as i128).sum();
+        let correctly_rounded = exact as f64;
+        assert_eq!(
+            native_i128::<4>(&big).to_bits(),
+            correctly_rounded.to_bits(),
+            "an exact accumulator should give the correctly rounded total",
+        );
+        assert_ne!(
+            current(&big).to_bits(),
+            correctly_rounded.to_bits(),
+            "the current kernel is expected to drift from it past 2^53",
+        );
+        println!(
+            "past 2^53: exact {exact}, correctly rounded {correctly_rounded:.0},              current kernel {:.0}",
+            current(&big),
+        );
+
+        let bench = |label: &str, f: &dyn Fn(&[i64]) -> f64| {
+            for _ in 0..5 { std::hint::black_box(f(&data)); }
+            let reps = 2_000u32;
+            let t = Instant::now();
+            for _ in 0..reps { std::hint::black_box(f(&data)); }
+            let per = t.elapsed() / reps;
+            println!(
+                "  {label:>18}: {per:>9.2?} = {:.1} GB/s",
+                (n * 8) as f64 / per.as_secs_f64() / 1e9,
+            );
+            per
+        };
+
+        println!("SUM over {n} i64, 512 KB:");
+        let cur = bench("current (f64 x8)", &current);
+        let i64_ = bench("i64 x4", &native_i64);
+        let i128_2 = bench("i128 x2", &native_i128::<2>);
+        let i128_4 = bench("i128 x4", &native_i128::<4>);
+        let i128_8 = bench("i128 x8", &native_i128::<8>);
+        let best_i128 = *[i128_2, i128_4, i128_8].iter().min().unwrap();
+        println!("  i64  is {:.2}x current", i64_.as_secs_f64() / cur.as_secs_f64());
+        println!("  i128 is {:.2}x current (best lane count)", best_i128.as_secs_f64() / cur.as_secs_f64());
+    }
+
     /// Why is summing integers slower than summing floats?
     ///
     /// The same lane kernel runs at 49.0 GB/s over `f64` and 35.4 GB/s over
