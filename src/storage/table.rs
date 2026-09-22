@@ -5,9 +5,25 @@ use rayon::prelude::*;
 
 /// Minimum total rows before concatenating columns in parallel is worth a rayon
 /// hand-off. Below this the copy is short enough that scheduling costs more.
-/// Measured at 262_144 on a machine reporting 20 threads, so ~13.1k each.
+///
+/// This was 262_144 and that was far too high -- it declined to parallelise the
+/// whole range where doing so pays. The parallelism here is over *columns*, not
+/// rows, so a handful of tasks each copying a column; measured on three columns
+/// in two batches:
+///
+///     5_000 rows   5.17x  (rayon overhead against a 3us copy)
+///    20_000 rows   0.70x
+///    50_000 rows   0.76x
+///   100_000 rows   0.78x
+///   300_000 rows   0.55x
+///
+/// The crossover sits between 5k and 20k, so 20k, divided by the thread count in
+/// keeping with the rest of `query::tuning` -- though note the work here scales
+/// with column count rather than thread count, so that division is a convention
+/// rather than a model. A single batch never reaches this: `RecordBatch::concat`
+/// returns a clone before it gets here.
 fn par_concat_rows() -> usize {
-    crate::query::tuning::par_min_rows(13_107)
+    crate::query::tuning::par_min_rows(1_000)
 }
 
 use super::{

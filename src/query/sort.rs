@@ -736,8 +736,8 @@ mod perf {
     fn merge_parallel_columns() {
         use rayon::prelude::*;
         use std::time::Instant;
-        const ROWS: usize = 100_000;
         const BATCH: usize = 65_536;
+        for &ROWS in &[5_000usize, 20_000, 50_000, 100_000, 300_000] {
 
         let schema = Schema::new(vec![
             Field::required("id", DataType::Int64),
@@ -767,7 +767,7 @@ mod perf {
             );
             start += n;
         }
-        assert_eq!(batches.len(), 2);
+        // 5k fits one batch; the rest take two or more.
 
         let n_cols = schema.fields.len();
         let concat_col = |ci: usize| {
@@ -804,10 +804,12 @@ mod perf {
         for _ in 0..3 { serial(); parallel(); }
         let s = (0..15).map(|_| serial()).min().unwrap();
         let p = (0..15).map(|_| parallel()).min().unwrap();
-        println!("merging {ROWS} rows, {n_cols} columns, 2 batches:");
-        println!("  one column at a time = {s:?}");
-        println!("  columns in parallel  = {p:?}");
-        println!("  parallel is {:.2}x", p.as_secs_f64() / s.as_secs_f64());
+        println!(
+            "  {ROWS:>7} rows, {} batches: serial {s:>9.2?}  parallel {p:>9.2?}  {:.2}x",
+            batches.len(),
+            p.as_secs_f64() / s.as_secs_f64(),
+        );
+        }
     }
 
     /// Should the sorted indices stay `u32` all the way to the gather?
