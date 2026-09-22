@@ -1719,6 +1719,27 @@ mod sum_perf {
             }
         }
 
+        /// `i64` lanes with the overflow actually checked, which is what an engine
+        /// that reports overflow instead of wrapping would have to do.
+        fn checked_i64(dense: &[i64]) -> Option<f64> {
+            let mut acc = [0i64; 4];
+            let mut chunks = dense.chunks_exact(4);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..4 {
+                    acc[i] = acc[i].checked_add(c[i])?;
+                }
+            }
+            let mut total = 0i64;
+            for &a in &acc {
+                total = total.checked_add(a)?;
+            }
+            for &v in chunks.remainder() {
+                total = total.checked_add(v)?;
+            }
+            Some(total as f64)
+        }
+
         /// Exact, and unreachable overflow: 2^127 needs more than 2^63 rows.
         fn native_i128<const N: usize>(dense: &[i64]) -> f64 {
             let mut acc = [0i128; N];
@@ -1793,6 +1814,7 @@ mod sum_perf {
         let cur = bench("current (f64 x8)", &current);
         let i64_ = bench("i64 x4", &native_i64);
         let guarded = bench("i64 x4 + guard", &|d| guarded_i64(d).unwrap_or(0.0));
+        let checked = bench("i64 x4 checked", &|d| checked_i64(d).unwrap_or(0.0));
         let i128_2 = bench("i128 x2", &native_i128::<2>);
         let i128_4 = bench("i128 x4", &native_i128::<4>);
         let i128_8 = bench("i128 x8", &native_i128::<8>);
@@ -1800,6 +1822,9 @@ mod sum_perf {
         println!("  i64  is {:.2}x current", i64_.as_secs_f64() / cur.as_secs_f64());
         println!("  i128 is {:.2}x current (best lane count)", best_i128.as_secs_f64() / cur.as_secs_f64());
         println!("  i64+guard is {:.2}x current", guarded.as_secs_f64() / cur.as_secs_f64());
+        println!("  i64 checked is {:.2}x current", checked.as_secs_f64() / cur.as_secs_f64());
+        assert_eq!(checked_i64(&data).unwrap().to_bits(), base.to_bits());
+        assert!(checked_i64(&vec![i64::MAX; 4]).is_none(), "checked must refuse this");
 
         // The guard has to actually fire when it should.
         let huge = vec![i64::MAX / 2; 8];
