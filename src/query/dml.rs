@@ -1101,6 +1101,66 @@ mod tests {
         assert!(splice_typed(&flags, &flag_vals, &selected).is_none());
     }
 
+    /// The in-place update must agree with the general path, and decline
+    /// everything it does not model.
+    #[test]
+    fn in_place_update_matches_the_general_path() {
+        use crate::query::expr::{BinaryOp, Expr};
+
+        let selected = vec![true, false, true, false];
+        let src = ColumnBuilder::float64(vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)]);
+        let col = |name: &str| Box::new(Expr::Column(name.into()));
+        let lit = |v: f64| Box::new(Expr::Literal(ScalarValue::Float64(Some(v))));
+
+        for (op, apply) in [
+            (BinaryOp::Add, (|a: f64, b: f64| a + b) as fn(f64, f64) -> f64),
+            (BinaryOp::Sub, |a, b| a - b),
+            (BinaryOp::Mul, |a, b| a * b),
+            (BinaryOp::Div, |a, b| a / b),
+        ] {
+            let expr = Expr::BinaryOp { left: col("x"), op: op.clone(), right: lit(2.0) };
+            let got = update_in_place_f64(&src, "x", &expr, &selected)
+                .unwrap_or_else(|| panic!("{op:?} should apply in place"));
+            for row in 0..4 {
+                let before = src.get(row).unwrap().as_f64().unwrap();
+                let want = if selected[row] { apply(before, 2.0) } else { before };
+                assert_eq!(
+                    got.get(row).unwrap().as_f64().unwrap(),
+                    want,
+                    "{op:?} row {row}",
+                );
+            }
+        }
+
+        // A different column on the right is not this shape: the value has to be
+        // read from elsewhere, so there is nothing to do in place.
+        let other = Expr::BinaryOp { left: col("y"), op: BinaryOp::Add, right: lit(1.0) };
+        assert!(update_in_place_f64(&src, "x", &other, &selected).is_none());
+
+        // `1 + x` is the same arithmetic but not the shape this recognises, and
+        // it must decline rather than silently compute `x + 1` -- which would be
+        // wrong for Sub and Div.
+        let flipped = Expr::BinaryOp {
+            left: lit(1.0),
+            op: BinaryOp::Sub,
+            right: col("x"),
+        };
+        assert!(update_in_place_f64(&src, "x", &flipped, &selected).is_none());
+
+        // A source with NULLs: writing into a dense copy would lose them.
+        let nullable = ColumnBuilder::float64(vec![None, Some(2.0), Some(3.0), Some(4.0)]);
+        let add = Expr::BinaryOp { left: col("x"), op: BinaryOp::Add, right: lit(1.0) };
+        assert!(update_in_place_f64(&nullable, "x", &add, &selected).is_none());
+
+        // Not arithmetic.
+        let cmp = Expr::BinaryOp { left: col("x"), op: BinaryOp::Gt, right: lit(1.0) };
+        assert!(update_in_place_f64(&src, "x", &cmp, &selected).is_none());
+
+        // Not a Float64 column.
+        let ints = ColumnBuilder::int64(vec![Some(1), Some(2), Some(3), Some(4)]);
+        assert!(update_in_place_f64(&ints, "x", &add, &selected).is_none());
+    }
+
     /// The constant splice must agree with the general path, value for value.
     ///
     /// It is tried first for `SET col = <literal>`, which is the common shape,
