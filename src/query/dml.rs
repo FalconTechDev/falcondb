@@ -714,11 +714,16 @@ mod merge_perf {
     /// `Float64`, which the fast path takes. So a string update is untested for
     /// speed as well as unoptimised.
     ///
-    /// Measured before the Utf8 arm existed: 23.99ms against 2.34ms, so 10.3x.
-    /// After it: 8.14-8.27ms, so 3.6x. What is left is not the splice -- it is
-    /// `eval_batch`, which returns a `ScalarValue` per row even when the
-    /// expression is the constant `'x'`, so a string constant is cloned once per
-    /// row of the table before the splice ever sees it.
+    /// Three readings on the same test, as the two fixes landed:
+    ///
+    /// ```text
+    ///   no Utf8 splice, no constant path   23.99ms   10.3x the float
+    ///   Utf8 splice                         8.14ms    3.6x
+    ///   constant path as well               1.61ms    0.7x
+    /// ```
+    ///
+    /// The string update now beats the float one, because the float case here is
+    /// `score = score + 1` -- not a constant, so it still evaluates per row.
     ///
     /// Run with
     /// `cargo test --release --lib update_by_column_type -- --ignored --nocapture`.
@@ -946,6 +951,56 @@ mod tests {
         let flags = ColumnBuilder::boolean(vec![Some(true), Some(false)]);
         let flag_vals = vec![ScalarValue::Boolean(Some(false)), ScalarValue::Boolean(Some(true))];
         assert!(splice_typed(&flags, &flag_vals, &selected).is_none());
+    }
+
+    /// The constant splice must agree with the general path, value for value.
+    ///
+    /// It is tried first for `SET col = <literal>`, which is the common shape,
+    /// and it skips materialising the literal once per row. Every case it accepts
+    /// has to produce what the row-by-row path produced, and every case it cannot
+    /// model has to be declined rather than approximated.
+    #[test]
+    fn constant_splice_matches_the_general_path() {
+        let selected = vec![true, false, true, false];
+
+        // Text: a value already in the dictionary, and one that is not.
+        let text = ColumnBuilder::utf8_from_str(vec![Some("a"), Some("b"), Some("c"), Some("d")]);
+        for (label, val, want) in [
+            ("existing dict entry", "b", ["b", "b", "b", "d"]),
+            ("new dict entry", "zzz", ["zzz", "b", "zzz", "d"]),
+        ] {
+            let got = splice_constant(&text, &ScalarValue::Utf8(Some(val.into())), &selected)
+                .unwrap_or_else(|| panic!("{label} should splice"));
+            for (row, expect) in want.iter().enumerate() {
+                assert_eq!(
+                    got.get(row).unwrap(),
+                    ScalarValue::Utf8(Some((*expect).into())),
+                    "{label}, row {row}",
+                );
+            }
+        }
+
+        // Numbers, against what the row-by-row form produces for the same input.
+        let nums = ColumnBuilder::int64(vec![Some(1), Some(2), Some(3), Some(4)]);
+        let one = ScalarValue::Int64(Some(99));
+        let per_row = vec![one.clone(), one.clone(), one.clone(), one.clone()];
+        let fast = splice_constant(&nums, &one, &selected).expect("int should splice");
+        let slow = splice_typed(&nums, &per_row, &selected).expect("int should splice");
+        for row in 0..4 {
+            assert_eq!(fast.get(row).unwrap(), slow.get(row).unwrap(), "row {row}");
+        }
+
+        // NULL changes the column's validity; the dense forms do not model that.
+        assert!(splice_constant(&nums, &ScalarValue::Int64(None), &selected).is_none());
+        assert!(splice_constant(&text, &ScalarValue::Null, &selected).is_none());
+
+        // A source that already has NULLs, for the same reason.
+        let nullable = ColumnBuilder::int64(vec![None, Some(2), Some(3), Some(4)]);
+        assert!(splice_constant(&nullable, &one, &selected).is_none());
+
+        // A constant of the wrong type must be declined, not coerced.
+        assert!(splice_constant(&nums, &ScalarValue::Utf8(Some("x".into())), &selected).is_none());
+        assert!(splice_constant(&text, &ScalarValue::Int64(Some(1)), &selected).is_none());
     }
 
     /// Text is spliced by dictionary code, and the result has to match what the
