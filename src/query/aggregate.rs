@@ -1627,6 +1627,113 @@ mod sum_perf {
         );
     }
 
+    /// Why is summing integers slower than summing floats?
+    ///
+    /// The same lane kernel runs at 49.0 GB/s over `f64` and 35.4 GB/s over
+    /// `i64`, and a variant that accumulates in `i64` and converts nothing is no
+    /// better at 34.6. So it is neither the widening nor the accumulator type,
+    /// and both are eight bytes a row, so it is not bandwidth either. That leaves
+    /// how the loop is being compiled.
+    ///
+    /// These variants change one thing each: the lane count (AVX2 holds four
+    /// `i64`, so eight lanes is two registers and four is one), and whether the
+    /// widening happens per element or once per lane at the end.
+    ///
+    /// Run with
+    /// `cargo test --release --lib integer_kernel_shapes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn integer_kernel_shapes() {
+        use std::time::Instant;
+
+        /// Four lanes: one AVX2 register's worth.
+        fn lanes4(dense: &[i64]) -> f64 {
+            let mut acc = [0i64; 4];
+            let mut chunks = dense.chunks_exact(4);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..4 {
+                    acc[i] = acc[i].wrapping_add(c[i]);
+                }
+            }
+            let mut total = acc.iter().fold(0i64, |a, &b| a.wrapping_add(b));
+            for &v in chunks.remainder() {
+                total = total.wrapping_add(v);
+            }
+            total as f64
+        }
+
+        /// Sixteen lanes: four registers, more independent chains to hide latency.
+        fn lanes16(dense: &[i64]) -> f64 {
+            let mut acc = [0i64; 16];
+            let mut chunks = dense.chunks_exact(16);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..16 {
+                    acc[i] = acc[i].wrapping_add(c[i]);
+                }
+            }
+            let mut total = acc.iter().fold(0i64, |a, &b| a.wrapping_add(b));
+            for &v in chunks.remainder() {
+                total = total.wrapping_add(v);
+            }
+            total as f64
+        }
+
+        /// Widen per element into f64 lanes, as production does, but four-wide.
+        fn widen4(dense: &[i64]) -> f64 {
+            let mut acc = [0.0f64; 4];
+            let mut chunks = dense.chunks_exact(4);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..4 {
+                    acc[i] += c[i] as f64;
+                }
+            }
+            let mut total: f64 = acc.iter().sum();
+            for &v in chunks.remainder() {
+                total += v as f64;
+            }
+            total
+        }
+
+        let n = 65_536;
+        let data: Vec<i64> = (0..n as i64).map(|i| i % 1_000).collect();
+        let fdata: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+
+        // Every integer variant must agree exactly with the current one. They
+        // differ only in grouping, and these magnitudes are far below 2^53, so
+        // "agree" means the same f64 bits.
+        let base = sum_lanes(&data);
+        for (label, got) in [("lanes4", lanes4(&data)), ("lanes16", lanes16(&data)), ("widen4", widen4(&data))] {
+            assert_eq!(base.to_bits(), got.to_bits(), "{label} changed the result");
+        }
+
+        let bench = |label: &str, f: &dyn Fn() -> f64| {
+            for _ in 0..5 { std::hint::black_box(f()); }
+            let reps = 2_000u32;
+            let t = Instant::now();
+            for _ in 0..reps { std::hint::black_box(f()); }
+            let per = t.elapsed() / reps;
+            println!(
+                "  {label:>22}: {per:>9.2?} = {:.1} GB/s",
+                (n * 8) as f64 / per.as_secs_f64() / 1e9,
+            );
+            per
+        };
+
+        println!("summing {n} values, 512 KB either way:");
+        let fref = bench("f64 data (reference)", &|| sum_lanes(&fdata));
+        let cur  = bench("i64, current", &|| sum_lanes(&data));
+        let l4   = bench("i64, 4 lanes", &|| lanes4(&data));
+        let l16  = bench("i64, 16 lanes", &|| lanes16(&data));
+        let w4   = bench("i64, widen 4 lanes", &|| widen4(&data));
+        println!(
+            "  best integer variant reaches {:.0}% of the float reference",
+            fref.as_secs_f64() / [cur, l4, l16, w4].iter().min().unwrap().as_secs_f64() * 100.0,
+        );
+    }
+
     /// How much of `SELECT SUM(id)` is not the sum?
     ///
     /// `SUM(id)/100k` measures 23.1 us in the benchmark, against Polars' 14.6 us.
