@@ -159,7 +159,7 @@ fn try_typed_sort(
     sort_exprs: &[SortExpr],
     limit:      Option<usize>,
 ) -> FalconResult<Option<Vec<u32>>> {
-    use crate::storage::column::Column;
+    use crate::storage::column::{Column, Utf8Column};
 
     // Row numbers are `u32` throughout the typed path. A batch with more rows
     // than that cannot be addressed by it, so hand those to the general path.
@@ -241,6 +241,59 @@ fn try_typed_sort(
         Column::Float32(c)   => float_typed!(c, f32, u32, f32_ord_key),
         Column::Date32(c)    => typed!(c, i32),
         Column::Timestamp(c) => typed!(c, i64),
+
+        // A dictionary column sorts by rank, not by string.
+        //
+        // Without this, ordering by a text column fell to the generic path: a
+        // `ScalarValue` per row -- a heap-allocated `String` each -- and then
+        // string comparisons all the way through the sort. Measured over 100k
+        // rows, `ORDER BY dept DESC` took 11.45ms against 1.89ms for the same
+        // sort on a `Float64` column, so 6.1x.
+        //
+        // The ordering of the codes only has to be decided once, and the
+        // dictionary holds distinct values rather than rows -- five entries for
+        // the column above, against a hundred thousand rows. After that this is
+        // the integer sort the numeric arms already do, on pairs that are half
+        // the size of the float ones: `(u32, u32)` is eight bytes where
+        // `(u64, u32)` is sixteen.
+        //
+        // Worst case is a column where every value is distinct, and then sorting
+        // the dictionary is the same work as sorting the rows would have been --
+        // but done once, on strings that are already deduplicated, rather than
+        // repeatedly inside a comparison sort.
+        Column::Utf8(c) => {
+            let dict = c.dict();
+            let mut order: Vec<u32> = (0..dict.len() as u32).collect();
+            order.sort_unstable_by(|&a, &b| dict[a as usize].cmp(&dict[b as usize]));
+            let mut rank = vec![0u32; dict.len()];
+            for (position, &code) in order.iter().enumerate() {
+                rank[code as usize] = position as u32;
+            }
+
+            let codes = c.codes();
+            let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(codes.len());
+            let mut nulls: Vec<usize> = Vec::new();
+            // Flip the rank's bits for DESC so the sort is always ascending,
+            // exactly as the float arms do with their ordering keys.
+            let key = |r: u32| if desc { !r } else { r };
+            if c.has_nulls() {
+                for (row, &code) in codes.iter().enumerate() {
+                    if Utf8Column::is_null_code(code) {
+                        nulls.push(row);
+                    } else {
+                        pairs.push((key(rank[code as usize]), row as u32));
+                    }
+                }
+            } else {
+                pairs.extend(
+                    codes.iter().enumerate().map(|(row, &code)| {
+                        (key(rank[code as usize]), row as u32)
+                    }),
+                );
+            }
+            sort_pairs_ord(&mut pairs);
+            Some(assemble(pairs, nulls, s.nulls_last, limit))
+        }
         // Utf8 keys would mean cloning or borrowing strings per row; Decimal128
         // and Boolean are rare enough as sort keys not to be worth a second path.
         _ => None,
@@ -488,6 +541,124 @@ fn compare_scalar(a: &ScalarValue, b: &ScalarValue, nulls_last: bool) -> std::cm
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod utf8_sort {
+    use super::*;
+    use crate::storage::{
+        column::ColumnBuilder,
+        schema::{Field, Schema},
+        types::DataType,
+    };
+
+    fn batch(values: Vec<Option<&str>>) -> RecordBatch {
+        RecordBatch::new(
+            Schema::new(vec![Field::nullable("s", DataType::Utf8)]),
+            vec![ColumnBuilder::utf8_from_str(values)],
+        )
+        .unwrap()
+    }
+
+    fn sorted(values: Vec<Option<&str>>, by: SortExpr) -> Vec<Option<String>> {
+        let b = batch(values);
+        let out = execute_sort(std::slice::from_ref(&b), &[by]).unwrap();
+        let col = out.column(0);
+        (0..out.row_count())
+            .map(|r| match col.get(r).unwrap() {
+                ScalarValue::Utf8(s) => s,
+                ScalarValue::Null => None,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Sorting a dictionary column by rank must order it by string.
+    ///
+    /// The ranks come from sorting the dictionary, which is in first-seen order,
+    /// so a column whose values appear out of order is the case that catches a
+    /// rank table built the wrong way round.
+    #[test]
+    fn orders_by_string_not_by_dictionary_position() {
+        let vals = vec![Some("pear"), Some("apple"), Some("fig"), Some("apple")];
+        assert_eq!(
+            sorted(vals.clone(), SortExpr::asc(Expr::Column("s".into()))),
+            vec![
+                Some("apple".to_string()),
+                Some("apple".to_string()),
+                Some("fig".to_string()),
+                Some("pear".to_string()),
+            ],
+        );
+        assert_eq!(
+            sorted(vals, SortExpr::desc(Expr::Column("s".into()))),
+            vec![
+                Some("pear".to_string()),
+                Some("fig".to_string()),
+                Some("apple".to_string()),
+                Some("apple".to_string()),
+            ],
+        );
+    }
+
+    /// NULLs are not in the dictionary and have to be placed, not ranked.
+    #[test]
+    fn places_nulls_rather_than_ranking_them() {
+        let vals = vec![Some("b"), None, Some("a"), None];
+
+        // `asc` puts them first, `asc_nulls_last` at the end.
+        assert_eq!(
+            sorted(vals.clone(), SortExpr::asc(Expr::Column("s".into()))),
+            vec![None, None, Some("a".to_string()), Some("b".to_string())],
+        );
+        assert_eq!(
+            sorted(vals.clone(), SortExpr::asc_nulls_last(Expr::Column("s".into()))),
+            vec![Some("a".to_string()), Some("b".to_string()), None, None],
+        );
+        // `desc` is nulls-last by construction.
+        assert_eq!(
+            sorted(vals, SortExpr::desc(Expr::Column("s".into()))),
+            vec![Some("b".to_string()), Some("a".to_string()), None, None],
+        );
+    }
+
+    /// Equal strings keep their original row order, as every other type does.
+    #[test]
+    fn equal_strings_keep_row_order() {
+        let b = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("s", DataType::Utf8),
+                Field::required("id", DataType::Int64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(vec![Some("x"), Some("x"), Some("x"), Some("x")]),
+                ColumnBuilder::int64(vec![Some(10), Some(20), Some(30), Some(40)]),
+            ],
+        )
+        .unwrap();
+        for by in [
+            SortExpr::asc(Expr::Column("s".into())),
+            SortExpr::desc(Expr::Column("s".into())),
+        ] {
+            let out = execute_sort(std::slice::from_ref(&b), &[by]).unwrap();
+            let ids: Vec<i64> = (0..out.row_count())
+                .map(|r| out.column(1).get(r).unwrap().as_i64().unwrap())
+                .collect();
+            assert_eq!(ids, vec![10, 20, 30, 40], "ties must not be reordered");
+        }
+    }
+
+    /// Every value distinct is the worst case for ranking, and still has to be
+    /// right: the dictionary is then as large as the column.
+    #[test]
+    fn handles_an_all_distinct_column() {
+        let owned: Vec<String> = (0..64).map(|i| format!("{:03}", (i * 37) % 64)).collect();
+        let vals: Vec<Option<&str>> = owned.iter().map(|s| Some(s.as_str())).collect();
+        let got = sorted(vals, SortExpr::asc(Expr::Column("s".into())));
+        let mut want: Vec<Option<String>> = owned.iter().map(|s| Some(s.clone())).collect();
+        want.sort();
+        assert_eq!(got, want);
+    }
+}
+
+#[cfg(test)]
 mod perf {
     use super::*;
     use crate::storage::{
@@ -705,6 +876,67 @@ mod perf {
         let b = time("asking is_valid per row", &branching);
         let d = time("dense path", &dense_path);
         println!("  dense is {:.2}x the branching form", d.as_secs_f64() / b.as_secs_f64());
+    }
+
+    /// What does `ORDER BY` cost on a column the typed sort does not cover?
+    ///
+    /// `try_typed_sort` handles `Int64`, `Int32`, `Float64`, `Float32`, `Date32`
+    /// and `Timestamp`. `Utf8` is not among them, so sorting by a string column
+    /// falls to the generic path: a `ScalarValue` per row -- a heap-allocated
+    /// `String` each -- and then string comparisons all the way through the sort.
+    ///
+    /// The column is dictionary-encoded, so the ordering of its *codes* can be
+    /// decided once by sorting the dictionary, which holds distinct values rather
+    /// than rows. After that the sort is the same integer sort the numeric path
+    /// already does.
+    ///
+    /// The benchmark suite sorts `score`, a `Float64`, so it never measures this.
+    ///
+    /// Run with
+    /// `cargo test --release --lib order_by_column_type -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn order_by_column_type() {
+        use std::time::Instant;
+        const ROWS: usize = 100_000;
+
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("score", DataType::Float64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS)
+                        .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5]))
+                        .collect(),
+                ),
+                ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 100) as f64)).collect()),
+            ],
+        )
+        .unwrap();
+
+        let time = |label: &str, column: &str| {
+            let exprs = vec![SortExpr::desc(Expr::Column(column.into()))];
+            let run = || {
+                let out = execute_sort(std::slice::from_ref(&batch), &exprs).unwrap();
+                assert_eq!(out.row_count(), ROWS);
+            };
+            for _ in 0..3 { run(); }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..9 {
+                let t = Instant::now();
+                run();
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>32}: {best:>9.2?}");
+            best
+        };
+
+        println!("ORDER BY DESC over {ROWS} rows:");
+        let f = time("score (Float64, typed sort)", "score");
+        let u = time("dept (Utf8, ScalarValue path)", "dept");
+        println!("  the string column costs {:.1}x the float one", u.as_secs_f64() / f.as_secs_f64());
     }
 
     /// Is the pre-sort merge worth spreading over cores at this size?
