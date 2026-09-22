@@ -1627,6 +1627,94 @@ mod sum_perf {
         );
     }
 
+    /// How much of `SELECT SUM(id)` is not the sum?
+    ///
+    /// `SUM(id)/100k` measures 23.1 us in the benchmark, against Polars' 14.6 us.
+    /// The summation kernel does 100k rows in 9.4 us on this machine -- faster than
+    /// Polars' whole query -- so most of that number is something other than
+    /// adding numbers up, and the kernel is the wrong thing to optimise.
+    ///
+    /// Split by asking a question that walks the same path and sums nothing:
+    /// `COUNT(*)` parses, plans, resolves columns and visits the batches, then
+    /// takes its answer from metadata. The gap between the two queries is the
+    /// summation; `COUNT(*)` on its own is everything else.
+    ///
+    /// Run with
+    /// `cargo test --release --lib sum_query_overhead -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sum_query_overhead() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        for &rows in &[10_000usize, 100_000, 1_000_000] {
+            // Batched the way a Parquet load batches, so the per-batch costs are
+            // the ones the benchmark actually pays.
+            const BATCH: usize = 65_536;
+            let schema = Schema::new(vec![Field::required("id", DataType::Int64)]);
+            let mut batches = Vec::new();
+            let mut start = 0;
+            while start < rows {
+                let n = BATCH.min(rows - start);
+                batches.push(
+                    RecordBatch::new(
+                        schema.clone(),
+                        vec![ColumnBuilder::int64(
+                            (0..n).map(|i| Some((start + i) as i64)).collect(),
+                        )],
+                    )
+                    .unwrap(),
+                );
+                start += n;
+            }
+            let n_batches = batches.len();
+            let db = Database::in_memory();
+            db.create_table_from_batches("bench", batches).unwrap();
+
+            let time = |sql: &str| -> std::time::Duration {
+                for _ in 0..5 {
+                    std::hint::black_box(db.sql(sql).unwrap());
+                }
+                let reps = (2_000_000 / rows).max(20) as u32;
+                let t = Instant::now();
+                for _ in 0..reps {
+                    std::hint::black_box(db.sql(sql).unwrap());
+                }
+                t.elapsed() / reps
+            };
+
+            let sum = time("SELECT SUM(id) AS s FROM bench");
+            let count = time("SELECT COUNT(*) AS n FROM bench");
+            let kernel = {
+                let dense: Vec<i64> = (0..rows as i64).collect();
+                for _ in 0..5 {
+                    std::hint::black_box(sum_lanes(&dense));
+                }
+                let reps = (5_000_000 / rows).max(20) as u32;
+                let t = Instant::now();
+                for _ in 0..reps {
+                    std::hint::black_box(sum_lanes(&dense));
+                }
+                t.elapsed() / reps
+            };
+
+            println!("SELECT SUM(id), {rows} rows in {n_batches} batch(es):");
+            println!("  whole query      = {sum:?}");
+            println!("  COUNT(*) instead = {count:?}   (same path, no summation)");
+            println!("  the kernel alone = {kernel:?}");
+            println!(
+                "  so {:.0}% of the query is not the sum",
+                count.as_secs_f64() / sum.as_secs_f64() * 100.0,
+            );
+        }
+    }
+
     /// Where does a parallel SUM start paying, and is the serial kernel already
     /// at its limit?
     ///
@@ -1677,7 +1765,7 @@ mod sum_perf {
         // serial numbers non-monotonic -- rayon's workers are still spinning down
         // when the next serial call starts, so alternating penalised one side.
         println!("
-serial vs parallel (blocked, min of 15):");
+serial vs parallel (mean of a repetition block):");
         for &n in &[50_000usize, 100_000, 150_000, 178_000, 300_000, 600_000, 1_000_000] {
             let data: Vec<f64> = (0..n).map(|i| (i % 1000) as f64).collect();
             assert!(
@@ -1685,22 +1773,21 @@ serial vs parallel (blocked, min of 15):");
                 "serial and parallel sums disagree at {n}",
             );
 
+            // Timed in blocks of repetitions rather than as a minimum over single
+            // calls. One call here is 10-30 us, close enough to this machine's
+            // noise that a minimum over fifteen of them still came out
+            // non-monotonic -- 150k measured slower than 178k on the same kernel,
+            // which cannot happen. Averaging a block of a hundred moves the
+            // measurement well clear of the noise.
+            let reps = (5_000_000 / n).max(20) as u32;
             for _ in 0..5 { std::hint::black_box(sum_lanes(&data)); }
-            let mut sv = Vec::new();
-            for _ in 0..15 {
-                let t = Instant::now();
-                std::hint::black_box(sum_lanes(&data));
-                sv.push(t.elapsed());
-            }
+            let t = Instant::now();
+            for _ in 0..reps { std::hint::black_box(sum_lanes(&data)); }
+            let sm = t.elapsed() / reps;
             for _ in 0..5 { std::hint::black_box(par_sum_lanes(&data)); }
-            let mut pv = Vec::new();
-            for _ in 0..15 {
-                let t = Instant::now();
-                std::hint::black_box(par_sum_lanes(&data));
-                pv.push(t.elapsed());
-            }
-            let sm = *sv.iter().min().unwrap();
-            let pm = *pv.iter().min().unwrap();
+            let t = Instant::now();
+            for _ in 0..reps { std::hint::black_box(par_sum_lanes(&data)); }
+            let pm = t.elapsed() / reps;
             let gb = |d: std::time::Duration| (n * 8) as f64 / d.as_secs_f64() / 1e9;
             println!(
                 "  {n:>9} rows: serial {sm:>9.2?} ({:>5.1} GB/s)  parallel {pm:>9.2?} ({:>5.1} GB/s)  {:.2}x",
