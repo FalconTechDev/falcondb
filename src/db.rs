@@ -2062,40 +2062,21 @@ fn table_from_batches(name: &str, batches: Vec<RecordBatch>) -> FalconResult<Tab
     Ok(table)
 }
 
-/// Keep only the rows where `mask[i] == true`.
+/// Keep only the rows where `mask[i] == true`, or `None` if that is no rows.
+///
+/// Delegates to [`RecordBatch::filter_by_mask`]. What stood here was a private
+/// copy that pushed every cell through a `ScalarValue` and then guessed at the
+/// output type: `Int32` came back as `Int64`, `Float32` as `Float64`, and
+/// `Date32`, `Timestamp` and `Decimal128` all fell through to `Int64`. It kept
+/// the original schema while doing so, so the batch it returned described itself
+/// incorrectly -- `from_shared` checks lengths, not types.
+///
+/// That is a correctness bug rather than a slow path, and it was reachable: this
+/// is the dedup step of a `UNION`-distinct recursive CTE, so any such query over
+/// a date, timestamp or decimal column was quietly changing their type.
 fn filter_batch_by_mask(batch: &RecordBatch, mask: &[bool]) -> Option<RecordBatch> {
-    let indices: Vec<usize> = mask.iter().enumerate()
-        .filter_map(|(i, &keep)| if keep { Some(i) } else { None })
-        .collect();
-    if indices.is_empty() { return None; }
-    let columns: Vec<_> = batch.columns.iter().map(|col| {
-        use crate::storage::column::Column;
-        use crate::storage::types::ScalarValue;
-        let vals: Vec<_> = indices.iter().map(|&r| col.get(r).unwrap_or(ScalarValue::Null)).collect();
-        std::sync::Arc::new(match col.as_ref() {
-            Column::Int64(_) | Column::Int32(_) =>
-                Column::Int64(crate::storage::column::PrimitiveColumn::new(
-                    vals.iter().map(|v| v.as_i64()).collect()
-                )),
-            Column::Float64(_) | Column::Float32(_) =>
-                Column::Float64(crate::storage::column::PrimitiveColumn::new(
-                    vals.iter().map(|v| v.as_f64()).collect()
-                )),
-            Column::Utf8(_) =>
-                Column::Utf8(crate::storage::column::Utf8Column::new(
-                    vals.iter().map(|v| match v { ScalarValue::Utf8(s) => s.clone(), _ => None }).collect()
-                )),
-            Column::Boolean(_) =>
-                Column::Boolean(crate::storage::column::BooleanColumn::new(
-                    vals.iter().map(|v| v.as_bool()).collect()
-                )),
-            _ =>
-                Column::Int64(crate::storage::column::PrimitiveColumn::new(
-                    vals.iter().map(|v| v.as_i64()).collect()
-                )),
-        })
-    }).collect();
-    RecordBatch::from_shared(batch.schema.clone(), columns).ok()
+    let kept = batch.filter_by_mask(mask).ok()?;
+    (kept.row_count() > 0).then_some(kept)
 }
 
 /// Replace every `Expr::Subquery` with the scalar it evaluates to.

@@ -187,7 +187,7 @@ pub fn execute_delete(
     }
 
     let returning = if need_returning && !deleted_batches.is_empty() {
-        let merged = merge_batches_simple(&deleted_batches, table)?;
+        let merged = merge_batches_simple(&deleted_batches)?;
         if is_wildcard_returning(&stmt.returning) {
             Some(merged)
         } else {
@@ -309,7 +309,7 @@ pub fn execute_update(
     }
 
     let returning = if need_returning && !updated_batches.is_empty() {
-        let merged = merge_batches_simple(&updated_batches, table)?;
+        let merged = merge_batches_simple(&updated_batches)?;
         if is_wildcard_returning(&stmt.returning) {
             Some(merged)
         } else {
@@ -520,28 +520,22 @@ fn splice_typed(
     }
 }
 
-fn merge_batches_simple(batches: &[RecordBatch], table: &Table) -> FalconResult<RecordBatch> {
-    if batches.len() == 1 {
-        return Ok(batches[0].clone());
-    }
-    let schema = &table.schema;
-    let total = batches.iter().map(|b| b.row_count()).sum::<usize>();
-    let mut per_col: Vec<Vec<ScalarValue>> = (0..schema.field_count())
-        .map(|_| Vec::with_capacity(total))
-        .collect();
-    for batch in batches {
-        for row in 0..batch.row_count() {
-            for col in 0..schema.field_count() {
-                per_col[col].push(batch.column(col).get(row)?);
-            }
-        }
-    }
-    let columns: FalconResult<Vec<Column>> = per_col
-        .iter()
-        .enumerate()
-        .map(|(i, vals)| scalars_to_column(vals, &schema.fields[i].data_type))
-        .collect();
-    RecordBatch::new(schema.clone(), columns?)
+/// Concatenate the batches a DML statement is returning.
+///
+/// Delegates to [`RecordBatch::concat`]. What stood here was a third private
+/// copy of the merge, and the worst of them: it pushed every cell through a
+/// `ScalarValue`, which is an enum allocation per value, and then rebuilt each
+/// column from that. O(rows x columns) boxing for what the shared version does
+/// as a memcpy per column.
+///
+/// That exact shape once made this engine's joins 100x slower than they needed
+/// to be, and nothing caught it because the copy was *correct*. It was still
+/// here, on the path `UPDATE ... RETURNING` and `DELETE ... RETURNING` take.
+///
+/// The `table` argument is gone with it: `RecordBatch::concat` takes the schema
+/// from the batches, which is where it came from in the first place.
+fn merge_batches_simple(batches: &[RecordBatch]) -> FalconResult<RecordBatch> {
+    RecordBatch::concat(batches)
 }
 
 /// True when `returning` is a single `RETURNING *` wildcard sentinel.

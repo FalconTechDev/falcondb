@@ -1,7 +1,6 @@
 use rayon::prelude::*;
 
 use crate::storage::{
-    column::Column,
     table::RecordBatch,
     types::{FalconResult, ScalarValue},
 };
