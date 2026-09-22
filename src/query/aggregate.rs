@@ -1407,16 +1407,24 @@ fn sum_lanes<T: SumLane>(dense: &[T]) -> f64 {
     let mut acc = [0.0f64; SUM_LANES];
     let mut chunks = dense.chunks_exact(SUM_LANES);
     for c in &mut chunks {
-        // Indexed, not zipped. The two say the same thing, and the result is
+        // Indexed, not zipped. The two say the same thing and the result is
         // bit-identical -- eight independent accumulators need no reassociation,
-        // so nothing about rounding changes. But the zipped form measured
-        // 25.0 GB/s against 42.8 GB/s for this one on data sitting in L2, a 42%
-        // difference on the kernel underneath every SUM, AVG, COUNT and the
-        // fused filter+sum. `sum_kernel_shapes` measures the two, and asserts
-        // they agree bit for bit.
+        // so nothing about rounding changes. On an unthrottled machine the
+        // indexed form measures 82.2 GB/s against 76.3 for the zipped one: 7%,
+        // on the kernel underneath every SUM, AVG, COUNT and the fused
+        // filter+sum. `sum_kernel_shapes` measures both and asserts they agree
+        // bit for bit.
+        //
+        // The first measurement of this said 42%, and it was wrong. It was taken
+        // while the laptop was throttled, and the two shapes do not degrade
+        // alike -- the same comparison read 0.58x throttled and 0.93x clean.
+        // Worth knowing beyond this one kernel: a *ratio* taken inside a single
+        // run is not automatically safe on a machine that throttles, which is
+        // the assumption the rest of this repo's measurement notes lean on. Two
+        // things bound by different resources will separate under a clock change.
         //
         // Eight named accumulators, which looks like the version most likely to
-        // stay in registers, measured 15.3 GB/s -- worse than either.
+        // stay in registers, measures 50.5 GB/s -- worse than either.
         #[allow(clippy::needless_range_loop)]
         for i in 0..SUM_LANES {
             acc[i] += c[i].to_f64();
@@ -1482,6 +1490,25 @@ mod sum_perf {
     #[ignore]
     fn sum_kernel_shapes() {
         use std::time::Instant;
+
+        /// The shape this kernel had before: iterator pair over both arrays.
+        /// Kept so the comparison can still be made now that production uses the
+        /// indexed form -- otherwise "current" and "indexed" are the same code and
+        /// the measurement compares nothing.
+        fn zipped(dense: &[f64]) -> f64 {
+            let mut acc = [0.0f64; 8];
+            let mut chunks = dense.chunks_exact(8);
+            for c in &mut chunks {
+                for (a, &v) in acc.iter_mut().zip(c.iter()) {
+                    *a += v;
+                }
+            }
+            let mut total: f64 = acc.iter().sum();
+            for &v in chunks.remainder() {
+                total += v;
+            }
+            total
+        }
 
         /// Indexed rather than zipped, in case the iterator pair obscures the
         /// fixed length.
@@ -1553,6 +1580,7 @@ mod sum_perf {
         // and is not a drop-in replacement.
         let base = sum_lanes(&data);
         for (label, got) in [
+            ("zipped", zipped(&data)),
             ("indexed", indexed(&data)),
             ("named", named(&data)),
             ("wide", wide(&data)),
@@ -1580,10 +1608,15 @@ mod sum_perf {
 
         println!("sum kernel shapes, {n} f64 in L2:");
         let cur = bench("current", &|d| sum_lanes(d));
+        let zip = bench("zipped", &zipped);
         let idx = bench("indexed", &indexed);
         let nam = bench("named", &named);
         let wid = bench("wide", &wide);
-        let best = [("indexed", idx), ("named", nam), ("wide", wid)]
+        println!(
+            "  indexed is {:.2}x zipped, the shape this kernel used to have",
+            idx.as_secs_f64() / zip.as_secs_f64(),
+        );
+        let best = [("zipped", zip), ("indexed", idx), ("named", nam), ("wide", wid)]
             .into_iter()
             .min_by_key(|(_, d)| *d)
             .unwrap();
