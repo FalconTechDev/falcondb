@@ -40,29 +40,29 @@ reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `SUM(score)` | 10 k | **1.4 µs** | 8.5 µs | 210 µs | 1.53 ms |
-| | 100 k | **8.7 µs** | 19.9 µs | 387 µs | 1.71 ms |
-| | 1 M | **61.2 µs** | 158 µs | 496 µs | 2.83 ms |
-| `SUM(id)` (integer) | 10 k | **2.9 µs** | 7.3 µs | 232 µs | 1.94 ms |
-| | 100 k | 23.1 µs | **14.6 µs** | 329 µs | 2.68 ms |
-| | 1 M | **79.4 µs** | 171 µs | 485 µs | 12.2 ms |
-| `WHERE score > 50` | 10 k | **19.8 µs** | 51.1 µs | 593 µs | 1.21 ms |
-| | 100 k | **133 µs** | 171 µs | 3.85 ms | 2.73 ms |
-| | 1 M | **652 µs** | 2.10 ms | 24.3 ms | 17.2 ms |
+| `SUM(score)` | 10 k | **1.4 µs** | 8.3 µs | 239 µs | 1.29 ms |
+| | 100 k | **8.8 µs** | 19.2 µs | 365 µs | 1.20 ms |
+| | 1 M | **61.5 µs** | 162 µs | 498 µs | 2.63 ms |
+| `SUM(id)` (integer) | 10 k | **2.6 µs** | 7.4 µs | 221 µs | 1.68 ms |
+| | 100 k | 21.0 µs | **14.7 µs** | 356 µs | 2.45 ms |
+| | 1 M | **77.0 µs** | 172 µs | 492 µs | 14.1 ms |
+| `WHERE score > 50` | 10 k | **19.5 µs** | 51.1 µs | 594 µs | 1.27 ms |
+| | 100 k | **126 µs** | 191 µs | 3.89 ms | 2.82 ms |
+| | 1 M | **730 µs** | 2.43 ms | 23.8 ms | 17.1 ms |
 
 ### Grouping, sorting, pipelines
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `GROUP BY` + 3 aggregates | 10 k | **34.1 µs** | 255 µs | 1.98 ms | 1.60 ms |
-| | 100 k | **98.2 µs** | 1.16 ms | 3.94 ms | 2.23 ms |
-| | 1 M | **669 µs** | 9.61 ms | 6.89 ms | 7.31 ms |
-| `ORDER BY score DESC` | 10 k | **241 µs** | 286 µs | 1.81 ms | 1.02 ms |
-| | 100 k | 1.77 ms | **1.38 ms** | 15.4 ms | 6.48 ms |
-| `DISTINCT` | 100 k | **592 µs** | 648 µs | 2.48 ms | 1.31 ms |
-| | 1 M | **2.39 ms** | 5.84 ms | 3.81 ms | 3.06 ms |
-| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **27.3 µs** | 276 µs | 1.85 ms | 1.54 ms |
-| | 100 k | **90.7 µs** | 1.22 ms | 3.75 ms | 2.11 ms |
+| `GROUP BY` + 3 aggregates | 10 k | **38.2 µs** | 251 µs | 1.89 ms | 1.61 ms |
+| | 100 k | **96.4 µs** | 1.16 ms | 3.55 ms | 2.22 ms |
+| | 1 M | **635 µs** | 9.79 ms | 6.73 ms | 7.23 ms |
+| `ORDER BY score DESC` | 10 k | **239 µs** | 274 µs | 1.89 ms | 947 µs |
+| | 100 k | 1.69 ms | **1.34 ms** | 15.7 ms | 6.57 ms |
+| `DISTINCT` | 100 k | **548 µs** | 617 µs | 2.28 ms | 1.33 ms |
+| | 1 M | **2.14 ms** | 5.84 ms | 4.03 ms | 3.10 ms |
+| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **23.3 µs** | 271 µs | 1.69 ms | 1.56 ms |
+| | 100 k | **90.2 µs** | 1.21 ms | 3.65 ms | 2.07 ms |
 
 ### Joins, window functions, DML
 
@@ -73,14 +73,14 @@ used to make — see [Methodology](#methodology).
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `INNER JOIN` | 100 k | **331 µs** | 422 µs | 1.94 ms | 3.88 ms |
-| | 1 M | 3.54 ms | **2.67 ms** | 7.96 ms | 16.5 ms |
-| `LEFT JOIN` | 100 k | **709 µs** | — | 2.51 ms | 4.07 ms |
-| `SEMI JOIN` (`EXISTS`) | 100 k | **674 µs** | — | 2.53 ms | 4.04 ms |
-| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **948 µs** | — | 2.54 ms | 4.31 ms |
-| `ROW_NUMBER() OVER` | 100 k | **4.14 ms** | — | 11.6 ms | 5.37 ms |
-| `UPDATE` (half the rows) | 100 k | **1.80 ms** | — | 3.62 ms | — |
-| `DELETE` (half the rows) | 100 k | **887 µs** | — | 2.58 ms | — |
+| `INNER JOIN` | 100 k | **310 µs** | 427 µs | 1.89 ms | 3.86 ms |
+| | 1 M | 3.38 ms | **2.63 ms** | 8.40 ms | 16.8 ms |
+| `LEFT JOIN` | 100 k | **648 µs** | — | 2.40 ms | 4.17 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **623 µs** | — | 2.47 ms | 4.09 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **916 µs** | — | 2.46 ms | 4.19 ms |
+| `ROW_NUMBER() OVER` | 100 k | **3.67 ms** | — | 11.6 ms | 6.21 ms |
+| `UPDATE` (half the rows) | 100 k | **1.76 ms** | — | 3.59 ms | — |
+| `DELETE` (half the rows) | 100 k | **931 µs** | — | 2.71 ms | — |
 
 ### Where FalconDB is behind
 
@@ -89,28 +89,32 @@ DataFusion in all of them. The exceptions are all against Polars:
 
 | | FalconDB | Polars | |
 |---|---|---|---|
-| `SUM(id)` 100 k | 23.1 µs | 14.6 µs | 1.6× |
-| `INNER JOIN` 1 M | 3.54 ms | 2.67 ms | 1.3× |
-| `ORDER BY` 100 k | 1.77 ms | 1.38 ms | 1.3× |
+| `SUM(id)` 100 k | 21.0 µs | 14.7 µs | 1.4× |
+| `INNER JOIN` 1 M | 3.38 ms | 2.63 ms | 1.3× |
+| `ORDER BY` 100 k | 1.69 ms | 1.34 ms | 1.3× |
 
-`INNER JOIN` at 1 M was 2.4× behind until the probe stopped concatenating the
-left side and the output moved to one allocation per column; at 100 k the same
-work turned a loss into a 1.3× win. `ORDER BY` was 1.4× behind before its radix
-sort was replaced by the standard library's.
+All three have narrowed, and the rivals held still while they did — Polars,
+DuckDB and DataFusion all measure within a few percent of the previous run, so
+the movement is ours.
 
-What is left of the join gap is the build and the probe. Of a 4.4 ms 1 M-row
-join, building the hash table is about 1.0 ms on one thread while the probe uses
-every core. Two ways of parallelising it were tried and both measured slower,
-the second after removing the first one's algorithmic flaw — which is what
-established that the build is not compute-bound at all but spends its time
-allocating and filling ~2.2 MB per join. See `IntHashTable::build_parallel` and
-`build_radix`, kept behind `cfg(test)` with the numbers.
+Most of it came from one shape of defect, found twice in an hour: a code path
+that handles NULLs, running over columns that have none, with no cheap check to
+skip the handling. `Column::gather_u32` tested validity and wrote a bitmap bit
+per output row -- the path every LEFT, SEMI and ANTI join builds its output
+through. Extracting sort keys asked the same question of every row. Both now
+check once. `PrimitiveColumn::filter` had always done so, which is how they
+became visible: the comparison was against a sibling that already did it right.
 
-`SUM(id)` at 100 k is one core against several: the aggregate threshold is 178k
-rows, measured, and below it a serial sum is genuinely faster than a parallel
-one here. Polars reaches 54 GB/s on 800 KB, which is more than one core gets
-from L2 on this machine, so it is not doing the same thing. Whether to lower the
-threshold for integer sums specifically has not been measured.
+What is left of the join gap is the build and the probe, not the plumbing. Of a
+1 M-row join, building the hash table is about 1.0 ms on one thread while the
+probe uses every core. Three ways of parallelising or shrinking it were measured
+and rejected -- see `IntHashTable::build_parallel`, `build_radix` and
+`bucket_density` -- which is how it became clear the build is bound by memory it
+has to touch once, not by work that can be spread.
+
+`SUM(id)` at 100 k runs on one core because the measured aggregate threshold is
+178k rows and a serial sum really is faster below it. Polars reaches 54 GB/s on
+800 KB, more than one core gets from L2 here, so it is not doing the same thing.
 
 ### How much room is actually left
 
