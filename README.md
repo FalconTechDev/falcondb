@@ -118,16 +118,32 @@ threshold for integer sums specifically has not been measured.
 `tests/diag_bandwidth.rs` measures the floor directly: summing `f64` at working
 sets that sit in L2, in L3 and past L3.
 
-| working set | throughput |
-|---|---|
-| 0.1 MB (L2) | 30.5 GB/s — *one* thread does 50.4; splitting costs more than it saves |
-| 8 MB (L3) | **144.9 GB/s** |
-| 256 MB (DRAM) | 57.2 GB/s |
+| working set | one thread | all threads |
+|---|---|---|
+| 0.1 MB (L2) | 50–101 GB/s | 8.6–30.5 GB/s — splitting costs more than it saves |
+| 8 MB (L3) | 37–39 GB/s | 104–145 GB/s |
+| 256 MB (DRAM) | 8.8–16.4 GB/s | **26–57 GB/s** |
 
-A 1 M-row `f64` column is 8 MB, which fits this CPU's 24 MB L3 — so that scan
-never touches DRAM, and the floor for it is **55 µs**. FalconDB takes 109 µs, so
-roughly **half the time is not the data movement**. Polars, at 165 µs, is three
-times off the same floor: everyone is far from the ceiling here, FalconDB least so.
+Those are ranges because on this laptop they are not constants. Four
+back-to-back runs of the same diagnostic read 40.8, 40.6, 25.9 and 31.3 GB/s
+from DRAM, and the L3 figure fell monotonically across them — 130.5, 125.6,
+107.7, 103.9 — while a single-threaded, cache-resident kernel measured at its
+best the whole time. Sustained multi-core traffic appears to spend a power
+budget that the memory side gives up before the cores do; the machine is cool to
+the touch throughout.
+
+So the "ceiling" moves by up to 2× depending on what the machine has been doing
+for the last few minutes. Two things follow, and the second is the one that
+matters:
+
+- A 1 M-row `f64` column is 8 MB and fits this CPU's 24 MB L3, so that scan
+  never touches DRAM. Its floor is 55–77 µs depending on which reading you take.
+  FalconDB measures 61 µs, which lands inside that band — near the floor on a
+  good reading, at it on a bad one.
+- Any statement of the form "we are N× off the hardware limit" is worth less
+  here than it looks, including the ones this file used to make. The limit was
+  quoted as 144.9 GB/s from a single reading; it is a range, and the range is
+  wide enough to change the conclusion.
 
 This only applies to sequential reads. `GROUP BY`, joins and sorts are bound by
 random-access latency instead, and that ceiling has not been measured — quoting
