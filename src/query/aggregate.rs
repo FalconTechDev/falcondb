@@ -1684,6 +1684,41 @@ mod sum_perf {
             total as f64
         }
 
+        /// `i64` lanes plus a bound that says whether they could have overflowed.
+        ///
+        /// The largest magnitude seen, times the row count, bounds the true sum.
+        /// If that product fits in `i64` the accumulation cannot have overflowed,
+        /// and the answer stands; if it might, the caller re-sums in `f64` and
+        /// gets exactly today's behaviour. Conservative -- it can send a sum that
+        /// would have been fine down the slow path -- but never wrong, and it
+        /// introduces no failure mode that callers do not already have.
+        ///
+        /// `max` over integers vectorises the same way the adds do, so this is one
+        /// more instruction per lane rather than a second pass.
+        fn guarded_i64(dense: &[i64]) -> Option<f64> {
+            let mut acc = [0i64; 4];
+            let mut peak = [0i64; 4];
+            let mut chunks = dense.chunks_exact(4);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..4 {
+                    acc[i] = acc[i].wrapping_add(c[i]);
+                    peak[i] = peak[i].max(c[i].saturating_abs());
+                }
+            }
+            let mut total = acc.iter().fold(0i64, |a, &b| a.wrapping_add(b));
+            let mut hi = peak.iter().copied().max().unwrap_or(0);
+            for &v in chunks.remainder() {
+                total = total.wrapping_add(v);
+                hi = hi.max(v.saturating_abs());
+            }
+            // Could the true total have left i64's range?
+            match hi.checked_mul(dense.len() as i64) {
+                Some(_) => Some(total as f64),
+                None => None,
+            }
+        }
+
         /// Exact, and unreachable overflow: 2^127 needs more than 2^63 rows.
         fn native_i128<const N: usize>(dense: &[i64]) -> f64 {
             let mut acc = [0i128; N];
@@ -1709,6 +1744,7 @@ mod sum_perf {
         let base = current(&data);
         for (label, got) in [
             ("native_i64", native_i64(&data)),
+            ("guarded_i64", guarded_i64(&data).expect("no overflow possible here")),
             ("native_i128 x2", native_i128::<2>(&data)),
             ("native_i128 x4", native_i128::<4>(&data)),
             ("native_i128 x8", native_i128::<8>(&data)),
@@ -1756,12 +1792,18 @@ mod sum_perf {
         println!("SUM over {n} i64, 512 KB:");
         let cur = bench("current (f64 x8)", &current);
         let i64_ = bench("i64 x4", &native_i64);
+        let guarded = bench("i64 x4 + guard", &|d| guarded_i64(d).unwrap_or(0.0));
         let i128_2 = bench("i128 x2", &native_i128::<2>);
         let i128_4 = bench("i128 x4", &native_i128::<4>);
         let i128_8 = bench("i128 x8", &native_i128::<8>);
         let best_i128 = *[i128_2, i128_4, i128_8].iter().min().unwrap();
         println!("  i64  is {:.2}x current", i64_.as_secs_f64() / cur.as_secs_f64());
         println!("  i128 is {:.2}x current (best lane count)", best_i128.as_secs_f64() / cur.as_secs_f64());
+        println!("  i64+guard is {:.2}x current", guarded.as_secs_f64() / cur.as_secs_f64());
+
+        // The guard has to actually fire when it should.
+        let huge = vec![i64::MAX / 2; 8];
+        assert!(guarded_i64(&huge).is_none(), "the guard should refuse this");
     }
 
     /// Why is summing integers slower than summing floats?
