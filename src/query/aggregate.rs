@@ -1404,29 +1404,42 @@ const SUM_LANES: usize = 8;
 /// *more* accurate, not less — it is a step toward pairwise summation.
 #[inline]
 fn sum_lanes<T: SumLane>(dense: &[T]) -> f64 {
-    let mut acc = [0.0f64; SUM_LANES];
-    let mut chunks = dense.chunks_exact(SUM_LANES);
+    // The lane count that vectorises best depends on the element type, so it
+    // cannot be one shared constant. Measured on 512 KB of each:
+    //
+    //   f64 data:  8 lanes 7.10us,  4 lanes 13.12us
+    //   i64 data:  8 lanes 24.02us, 4 lanes 18.89us
+    //
+    // Four `i64` is exactly one AVX2 register; at eight the integer loop stops
+    // vectorising and costs 3.4x what the float one does on the same bytes.
+    // Floats want the opposite -- eight lanes gives them two registers' worth of
+    // independent chains to hide the latency of `vaddpd`.
+    //
+    // `T::LANES` is a constant per instantiation, so this match folds away.
+    match T::LANES {
+        4 => sum_lanes_n::<4, T>(dense),
+        _ => sum_lanes_n::<8, T>(dense),
+    }
+}
+
+fn sum_lanes_n<const N: usize, T: SumLane>(dense: &[T]) -> f64 {
+    let mut acc = [0.0f64; N];
+    let mut chunks = dense.chunks_exact(N);
     for c in &mut chunks {
         // Indexed, not zipped. The two say the same thing and the result is
-        // bit-identical -- eight independent accumulators need no reassociation,
-        // so nothing about rounding changes. On an unthrottled machine the
-        // indexed form measures 82.2 GB/s against 76.3 for the zipped one: 7%,
-        // on the kernel underneath every SUM, AVG, COUNT and the fused
-        // filter+sum. `sum_kernel_shapes` measures both and asserts they agree
-        // bit for bit.
+        // bit-identical -- N independent accumulators need no reassociation, so
+        // nothing about rounding changes. The zipped form measures 7% slower on
+        // an unthrottled machine; `sum_kernel_shapes` checks both, and asserts
+        // they agree bit for bit.
         //
-        // The first measurement of this said 42%, and it was wrong. It was taken
-        // while the laptop was throttled, and the two shapes do not degrade
-        // alike -- the same comparison read 0.58x throttled and 0.93x clean.
-        // Worth knowing beyond this one kernel: a *ratio* taken inside a single
-        // run is not automatically safe on a machine that throttles, which is
-        // the assumption the rest of this repo's measurement notes lean on. Two
-        // things bound by different resources will separate under a clock change.
-        //
-        // Eight named accumulators, which looks like the version most likely to
-        // stay in registers, measures 50.5 GB/s -- worse than either.
+        // An earlier note here said 42%. That reading was taken while the laptop
+        // was throttled, and the two shapes do not degrade alike -- the same
+        // comparison reads 0.58x throttled and 0.93x clean. Worth knowing beyond
+        // this kernel: a ratio taken inside one run is not automatically safe on
+        // a machine that throttles, which is what the rest of this repo's
+        // measurement notes lean on.
         #[allow(clippy::needless_range_loop)]
-        for i in 0..SUM_LANES {
+        for i in 0..N {
             acc[i] += c[i].to_f64();
         }
     }
@@ -1444,22 +1457,31 @@ fn sum_lanes<T: SumLane>(dense: &[T]) -> f64 {
 /// `v as f64` did exactly this, so the trait keeps that behaviour rather than
 /// changing what SUM means on wide integers.
 trait SumLane: Copy + Sync {
+    /// Accumulator lanes that vectorise best for this element type. Measured,
+    /// not assumed -- see `sum_lanes` and `integer_kernel_shapes`. Only `i64` has
+    /// been measured at four; the other integer widths keep eight until someone
+    /// measures them.
+    const LANES: usize;
     fn to_f64(self) -> f64;
 }
 
 impl SumLane for f64 {
+    const LANES: usize = 8;
     #[inline(always)]
     fn to_f64(self) -> f64 { self }
 }
 impl SumLane for f32 {
+    const LANES: usize = 8;
     #[inline(always)]
     fn to_f64(self) -> f64 { self as f64 }
 }
 impl SumLane for i64 {
+    const LANES: usize = 4;
     #[inline(always)]
     fn to_f64(self) -> f64 { self as f64 }
 }
 impl SumLane for i32 {
+    const LANES: usize = 8;
     #[inline(always)]
     fn to_f64(self) -> f64 { self as f64 }
 }
@@ -1680,6 +1702,24 @@ mod sum_perf {
             total as f64
         }
 
+        /// The float path at four lanes. `SUM_LANES` is shared by both types, so
+        /// a change there has to be measured on floats too.
+        fn f64_lanes4(dense: &[f64]) -> f64 {
+            let mut acc = [0.0f64; 4];
+            let mut chunks = dense.chunks_exact(4);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..4 {
+                    acc[i] += c[i];
+                }
+            }
+            let mut total: f64 = acc.iter().sum();
+            for &v in chunks.remainder() {
+                total += v;
+            }
+            total
+        }
+
         /// Widen per element into f64 lanes, as production does, but four-wide.
         fn widen4(dense: &[i64]) -> f64 {
             let mut acc = [0.0f64; 4];
@@ -1704,6 +1744,10 @@ mod sum_perf {
         // Every integer variant must agree exactly with the current one. They
         // differ only in grouping, and these magnitudes are far below 2^53, so
         // "agree" means the same f64 bits.
+        assert!(
+            (f64_lanes4(&fdata) - sum_lanes(&fdata)).abs() < 1e-6,
+            "four and eight float lanes disagree beyond rounding",
+        );
         let base = sum_lanes(&data);
         for (label, got) in [("lanes4", lanes4(&data)), ("lanes16", lanes16(&data)), ("widen4", widen4(&data))] {
             assert_eq!(base.to_bits(), got.to_bits(), "{label} changed the result");
@@ -1723,11 +1767,16 @@ mod sum_perf {
         };
 
         println!("summing {n} values, 512 KB either way:");
-        let fref = bench("f64 data (reference)", &|| sum_lanes(&fdata));
+        let fref = bench("f64 data, 8 lanes", &|| sum_lanes(&fdata));
+        let f4   = bench("f64 data, 4 lanes", &|| f64_lanes4(&fdata));
         let cur  = bench("i64, current", &|| sum_lanes(&data));
         let l4   = bench("i64, 4 lanes", &|| lanes4(&data));
         let l16  = bench("i64, 16 lanes", &|| lanes16(&data));
         let w4   = bench("i64, widen 4 lanes", &|| widen4(&data));
+        println!(
+            "  f64 at 4 lanes is {:.2}x f64 at 8",
+            f4.as_secs_f64() / fref.as_secs_f64(),
+        );
         println!(
             "  best integer variant reaches {:.0}% of the float reference",
             fref.as_secs_f64() / [cur, l4, l16, w4].iter().min().unwrap().as_secs_f64() * 100.0,
