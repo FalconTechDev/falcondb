@@ -551,6 +551,111 @@ pub fn empty_like(name: &str, schema: &Schema) -> Table {
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod merge_perf {
+    use super::*;
+    use crate::storage::{
+        column::ColumnBuilder,
+        schema::{Field, Schema},
+        types::DataType,
+    };
+    use std::time::Instant;
+
+    /// What the `ScalarValue` merge cost the RETURNING path.
+    ///
+    /// `merge_batches_simple` used to rebuild every column by pushing each cell
+    /// through a `ScalarValue` -- an enum allocation per value -- and this stayed
+    /// in place long after the same shape was found and fixed in the join, where
+    /// it had made joins 100x slower.
+    ///
+    /// The benchmark suite never covered it: its DML group runs `UPDATE` and
+    /// `DELETE` without `RETURNING`, and the merge only happens when rows are
+    /// returned. So the speedup has to be measured here or not at all.
+    ///
+    /// Run with
+    /// `cargo test --release --lib returning_merge_shapes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn returning_merge_shapes() {
+        const ROWS: usize = 100_000;
+        const BATCH: usize = 65_536;
+
+        let schema = Schema::new(vec![
+            Field::required("id", DataType::Int64),
+            Field::required("dept", DataType::Utf8),
+            Field::required("score", DataType::Float64),
+        ]);
+        let mut batches = Vec::new();
+        let mut start = 0;
+        while start < ROWS {
+            let n = BATCH.min(ROWS - start);
+            batches.push(
+                RecordBatch::new(
+                    schema.clone(),
+                    vec![
+                        ColumnBuilder::int64((0..n).map(|i| Some((start + i) as i64)).collect()),
+                        ColumnBuilder::utf8_from_str(
+                            (0..n)
+                                .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][(start + i) % 5]))
+                                .collect(),
+                        ),
+                        ColumnBuilder::float64(
+                            (0..n).map(|i| Some(((start + i) % 100) as f64 + 0.5)).collect(),
+                        ),
+                    ],
+                )
+                .unwrap(),
+            );
+            start += n;
+        }
+
+        /// The shape that was here: every cell through a ScalarValue.
+        fn boxed(batches: &[RecordBatch], schema: &Schema) -> FalconResult<RecordBatch> {
+            let total = batches.iter().map(|b| b.row_count()).sum::<usize>();
+            let mut per_col: Vec<Vec<ScalarValue>> = (0..schema.field_count())
+                .map(|_| Vec::with_capacity(total))
+                .collect();
+            for batch in batches {
+                for row in 0..batch.row_count() {
+                    for col in 0..schema.field_count() {
+                        per_col[col].push(batch.column(col).get(row)?);
+                    }
+                }
+            }
+            let columns: FalconResult<Vec<Column>> = per_col
+                .iter()
+                .enumerate()
+                .map(|(i, vals)| scalars_to_column(vals, &schema.fields[i].data_type))
+                .collect();
+            RecordBatch::new(schema.clone(), columns?)
+        }
+
+        // Both must produce the same rows; the old one was correct, only slow.
+        let a = RecordBatch::concat(&batches).unwrap();
+        let b = boxed(&batches, &schema).unwrap();
+        assert_eq!(a.row_count(), b.row_count());
+        for c in 0..a.column_count() {
+            for r in (0..a.row_count()).step_by(4999) {
+                assert_eq!(a.column(c).get(r).unwrap(), b.column(c).get(r).unwrap(), "col {c} row {r}");
+            }
+        }
+
+        let bench = |label: &str, f: &dyn Fn() -> RecordBatch| {
+            for _ in 0..3 { std::hint::black_box(f()); }
+            let t = Instant::now();
+            for _ in 0..20 { std::hint::black_box(f()); }
+            let per = t.elapsed() / 20;
+            println!("  {label:>24}: {per:>9.2?}");
+            per
+        };
+
+        println!("merging {ROWS} rows, 3 columns, for RETURNING:");
+        let old = bench("via ScalarValue", &|| boxed(&batches, &schema).unwrap());
+        let new = bench("typed concat", &|| RecordBatch::concat(&batches).unwrap());
+        println!("  typed is {:.2}x the boxed merge", new.as_secs_f64() / old.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
