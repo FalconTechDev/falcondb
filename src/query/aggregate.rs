@@ -1817,8 +1817,18 @@ mod sum_perf {
             total as f64
         }
 
+        // Two shapes. The benchmark's `id` column is 0..n, so its values reach a
+        // million and its running total reaches 5e9; the other is small values
+        // that never let the total grow. If a checked accumulator behaves
+        // differently on the two, that is worth knowing before drawing a
+        // conclusion from either.
         let n = 65_536;
-        let data: Vec<i64> = (0..n as i64).map(|i| i % 1_000).collect();
+        for (shape, data) in [
+            ("small values (i % 1000)", (0..n as i64).map(|i| i % 1_000).collect::<Vec<i64>>()),
+            ("the benchmark's column (0..n)", (0..n as i64).collect::<Vec<i64>>()),
+        ] {
+        println!("
+--- {shape} ---");
 
         // Below 2^53 every option must give the same f64 bits. Above it they must
         // not: that difference is the entire point.
@@ -1885,6 +1895,7 @@ mod sum_perf {
         println!("  i64 checked is {:.2}x current", checked.as_secs_f64() / cur.as_secs_f64());
         assert_eq!(checked_i64(&data).unwrap().to_bits(), base.to_bits());
         assert!(checked_i64(&vec![i64::MAX; 4]).is_none(), "checked must refuse this");
+        }
 
         // The guard has to actually fire when it should.
         let huge = vec![i64::MAX / 2; 8];
