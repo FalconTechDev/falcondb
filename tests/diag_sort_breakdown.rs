@@ -60,7 +60,11 @@ fn build_batches(rows: usize, batch_rows: usize) -> Vec<RecordBatch> {
 #[test]
 fn sort_time_against_merge_time() {
     const ROWS: usize = 100_000;
-    const BATCH: usize = 1024;
+    // What the Parquet reader produces. This said 1024 for a long time, which is
+    // what the reader used to produce; at 100k rows that is 98 batches against
+    // the 2 the benchmark actually has, and the merge it measured was not the
+    // merge the benchmark pays.
+    const BATCH: usize = 65_536;
     let batches = build_batches(ROWS, BATCH);
 
     // `merge_batches` short-circuits to a clone when handed a single batch, so

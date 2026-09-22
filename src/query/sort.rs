@@ -718,6 +718,98 @@ mod perf {
         println!("  dense is {:.2}x the branching form", d.as_secs_f64() / b.as_secs_f64());
     }
 
+    /// Is the pre-sort merge worth spreading over cores at this size?
+    ///
+    /// `execute_sort` concatenates its input into one batch before sorting, and
+    /// that merge is 22-25% of a 100k-row ORDER BY even with only two batches --
+    /// a full copy of every column before any comparison happens.
+    ///
+    /// `RecordBatch::concat` can copy columns in parallel, but only above
+    /// `par_concat_rows()`, which is 262k on this machine. At 100k it copies three
+    /// columns one after another. Three columns is three tasks, which is not much
+    /// parallelism, but it is free if it wins.
+    ///
+    /// Run with
+    /// `cargo test --release --lib merge_parallel_columns -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn merge_parallel_columns() {
+        use rayon::prelude::*;
+        use std::time::Instant;
+        const ROWS: usize = 100_000;
+        const BATCH: usize = 65_536;
+
+        let schema = Schema::new(vec![
+            Field::required("id", DataType::Int64),
+            Field::required("dept", DataType::Utf8),
+            Field::required("score", DataType::Float64),
+        ]);
+        let mut batches = Vec::new();
+        let mut start = 0;
+        while start < ROWS {
+            let n = BATCH.min(ROWS - start);
+            batches.push(
+                RecordBatch::new(
+                    schema.clone(),
+                    vec![
+                        ColumnBuilder::int64((0..n).map(|i| Some((start + i) as i64)).collect()),
+                        ColumnBuilder::utf8_from_str(
+                            (0..n)
+                                .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][(start + i) % 5]))
+                                .collect(),
+                        ),
+                        ColumnBuilder::float64(
+                            (0..n).map(|i| Some(((start + i) % 100) as f64 + 0.5)).collect(),
+                        ),
+                    ],
+                )
+                .unwrap(),
+            );
+            start += n;
+        }
+        assert_eq!(batches.len(), 2);
+
+        let n_cols = schema.fields.len();
+        let concat_col = |ci: usize| {
+            let parts: Vec<&crate::storage::column::Column> =
+                batches.iter().map(|b| b.column(ci)).collect();
+            crate::storage::column::Column::concat(&parts).unwrap()
+        };
+
+        let serial = || {
+            let t = Instant::now();
+            let cols: Vec<_> = (0..n_cols).map(concat_col).collect();
+            let e = t.elapsed();
+            std::hint::black_box(&cols);
+            e
+        };
+        let parallel = || {
+            let t = Instant::now();
+            let cols: Vec<_> = (0..n_cols).into_par_iter().map(concat_col).collect();
+            let e = t.elapsed();
+            std::hint::black_box(&cols);
+            e
+        };
+
+        // Same columns either way.
+        let a = (0..n_cols).map(concat_col).collect::<Vec<_>>();
+        let b: Vec<_> = (0..n_cols).into_par_iter().map(concat_col).collect();
+        for c in 0..n_cols {
+            assert_eq!(a[c].len(), b[c].len());
+            for r in (0..a[c].len()).step_by(4999) {
+                assert_eq!(a[c].get(r).unwrap(), b[c].get(r).unwrap(), "column {c} row {r}");
+            }
+        }
+
+        for _ in 0..3 { serial(); parallel(); }
+        let s = (0..15).map(|_| serial()).min().unwrap();
+        let p = (0..15).map(|_| parallel()).min().unwrap();
+        println!("merging {ROWS} rows, {n_cols} columns, 2 batches:");
+        println!("  one column at a time = {s:?}");
+        println!("  columns in parallel  = {p:?}");
+        println!("  parallel is {:.2}x", p.as_secs_f64() / s.as_secs_f64());
+    }
+
     /// Should the sorted indices stay `u32` all the way to the gather?
     ///
     /// The sort works on `(key, u32)` pairs -- the row number is four bytes,
