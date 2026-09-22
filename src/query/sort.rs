@@ -184,12 +184,20 @@ fn try_typed_sort(
             let dense = c.dense();
             let mut pairs: Vec<($ty, u32)> = Vec::with_capacity(dense.len());
             let mut nulls: Vec<usize> = Vec::new();
-            for i in 0..c.len() {
-                if c.is_valid(i) {
-                    pairs.push((dense[i], i as u32));
-                } else {
-                    nulls.push(i);
+            // A column with no NULLs asks `is_valid` nothing: the branch is the
+            // only thing standing between this loop and a vectorised one, and it
+            // can never be taken. Same shape of waste that `Column::gather_u32`
+            // was carrying until it got its dense path.
+            if c.has_nulls() {
+                for i in 0..c.len() {
+                    if c.is_valid(i) {
+                        pairs.push((dense[i], i as u32));
+                    } else {
+                        nulls.push(i);
+                    }
                 }
+            } else {
+                pairs.extend(dense.iter().enumerate().map(|(i, &v)| (v, i as u32)));
             }
             sort_pairs(&mut pairs, desc);
             Some(assemble(pairs, nulls, s.nulls_last, limit))
@@ -204,14 +212,23 @@ fn try_typed_sort(
             let dense = c.dense();
             let mut pairs: Vec<($uint, u32)> = Vec::with_capacity(dense.len());
             let mut nulls: Vec<usize> = Vec::new();
-            for i in 0..c.len() {
-                if c.is_valid(i) {
-                    let key = $key_fn(dense[i]);
-                    // Flip all bits for DESC so we can always sort ascending.
-                    pairs.push((if desc { !key } else { key }, i as u32));
-                } else {
-                    nulls.push(i);
+            // See the note in `typed!`: no NULLs means the validity branch is
+            // dead weight on every row.
+            if c.has_nulls() {
+                for i in 0..c.len() {
+                    if c.is_valid(i) {
+                        let key = $key_fn(dense[i]);
+                        // Flip all bits for DESC so we can always sort ascending.
+                        pairs.push((if desc { !key } else { key }, i as u32));
+                    } else {
+                        nulls.push(i);
+                    }
                 }
+            } else {
+                pairs.extend(dense.iter().enumerate().map(|(i, &v)| {
+                    let key = $key_fn(v);
+                    (if desc { !key } else { key }, i as u32)
+                }));
             }
             sort_pairs_ord(&mut pairs);
             Some(assemble(pairs, nulls, s.nulls_last, limit))
@@ -640,6 +657,65 @@ mod perf {
             println!("  {n:>7} rows: serial {sm:>10.2?}  parallel {pm:>10.2?}  ({:.2}x)",
                      pm.as_secs_f64() / sm.as_secs_f64());
         }
+    }
+
+    /// What does the validity branch cost when there is nothing to check?
+    ///
+    /// Building the sort's (key, row) pairs asked `is_valid` on every row, even
+    /// for a column that holds no NULLs and cannot answer anything but yes. The
+    /// branch is also what stops the loop vectorising.
+    ///
+    /// Run with
+    /// `cargo test --release --lib dense_key_extraction -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dense_key_extraction() {
+        const ROWS: usize = 100_000;
+        let col = ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 100) as f64 + 0.5)).collect());
+        let c = match &col {
+            crate::storage::column::Column::Float64(c) => c,
+            _ => unreachable!(),
+        };
+
+        // The shape this loop had: ask, branch, push.
+        let branching = || {
+            let dense = c.dense();
+            let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(dense.len());
+            let mut nulls: Vec<usize> = Vec::new();
+            for i in 0..c.len() {
+                if c.is_valid(i) {
+                    pairs.push((!f64_sort_key(dense[i]), i as u32));
+                } else {
+                    nulls.push(i);
+                }
+            }
+            (pairs, nulls)
+        };
+        // The shape it has now when the column is dense.
+        let dense_path = || {
+            let dense = c.dense();
+            let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(dense.len());
+            pairs.extend(
+                dense.iter().enumerate().map(|(i, &v)| (!f64_sort_key(v), i as u32)),
+            );
+            (pairs, Vec::<usize>::new())
+        };
+
+        assert_eq!(branching().0, dense_path().0, "the two must build the same pairs");
+
+        let time = |label: &str, f: &dyn Fn() -> (Vec<(u64, u32)>, Vec<usize>)| {
+            for _ in 0..3 { std::hint::black_box(f()); }
+            let t = std::time::Instant::now();
+            for _ in 0..200 { std::hint::black_box(f()); }
+            let per = t.elapsed() / 200;
+            println!("  {label:>28}: {per:>9.2?}");
+            per
+        };
+
+        println!("building {ROWS} (key, row) pairs from a column with no NULLs:");
+        let b = time("asking is_valid per row", &branching);
+        let d = time("dense path", &dense_path);
+        println!("  dense is {:.2}x the branching form", d.as_secs_f64() / b.as_secs_f64());
     }
 
     /// Should the sorted indices stay `u32` all the way to the gather?
