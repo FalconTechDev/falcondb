@@ -2330,6 +2330,94 @@ mod tests {
         );
     }
 
+    /// How many buckets per row should the join table have?
+    ///
+    /// `with_rows` allocates two buckets per row, so 100k build rows take a 1 MB
+    /// `heads` array on top of 400 KB of chain links and 800 KB of keys. The
+    /// build was measured as allocation-bound rather than compute-bound -- two
+    /// attempts at parallelising it both came out slower -- so 2.2 MB per join is
+    /// the thing to attack, and `heads` is the largest piece of it.
+    ///
+    /// One bucket per row halves it. The cost is collisions: a load factor of 1.0
+    /// instead of 0.5 makes chains longer, and the probe walks those chains. Both
+    /// sides have to be measured, because a build that saves less than the probe
+    /// loses is not a saving.
+    ///
+    /// Run with
+    /// `cargo test --release --lib bucket_density -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bucket_density() {
+        use std::time::Instant;
+
+        const BUILD: usize = 100_000;
+        const PROBE: usize = 1_000_000;
+
+        /// `with_rows`, parameterised by how many buckets each row gets.
+        fn build_with(col: &Column, n: usize, per_row: usize) -> IntHashTable {
+            let buckets = (n.max(1) * per_row).next_power_of_two();
+            let mask = buckets - 1;
+            let mut t = IntHashTable {
+                mask,
+                heads: vec![NO_ROW; buckets],
+                next: vec![NO_ROW; n],
+                keys: Vec::with_capacity(n),
+            };
+            for row in 0..n {
+                t.insert(int_key(col, row), row);
+            }
+            t
+        }
+
+        // Keys 0,10,20,... on the build side and 0..1M on the probe side: a tenth
+        // of the probe matches, which is the benchmark's selectivity.
+        let right = int_key_batch("rk", (0..BUILD as i64).map(|i| i * 10).collect());
+        let left = int_key_batch("k", (0..PROBE as i64).collect());
+        let rcol = right.column(0);
+        let left_cols: Vec<&Column> = vec![left.column(0)];
+
+        for per_row in [1usize, 2, 4] {
+            let buckets = (BUILD * per_row).next_power_of_two();
+
+            let build = || {
+                let t = Instant::now();
+                let table = build_with(rcol, BUILD, per_row);
+                let e = t.elapsed();
+                std::hint::black_box(&table);
+                e
+            };
+            for _ in 0..3 { build(); }
+            let b = (0..9).map(|_| build()).min().unwrap();
+
+            let map = JoinKeyMap::Int(build_with(rcol, BUILD, per_row));
+            let probe = || {
+                let mut li = Vec::new();
+                let mut ri = Vec::new();
+                let mut scratch = Vec::new();
+                let t = Instant::now();
+                for row in 0..PROBE {
+                    probe_one(
+                        row, &left_cols, &map, None,
+                        &JoinType::Inner, &mut li, &mut ri, None, &mut scratch,
+                    )
+                    .unwrap();
+                }
+                (t.elapsed(), li.len())
+            };
+            let (_, matches) = probe();
+            assert_eq!(matches, BUILD, "every build row should match exactly once");
+            for _ in 0..2 { probe(); }
+            let pr = (0..3).map(|_| probe().0).min().unwrap();
+
+            println!(
+                "  {per_row} bucket(s)/row ({} buckets, {} KB heads): build {b:>9.2?}, probe {pr:>9.2?}, total {:>9.2?}",
+                buckets,
+                buckets * 4 / 1024,
+                b + pr,
+            );
+        }
+    }
+
     fn int_key_batch(name: &str, vals: Vec<i64>) -> RecordBatch {
         use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
         RecordBatch::new(
