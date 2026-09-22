@@ -409,6 +409,40 @@ mod dense_layout_tests {
         assert_eq!(c.get(1), Some(5));
     }
 
+    /// The dense fast path in `gather_u32` must agree with the general one.
+    ///
+    /// It skips the validity check and the output bitmap, which is only sound
+    /// when the source has no NULLs and no index is the NULL marker. Each of the
+    /// three cases is checked against `filter_by_indices`, which has always
+    /// handled all of them.
+    #[test]
+    fn gather_u32_matches_filter_by_indices() {
+        let dense = ColumnBuilder::int64((0..50).map(|i| Some(i as i64 * 3)).collect());
+        let holey = ColumnBuilder::int64(
+            (0..50).map(|i| if i % 7 == 0 { None } else { Some(i as i64 * 3) }).collect(),
+        );
+        let idx: Vec<u32> = (0..50).map(|i| (i * 17) % 50).collect();
+        let wide: Vec<usize> = idx.iter().map(|&i| i as usize).collect();
+
+        for (label, col) in [("dense", &dense), ("with nulls", &holey)] {
+            let fast = col.gather_u32(&idx).unwrap();
+            let slow = col.filter_by_indices(&wide).unwrap();
+            assert_eq!(fast.len(), slow.len(), "{label}: length");
+            for r in 0..fast.len() {
+                assert_eq!(fast.get(r).unwrap(), slow.get(r).unwrap(), "{label}: row {r}");
+            }
+        }
+
+        // A LEFT join's unmatched rows arrive as the marker and must come out
+        // NULL even though the source column has none.
+        let mut with_marker = idx.clone();
+        with_marker[3] = u32::MAX;
+        with_marker[11] = u32::MAX;
+        let got = dense.gather_u32(&with_marker).unwrap();
+        assert!(got.get(3).unwrap().is_null(), "marker should produce NULL");
+        assert!(got.get(11).unwrap().is_null(), "marker should produce NULL");
+        assert_eq!(got.get(4).unwrap(), dense.get(idx[4] as usize).unwrap());
+    }
     #[test]
     fn is_valid_matches_get() {
         let c = PrimitiveColumn::new(vec![Some(1i64), None, Some(3)]);
