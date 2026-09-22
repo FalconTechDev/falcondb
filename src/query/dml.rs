@@ -703,6 +703,74 @@ mod merge_perf {
     };
     use std::time::Instant;
 
+    /// Two buffers and a full evaluation, against one buffer and a partial one.
+    ///
+    /// The dense `f64` path for `UPDATE ... SET col = <expr>` allocates a vector
+    /// for the computed values and another for the copy it splices into, then
+    /// evaluates the expression for every row and discards the result wherever
+    /// the filter did not select.
+    ///
+    /// For the common shape `SET x = x <op> <literal>` -- the target column on
+    /// both sides -- none of that is needed: the copy can be updated in place,
+    /// for the selected rows only.
+    ///
+    /// Run with
+    /// `cargo test --release --lib update_in_place_shapes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn update_in_place_shapes() {
+        use crate::storage::column::PrimitiveColumn;
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+        let src: Vec<f64> = (0..ROWS).map(|i| (i % 100) as f64).collect();
+        let selected: Vec<bool> = (0..ROWS).map(|i| (i % 100) > 50).collect();
+        let hits = selected.iter().filter(|&&s| s).count();
+
+        // What the code does now: evaluate everything, then splice.
+        let two_buffers = || {
+            let computed: Vec<f64> = src.iter().map(|&v| v + 1.0).collect();
+            let mut dense = src.clone();
+            for (r, keep) in selected.iter().enumerate() {
+                if *keep {
+                    dense[r] = computed[r];
+                }
+            }
+            PrimitiveColumn::from_non_null(dense)
+        };
+        // One buffer, and arithmetic only where it is kept.
+        let in_place = || {
+            let mut dense = src.clone();
+            for (r, keep) in selected.iter().enumerate() {
+                if *keep {
+                    dense[r] += 1.0;
+                }
+            }
+            PrimitiveColumn::from_non_null(dense)
+        };
+
+        // Same column either way.
+        let a = two_buffers();
+        let b = in_place();
+        for r in 0..ROWS {
+            assert_eq!(a.get(r), b.get(r), "row {r}");
+        }
+
+        let bench = |label: &str, f: &dyn Fn() -> PrimitiveColumn<f64>| {
+            for _ in 0..5 { std::hint::black_box(f()); }
+            let t = Instant::now();
+            for _ in 0..200 { std::hint::black_box(f()); }
+            let per = t.elapsed() / 200;
+            println!("  {label:>32}: {per:>9.2?}");
+            per
+        };
+
+        println!("UPDATE {hits} of {ROWS} rows, SET x = x + 1:");
+        let old = bench("evaluate all, then splice", &two_buffers);
+        let new = bench("update the copy in place", &in_place);
+        println!("  in place is {:.2}x", new.as_secs_f64() / old.as_secs_f64());
+    }
+
     /// What does `UPDATE` cost on a column the typed splice does not cover?
     ///
     /// `splice_typed` handles `Int64`, `Float64`, `Int32` and `Float32`. Anything
