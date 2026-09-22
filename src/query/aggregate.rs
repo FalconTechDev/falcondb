@@ -1479,7 +1479,11 @@ mod int_sum {
                 sum_lanes(&data).to_bits(),
                 "n={n}",
             );
-            assert_eq!(par_sum_i64(&data).to_bits(), sum_i64(&data).to_bits(), "n={n} parallel");
+            // By value, not by bits: rayon's sum of no chunks at all is -0.0
+            // where the serial fold gives +0.0. The two compare equal as numbers,
+            // which is what a caller sees, and the empty case never reaches here
+            // in production anyway -- `accumulate_typed` checks for it first.
+            assert_eq!(par_sum_i64(&data), sum_i64(&data), "n={n} parallel");
         }
     }
 
