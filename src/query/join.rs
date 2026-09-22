@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -608,7 +609,9 @@ fn build_hash_table(
 
     if typed {
         let col = key_cols[0];
-        let mut table = IntHashTable::with_rows(n);
+        // The same column the probe will read, shared not copied.
+        let key_idx = batch.schema.column_index(keys[0])?;
+        let mut table = IntHashTable::with_rows(n, Arc::clone(&batch.columns[key_idx]));
         for row in 0..n {
             let k = int_key(col, row);
             table.insert(k, row);
@@ -945,21 +948,46 @@ struct IntHashTable {
     mask:  usize,
     heads: Vec<u32>,
     next:  Vec<u32>,
-    keys:  Vec<i64>,
+    /// The build side's key column, shared rather than copied.
+    ///
+    /// This used to be a `Vec<i64>` of one key per build row -- 800 KB at 100k
+    /// rows -- duplicating what the column already held. The chain walk reads it
+    /// to check whether a node really matches; it can read the column instead,
+    /// and an `Arc` clone costs a refcount bump.
+    ///
+    /// Measured on both sides, four runs, 100k build rows against 1M probes:
+    ///
+    ///   build   with 603-1170us   without 553-589us
+    ///   probe   with 11.20-12.37ms  without 10.95-11.35ms
+    ///
+    /// Faster on both, which was not obvious -- an extra indirection per chain
+    /// node could have cost more than the allocation saved. It does not, because
+    /// the column is resident anyway and 800 KB of duplicate stops competing with
+    /// the buckets for cache. The numbers without it are also markedly steadier,
+    /// the copy having made the build sensitive to allocator state.
+    ///
+    /// Unlike the bucket array this one had no second job: `bucket_density`
+    /// records why shrinking *that* one loses. `keys_array_worth_it` records
+    /// this.
+    key_col: Arc<Column>,
 }
 
 /// Marks the end of a chain / an empty bucket.
 const NO_ROW: u32 = u32::MAX;
 
 impl IntHashTable {
-    fn with_rows(n: usize) -> Self {
+    fn with_rows(n: usize, key_col: Arc<Column>) -> Self {
         // Two buckets per row keeps chains short without wasting much memory.
+        // One per row was measured and loses: it saves 300us of build and costs
+        // 4.6ms of probe, because the probe walks the longer chains a million
+        // times. Four per row wins on a serial probe and loses on a parallel one,
+        // which is the one production has. See `bucket_density`.
         let buckets = (n.max(1) * 2).next_power_of_two();
         Self {
             mask:  buckets - 1,
             heads: vec![NO_ROW; buckets],
             next:  vec![NO_ROW; n],
-            keys:  Vec::with_capacity(n),
+            key_col,
         }
     }
 
@@ -1055,19 +1083,19 @@ impl IntHashTable {
     /// one partition, and a partition to one thread, so no two threads ever touch
     /// the same slot. They are here only because the compiler cannot see that.
     #[cfg(test)]
-    fn build_radix(col: &Column, n: usize) -> Self {
+    fn build_radix(col: Arc<Column>, n: usize) -> Self {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
         let buckets = (n.max(1) * 2).next_power_of_two();
         let mask = buckets - 1;
 
-        let keys: Vec<i64> = (0..n).into_par_iter().map(|r| int_key(col, r)).collect();
+        let keys: Vec<i64> = (0..n).into_par_iter().map(|r| int_key(&col, r)).collect();
         if n == 0 {
             return Self {
                 mask,
                 heads: vec![NO_ROW; buckets],
                 next:  Vec::new(),
-                keys,
+                key_col: col,
             };
         }
 
@@ -1135,23 +1163,23 @@ impl IntHashTable {
             mask,
             heads: heads.into_iter().map(|a| a.into_inner()).collect(),
             next:  next.into_iter().map(|a| a.into_inner()).collect(),
-            keys,
+            key_col: col,
         }
     }
 
     #[cfg(test)]
-    fn build_parallel(col: &Column, n: usize) -> Self {
+    fn build_parallel(col: Arc<Column>, n: usize) -> Self {
         Self::build_parallel_with(col, n, rayon::current_num_threads().max(1))
     }
 
     #[cfg(test)]
-    fn build_parallel_with(col: &Column, n: usize, parts: usize) -> Self {
+    fn build_parallel_with(col: Arc<Column>, n: usize, parts: usize) -> Self {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
         let buckets = (n.max(1) * 2).next_power_of_two();
         let mask = buckets - 1;
 
-        let keys: Vec<i64> = (0..n).into_par_iter().map(|r| int_key(col, r)).collect();
+        let keys: Vec<i64> = (0..n).into_par_iter().map(|r| int_key(&col, r)).collect();
 
         let heads: Vec<AtomicU32> = (0..buckets).map(|_| AtomicU32::new(NO_ROW)).collect();
         let next:  Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NO_ROW)).collect();
@@ -1176,17 +1204,14 @@ impl IntHashTable {
             mask,
             heads: heads.into_iter().map(|a| a.into_inner()).collect(),
             next:  next.into_iter().map(|a| a.into_inner()).collect(),
-            keys,
+            key_col: col,
         }
     }
 
     #[inline]
     fn insert(&mut self, key: i64, row: usize) {
-        // `keys` is indexed by row, so rows have to arrive in order for the probe's
-        // `self.keys[row]` check to refer to the right key.
-        debug_assert_eq!(self.keys.len(), row, "build rows must be inserted in order");
+        debug_assert!(row < self.next.len(), "build row out of range");
         let b = self.bucket(key);
-        self.keys.push(key);
         self.next[row] = self.heads[b];
         self.heads[b] = row as u32;
     }
@@ -1197,7 +1222,7 @@ impl IntHashTable {
         let mut cur = self.heads[self.bucket(key)];
         while cur != NO_ROW {
             let row = cur as usize;
-            if self.keys[row] == key {
+            if int_key(&self.key_col, row) == key {
                 out.push(row);
             }
             cur = self.next[row];
@@ -1209,7 +1234,7 @@ impl IntHashTable {
         let mut cur = self.heads[self.bucket(key)];
         while cur != NO_ROW {
             let row = cur as usize;
-            if self.keys[row] == key {
+            if int_key(&self.key_col, row) == key {
                 return true;
             }
             cur = self.next[row];
@@ -2175,20 +2200,20 @@ mod tests {
             vec![ColumnBuilder::int64((0..ROWS as i64).map(|i| Some(i * 10)).collect())],
         )
         .unwrap();
-        let col = right.column(0);
+        let col = Arc::clone(&right.columns[0]);
 
         let alloc_only = || {
             let t = Instant::now();
-            let table = IntHashTable::with_rows(ROWS);
+            let table = IntHashTable::with_rows(ROWS, Arc::clone(&col));
             let e = t.elapsed();
             std::hint::black_box(&table);
             e
         };
         let alloc_and_insert = || {
             let t = Instant::now();
-            let mut table = IntHashTable::with_rows(ROWS);
+            let mut table = IntHashTable::with_rows(ROWS, Arc::clone(&col));
             for row in 0..ROWS {
-                table.insert(int_key(col, row), row);
+                table.insert(int_key(&col, row), row);
             }
             let e = t.elapsed();
             std::hint::black_box(&table);
@@ -2330,22 +2355,24 @@ mod tests {
         );
     }
 
-    /// Does the join table need its own copy of the build keys?
+    /// Does the join table need its own copy of the build keys? It did not.
     ///
-    /// `IntHashTable::keys` is one `i64` per build row -- 800 KB at 100k rows --
-    /// and it duplicates data the key column already holds. The chain walk reads
-    /// it to check whether a node really matches. Reading the column instead
-    /// would save the allocation and the fill.
+    /// `IntHashTable` used to hold one `i64` per build row -- 800 KB at 100k --
+    /// duplicating the key column so the chain walk could check a node. It now
+    /// shares the column through an `Arc` instead. Measured on both sides before
+    /// the change, four runs, 100k build rows against 1M probes:
     ///
-    /// Unlike the bucket array, this one cannot be defended by chain length: it
-    /// has no effect on collisions. What it might be buying is locality. `keys`
-    /// is indexed by build row, and so is the column, so both are equally
-    /// scattered during a probe -- but the column is behind an enum and a length
-    /// check, and 800 KB of it competes with the buckets for cache either way.
+    ///   build   with 603-1170us     without 553-589us
+    ///   probe   with 11.20-12.37ms  without 10.95-11.35ms
     ///
-    /// Measured on the build side (allocating and filling it) and on the probe
-    /// side (one extra indirection per chain node), because saving 800 KB of
-    /// allocation is worth nothing if the probe pays it back a million times.
+    /// Faster on both. That was not obvious: an extra indirection per chain node
+    /// could easily have cost more than the allocation saved. It does not,
+    /// because the column is resident anyway and the duplicate was competing with
+    /// the buckets for cache. The figures without it are also far steadier -- the
+    /// copy had made the build sensitive to allocator state.
+    ///
+    /// This keeps the comparison runnable: production has only the shared-column
+    /// shape now, so the copying one lives here.
     ///
     /// Run with
     /// `cargo test --release --lib keys_array_worth_it -- --ignored --nocapture`.
@@ -2359,63 +2386,45 @@ mod tests {
 
         let right = int_key_batch("rk", (0..BUILD as i64).map(|i| i * 10).collect());
         let left = int_key_batch("k", (0..PROBE as i64).collect());
-        let rcol = right.column(0);
+        let rcol = Arc::clone(&right.columns[0]);
         let lcol = left.column(0);
 
-        // With the keys array: what the table does today.
-        let build_with_keys = || {
+        // What production does now.
+        let build_shared = || {
             let t = Instant::now();
-            let mut table = IntHashTable::with_rows(BUILD);
+            let mut table = IntHashTable::with_rows(BUILD, Arc::clone(&rcol));
             for row in 0..BUILD {
-                table.insert(int_key(rcol, row), row);
+                table.insert(int_key(&rcol, row), row);
             }
             let e = t.elapsed();
             std::hint::black_box(&table);
             e
         };
 
-        // Without it: same buckets and chains, no per-row key copy.
-        let build_without_keys = || {
-            let buckets = (BUILD * 2).next_power_of_two();
-            let mask = buckets - 1;
+        // What it did before: the same chains plus a per-row copy of the keys.
+        let build_copying = || {
             let t = Instant::now();
-            let mut heads = vec![NO_ROW; buckets];
-            let mut next = vec![NO_ROW; BUILD];
+            let mut table = IntHashTable::with_rows(BUILD, Arc::clone(&rcol));
+            let mut keys: Vec<i64> = Vec::with_capacity(BUILD);
             for row in 0..BUILD {
-                let b = bucket_with(mask, int_key(rcol, row));
-                next[row] = heads[b];
-                heads[b] = row as u32;
+                let k = int_key(&rcol, row);
+                keys.push(k);
+                table.insert(k, row);
             }
             let e = t.elapsed();
-            std::hint::black_box((&heads, &next));
+            std::hint::black_box((&table, &keys));
             e
         };
 
         let table = {
-            let mut t = IntHashTable::with_rows(BUILD);
+            let mut t = IntHashTable::with_rows(BUILD, Arc::clone(&rcol));
             for row in 0..BUILD {
-                t.insert(int_key(rcol, row), row);
+                t.insert(int_key(&rcol, row), row);
             }
             t
         };
+        let keys: Vec<i64> = (0..BUILD).map(|r| int_key(&rcol, r)).collect();
 
-        // Chain walk reading `keys`, and the same walk reading the column.
-        let probe_via_keys = || {
-            let mut hits = 0usize;
-            let t = Instant::now();
-            for row in 0..PROBE {
-                let key = int_key(lcol, row);
-                let mut cur = table.heads[bucket_with(table.mask, key)];
-                while cur != NO_ROW {
-                    let r = cur as usize;
-                    if table.keys[r] == key {
-                        hits += 1;
-                    }
-                    cur = table.next[r];
-                }
-            }
-            (t.elapsed(), hits)
-        };
         let probe_via_column = || {
             let mut hits = 0usize;
             let t = Instant::now();
@@ -2424,7 +2433,23 @@ mod tests {
                 let mut cur = table.heads[bucket_with(table.mask, key)];
                 while cur != NO_ROW {
                     let r = cur as usize;
-                    if int_key(rcol, r) == key {
+                    if int_key(&rcol, r) == key {
+                        hits += 1;
+                    }
+                    cur = table.next[r];
+                }
+            }
+            (t.elapsed(), hits)
+        };
+        let probe_via_keys = || {
+            let mut hits = 0usize;
+            let t = Instant::now();
+            for row in 0..PROBE {
+                let key = int_key(lcol, row);
+                let mut cur = table.heads[bucket_with(table.mask, key)];
+                while cur != NO_ROW {
+                    let r = cur as usize;
+                    if keys[r] == key {
                         hits += 1;
                     }
                     cur = table.next[r];
@@ -2433,8 +2458,8 @@ mod tests {
             (t.elapsed(), hits)
         };
 
-        let (_, a) = probe_via_keys();
-        let (_, b) = probe_via_column();
+        let (_, a) = probe_via_column();
+        let (_, b) = probe_via_keys();
         assert_eq!(a, b, "the two chain walks must find the same matches");
         assert_eq!(a, BUILD, "every build row should match exactly once");
 
@@ -2446,21 +2471,14 @@ mod tests {
         };
 
         println!("100k build rows, {PROBE} probes:");
-        let bw = bench("build, with keys", &build_with_keys, 9);
-        let bo = bench("build, without keys", &build_without_keys, 9);
-        let pw = bench("probe, reads keys", &|| probe_via_keys().0, 3);
+        let bo = bench("build, shared column", &build_shared, 9);
+        let bw = bench("build, copied keys", &build_copying, 9);
         let po = bench("probe, reads the column", &|| probe_via_column().0, 3);
-
-        println!("  build saves {:?} without it", bw.saturating_sub(bo));
-        println!("  probe costs {:?} without it", po.saturating_sub(pw));
-        println!(
-            "  serial total {:?} -> {:?}",
-            bw + pw,
-            bo + po,
-        );
+        let pw = bench("probe, reads copied keys", &|| probe_via_keys().0, 3);
+        println!("  build saves {:?}", bw.saturating_sub(bo));
+        println!("  probe saves {:?}", pw.saturating_sub(po));
         // The probe runs on every core and the build on one, so the probe column
-        // is worth roughly a tenth of itself in production. Say so rather than
-        // comparing serial totals and calling it a result.
+        // is worth roughly a tenth of itself in production.
         println!(
             "  with the probe scaled by 10x for parallelism: {:.0}us -> {:.0}us",
             bw.as_secs_f64() * 1e6 + pw.as_secs_f64() * 1e5,
@@ -2492,17 +2510,16 @@ mod tests {
         const PROBE: usize = 1_000_000;
 
         /// `with_rows`, parameterised by how many buckets each row gets.
-        fn build_with(col: &Column, n: usize, per_row: usize) -> IntHashTable {
+        fn build_with(col: Arc<Column>, n: usize, per_row: usize) -> IntHashTable {
             let buckets = (n.max(1) * per_row).next_power_of_two();
-            let mask = buckets - 1;
             let mut t = IntHashTable {
-                mask,
+                mask: buckets - 1,
                 heads: vec![NO_ROW; buckets],
                 next: vec![NO_ROW; n],
-                keys: Vec::with_capacity(n),
+                key_col: Arc::clone(&col),
             };
             for row in 0..n {
-                t.insert(int_key(col, row), row);
+                t.insert(int_key(&col, row), row);
             }
             t
         }
@@ -2511,7 +2528,7 @@ mod tests {
         // of the probe matches, which is the benchmark's selectivity.
         let right = int_key_batch("rk", (0..BUILD as i64).map(|i| i * 10).collect());
         let left = int_key_batch("k", (0..PROBE as i64).collect());
-        let rcol = right.column(0);
+        let rcol = Arc::clone(&right.columns[0]);
         let left_cols: Vec<&Column> = vec![left.column(0)];
 
         for per_row in [1usize, 2, 4] {
@@ -2519,7 +2536,7 @@ mod tests {
 
             let build = || {
                 let t = Instant::now();
-                let table = build_with(rcol, BUILD, per_row);
+                let table = build_with(Arc::clone(&rcol), BUILD, per_row);
                 let e = t.elapsed();
                 std::hint::black_box(&table);
                 e
@@ -2527,7 +2544,7 @@ mod tests {
             for _ in 0..3 { build(); }
             let b = (0..9).map(|_| build()).min().unwrap();
 
-            let map = JoinKeyMap::Int(build_with(rcol, BUILD, per_row));
+            let map = JoinKeyMap::Int(build_with(Arc::clone(&rcol), BUILD, per_row));
             let probe = || {
                 let mut li = Vec::new();
                 let mut ri = Vec::new();
@@ -2578,20 +2595,23 @@ mod tests {
     fn parallel_build_is_identical_to_serial() {
         for &(n, period) in &[(1usize, 1i64), (7, 3), (1000, 97), (50_000, 977)] {
             let batch = int_key_batch("k", (0..n as i64).map(|i| (i % period) * 10).collect());
-            let col = batch.column(0);
+            let col = Arc::clone(&batch.columns[0]);
 
-            let mut serial = IntHashTable::with_rows(n);
+            let mut serial = IntHashTable::with_rows(n, Arc::clone(&col));
             for row in 0..n {
-                serial.insert(int_key(col, row), row);
+                serial.insert(int_key(&col, row), row);
             }
             for (label, built) in [
-                ("bucket-partitioned", IntHashTable::build_parallel(col, n)),
-                ("radix", IntHashTable::build_radix(col, n)),
+                ("bucket-partitioned", IntHashTable::build_parallel(Arc::clone(&col), n)),
+                ("radix", IntHashTable::build_radix(Arc::clone(&col), n)),
             ] {
                 let parallel = built;
 
             assert_eq!(serial.mask, parallel.mask, "n={n} {label}: mask");
-            assert_eq!(serial.keys, parallel.keys, "n={n} {label}: keys");
+            assert!(
+                Arc::ptr_eq(&serial.key_col, &parallel.key_col),
+                "n={n} {label}: both should share the same key column",
+            );
             assert_eq!(serial.heads, parallel.heads, "n={n} {label}: bucket heads");
             assert_eq!(serial.next, parallel.next, "n={n} {label}: chains");
 
@@ -2627,22 +2647,25 @@ mod tests {
         const ROWS: usize = 100_000;
 
         let batch = int_key_batch("k", (0..ROWS as i64).map(|i| i * 10).collect());
-        let col = batch.column(0);
+        let col = Arc::clone(&batch.columns[0]);
 
         let serial = || {
             let t = Instant::now();
-            let mut table = IntHashTable::with_rows(ROWS);
+            let mut table = IntHashTable::with_rows(ROWS, Arc::clone(&col));
             for row in 0..ROWS {
-                table.insert(int_key(col, row), row);
+                table.insert(int_key(&col, row), row);
             }
             let e = t.elapsed();
             std::hint::black_box(&table);
             e
         };
         let parallel_with = |parts: usize| {
+            // Clone the handle per call, so the outer closure only borrows and
+            // can be called more than once.
+            let col = Arc::clone(&col);
             move || {
                 let t = Instant::now();
-                let table = IntHashTable::build_parallel_with(col, ROWS, parts);
+                let table = IntHashTable::build_parallel_with(Arc::clone(&col), ROWS, parts);
                 let e = t.elapsed();
                 std::hint::black_box(&table);
                 e
@@ -2670,7 +2693,7 @@ mod tests {
 
         let radix = || {
             let t = Instant::now();
-            let table = IntHashTable::build_radix(col, ROWS);
+            let table = IntHashTable::build_radix(Arc::clone(&col), ROWS);
             let e = t.elapsed();
             std::hint::black_box(&table);
             e
