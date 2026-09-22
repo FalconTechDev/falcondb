@@ -1702,6 +1702,26 @@ mod sum_perf {
             total as f64
         }
 
+        /// The integer path as it was before: widening into eight f64 lanes.
+        /// Production now uses four for i64, so without this the comparison has
+        /// nothing to compare against -- and on this machine it has to be made
+        /// inside one run.
+        fn widen8(dense: &[i64]) -> f64 {
+            let mut acc = [0.0f64; 8];
+            let mut chunks = dense.chunks_exact(8);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..8 {
+                    acc[i] += c[i] as f64;
+                }
+            }
+            let mut total: f64 = acc.iter().sum();
+            for &v in chunks.remainder() {
+                total += v as f64;
+            }
+            total
+        }
+
         /// The float path at four lanes. `SUM_LANES` is shared by both types, so
         /// a change there has to be measured on floats too.
         fn f64_lanes4(dense: &[f64]) -> f64 {
@@ -1769,10 +1789,15 @@ mod sum_perf {
         println!("summing {n} values, 512 KB either way:");
         let fref = bench("f64 data, 8 lanes", &|| sum_lanes(&fdata));
         let f4   = bench("f64 data, 4 lanes", &|| f64_lanes4(&fdata));
-        let cur  = bench("i64, current", &|| sum_lanes(&data));
+        let cur  = bench("i64, current (4 lanes)", &|| sum_lanes(&data));
+        let w8   = bench("i64, previous (8 lanes)", &|| widen8(&data));
         let l4   = bench("i64, 4 lanes", &|| lanes4(&data));
         let l16  = bench("i64, 16 lanes", &|| lanes16(&data));
         let w4   = bench("i64, widen 4 lanes", &|| widen4(&data));
+        println!(
+            "  the change: current is {:.2}x the previous 8-lane shape",
+            cur.as_secs_f64() / w8.as_secs_f64(),
+        );
         println!(
             "  f64 at 4 lanes is {:.2}x f64 at 8",
             f4.as_secs_f64() / fref.as_secs_f64(),
