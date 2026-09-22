@@ -271,9 +271,19 @@ pub fn execute_update(
                 }
             }
 
-            let computed = expr.eval_batch(batch)?;
             let dt = &schema.fields[*col_idx].data_type;
             let src = batch.column(*col_idx);
+
+            // A literal is the common case and does not need materialising once
+            // per row before it can be written once per selected row.
+            if let crate::query::expr::Expr::Literal(v) = expr {
+                if let Some(c) = splice_constant(src, v, &selected) {
+                    columns[*col_idx] = Arc::new(c);
+                    continue;
+                }
+            }
+
+            let computed = expr.eval_batch(batch)?;
             columns[*col_idx] = Arc::new(match splice_typed(src, &computed, &selected) {
                 Some(c) => c,
                 None => {
@@ -476,6 +486,91 @@ fn scalars_to_column(vals: &[ScalarValue], dt: &DataType) -> FalconResult<Column
 /// not list, or a computed value that is NULL or of another type — so the caller
 /// falls back and the semantics stay in one place. A NULL assignment is rare and
 /// changes the column's validity, which the dense copy here does not model.
+/// Splice one constant into the selected rows.
+///
+/// `UPDATE t SET col = <literal>` is the common shape, and the general path
+/// handles it by first asking `eval_batch` for the value of that literal once per
+/// row: `Expr::Literal(v) => vec![v.clone(); row_count]`. For a string that is a
+/// heap allocation per row of the table before any row is written, and for a
+/// dictionary column it then looks the same string up once per row as well.
+///
+/// Here the value is converted once. A text column resolves its code once too,
+/// so the work per selected row is a `u32` store.
+///
+/// Returns `None` for anything it cannot model, exactly as [`splice_typed`] does,
+/// and the caller falls through to the general path.
+fn splice_constant(src: &Column, value: &ScalarValue, selected: &[bool]) -> Option<Column> {
+    use crate::storage::column::PrimitiveColumn;
+
+    debug_assert_eq!(src.len(), selected.len(), "mask must cover the column");
+
+    // Writing a NULL changes the column's validity, which the dense forms below
+    // do not model. The general path knows how.
+    if value.is_null() {
+        return None;
+    }
+
+    macro_rules! dense {
+        ($c:expr, $variant:ident, $extract:expr) => {{
+            let c = $c;
+            if c.has_nulls() {
+                return None;
+            }
+            let v = $extract(value)?;
+            let mut values = c.dense().to_vec();
+            for (row, keep) in selected.iter().enumerate() {
+                if *keep {
+                    values[row] = v;
+                }
+            }
+            Some(Column::$variant(PrimitiveColumn::from_non_null(values)))
+        }};
+    }
+
+    match src {
+        Column::Int64(c) => dense!(c, Int64, |v: &ScalarValue| match v {
+            ScalarValue::Int64(Some(x)) => Some(*x),
+            _ => None,
+        }),
+        Column::Float64(c) => dense!(c, Float64, |v: &ScalarValue| match v {
+            ScalarValue::Float64(Some(x)) => Some(*x),
+            _ => None,
+        }),
+        Column::Int32(c) => dense!(c, Int32, |v: &ScalarValue| match v {
+            ScalarValue::Int32(Some(x)) => Some(*x),
+            _ => None,
+        }),
+        Column::Float32(c) => dense!(c, Float32, |v: &ScalarValue| match v {
+            ScalarValue::Float32(Some(x)) => Some(*x),
+            _ => None,
+        }),
+
+        Column::Utf8(c) => {
+            let ScalarValue::Utf8(Some(text)) = value else {
+                return None;
+            };
+            // One lookup for the whole statement, not one per row.
+            let mut dict: Vec<String> = c.dict().to_vec();
+            let code = match dict.iter().position(|d| d == text) {
+                Some(i) => i as u32,
+                None => {
+                    dict.push(text.clone());
+                    (dict.len() - 1) as u32
+                }
+            };
+            let mut codes: Vec<u32> = c.codes().to_vec();
+            for (row, keep) in selected.iter().enumerate() {
+                if *keep {
+                    codes[row] = code;
+                }
+            }
+            Some(Column::Utf8(Utf8Column::from_parts(std::sync::Arc::new(dict), codes)))
+        }
+
+        _ => None,
+    }
+}
+
 fn splice_typed(
     src:      &Column,
     computed: &[ScalarValue],
