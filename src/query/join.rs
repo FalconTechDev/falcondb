@@ -2330,6 +2330,144 @@ mod tests {
         );
     }
 
+    /// Does the join table need its own copy of the build keys?
+    ///
+    /// `IntHashTable::keys` is one `i64` per build row -- 800 KB at 100k rows --
+    /// and it duplicates data the key column already holds. The chain walk reads
+    /// it to check whether a node really matches. Reading the column instead
+    /// would save the allocation and the fill.
+    ///
+    /// Unlike the bucket array, this one cannot be defended by chain length: it
+    /// has no effect on collisions. What it might be buying is locality. `keys`
+    /// is indexed by build row, and so is the column, so both are equally
+    /// scattered during a probe -- but the column is behind an enum and a length
+    /// check, and 800 KB of it competes with the buckets for cache either way.
+    ///
+    /// Measured on the build side (allocating and filling it) and on the probe
+    /// side (one extra indirection per chain node), because saving 800 KB of
+    /// allocation is worth nothing if the probe pays it back a million times.
+    ///
+    /// Run with
+    /// `cargo test --release --lib keys_array_worth_it -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn keys_array_worth_it() {
+        use std::time::Instant;
+
+        const BUILD: usize = 100_000;
+        const PROBE: usize = 1_000_000;
+
+        let right = int_key_batch("rk", (0..BUILD as i64).map(|i| i * 10).collect());
+        let left = int_key_batch("k", (0..PROBE as i64).collect());
+        let rcol = right.column(0);
+        let lcol = left.column(0);
+
+        // With the keys array: what the table does today.
+        let build_with_keys = || {
+            let t = Instant::now();
+            let mut table = IntHashTable::with_rows(BUILD);
+            for row in 0..BUILD {
+                table.insert(int_key(rcol, row), row);
+            }
+            let e = t.elapsed();
+            std::hint::black_box(&table);
+            e
+        };
+
+        // Without it: same buckets and chains, no per-row key copy.
+        let build_without_keys = || {
+            let buckets = (BUILD * 2).next_power_of_two();
+            let mask = buckets - 1;
+            let t = Instant::now();
+            let mut heads = vec![NO_ROW; buckets];
+            let mut next = vec![NO_ROW; BUILD];
+            for row in 0..BUILD {
+                let b = bucket_with(mask, int_key(rcol, row));
+                next[row] = heads[b];
+                heads[b] = row as u32;
+            }
+            let e = t.elapsed();
+            std::hint::black_box((&heads, &next));
+            e
+        };
+
+        let table = {
+            let mut t = IntHashTable::with_rows(BUILD);
+            for row in 0..BUILD {
+                t.insert(int_key(rcol, row), row);
+            }
+            t
+        };
+
+        // Chain walk reading `keys`, and the same walk reading the column.
+        let probe_via_keys = || {
+            let mut hits = 0usize;
+            let t = Instant::now();
+            for row in 0..PROBE {
+                let key = int_key(lcol, row);
+                let mut cur = table.heads[bucket_with(table.mask, key)];
+                while cur != NO_ROW {
+                    let r = cur as usize;
+                    if table.keys[r] == key {
+                        hits += 1;
+                    }
+                    cur = table.next[r];
+                }
+            }
+            (t.elapsed(), hits)
+        };
+        let probe_via_column = || {
+            let mut hits = 0usize;
+            let t = Instant::now();
+            for row in 0..PROBE {
+                let key = int_key(lcol, row);
+                let mut cur = table.heads[bucket_with(table.mask, key)];
+                while cur != NO_ROW {
+                    let r = cur as usize;
+                    if int_key(rcol, r) == key {
+                        hits += 1;
+                    }
+                    cur = table.next[r];
+                }
+            }
+            (t.elapsed(), hits)
+        };
+
+        let (_, a) = probe_via_keys();
+        let (_, b) = probe_via_column();
+        assert_eq!(a, b, "the two chain walks must find the same matches");
+        assert_eq!(a, BUILD, "every build row should match exactly once");
+
+        let bench = |label: &str, f: &dyn Fn() -> std::time::Duration, reps: usize| {
+            for _ in 0..2 { f(); }
+            let best = (0..reps).map(|_| f()).min().unwrap();
+            println!("  {label:>26}: {best:>9.2?}");
+            best
+        };
+
+        println!("100k build rows, {PROBE} probes:");
+        let bw = bench("build, with keys", &build_with_keys, 9);
+        let bo = bench("build, without keys", &build_without_keys, 9);
+        let pw = bench("probe, reads keys", &|| probe_via_keys().0, 3);
+        let po = bench("probe, reads the column", &|| probe_via_column().0, 3);
+
+        println!("  build saves {:?} without it", bw.saturating_sub(bo));
+        println!("  probe costs {:?} without it", po.saturating_sub(pw));
+        println!(
+            "  serial total {:?} -> {:?}",
+            bw + pw,
+            bo + po,
+        );
+        // The probe runs on every core and the build on one, so the probe column
+        // is worth roughly a tenth of itself in production. Say so rather than
+        // comparing serial totals and calling it a result.
+        println!(
+            "  with the probe scaled by 10x for parallelism: {:.0}us -> {:.0}us",
+            bw.as_secs_f64() * 1e6 + pw.as_secs_f64() * 1e5,
+            bo.as_secs_f64() * 1e6 + po.as_secs_f64() * 1e5,
+        );
+    }
+
     /// How many buckets per row should the join table have?
     ///
     /// `with_rows` allocates two buckets per row, so 100k build rows take a 1 MB
