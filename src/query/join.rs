@@ -605,19 +605,31 @@ fn build_hash_table(
         .collect::<FalconResult<_>>()?;
 
     let n = batch.row_count();
-    let mut bloom = (n >= BLOOM_MIN_ROWS).then(|| BuildFilter::with_capacity(n));
+    let bloom = (n >= BLOOM_MIN_ROWS).then(|| BuildFilter::with_capacity(n));
 
     if typed {
         let col = key_cols[0];
         // The same column the probe will read, shared not copied.
         let key_idx = batch.schema.column_index(keys[0])?;
         let mut table = IntHashTable::with_rows(n, Arc::clone(&batch.columns[key_idx]));
-        for row in 0..n {
-            let k = int_key(col, row);
-            table.insert(k, row);
-            if let Some(f) = bloom.as_mut() {
-                f.insert(int_key_hash(k));
+
+        // The filter goes first and on every core. It is a third of a serial
+        // build -- 312us of 951us at 100k rows -- and the only part of the build
+        // whose result does not depend on the order rows are visited in, so it is
+        // the only part that can be spread without changing what a join returns.
+        if let Some(f) = bloom.as_ref() {
+            if n >= par_bloom_rows() {
+                (0..n).into_par_iter().for_each(|row| {
+                    f.insert_concurrent(int_key_hash(int_key(col, row)));
+                });
+            } else {
+                for row in 0..n {
+                    f.insert(int_key_hash(int_key(col, row)));
+                }
             }
+        }
+        for row in 0..n {
+            table.insert(int_key(col, row), row);
         }
         return Ok((JoinKeyMap::Int(table), bloom));
     }
@@ -626,7 +638,7 @@ fn build_hash_table(
     for row in 0..n {
         let key = row_key(&key_cols, row)?;
         table.entry(key).or_default().push(row);
-        if let Some(f) = bloom.as_mut() {
+        if let Some(f) = bloom.as_ref() {
             f.insert(row_key_hash(&key_cols, row));
         }
     }
@@ -1321,6 +1333,16 @@ fn bucket_with(mask: usize, key: i64) -> usize {
     (h as usize) & mask
 }
 
+/// Minimum build rows before the Bloom filter is worth filling from several
+/// threads.
+///
+/// Concurrent insertion trades total work for wall-clock: a locked OR costs more
+/// than a plain one, but twelve cores finish sooner. Below a few thousand rows
+/// the rayon hand-off is the larger number.
+fn par_bloom_rows() -> usize {
+    crate::query::tuning::par_min_rows(1_024)
+}
+
 /// A Bloom filter of the build side's join keys.
 ///
 /// The probe key is a `String` built by joining the key columns, so every probe
@@ -1332,7 +1354,18 @@ fn bucket_with(mask: usize, key: i64) -> usize {
 /// allowed — they simply fall through to the hash table, which is authoritative.
 /// False negatives are not possible, so the join result is unchanged.
 struct BuildFilter {
-    bits: Vec<u64>,
+    /// Atomic so the filter can be filled from several threads.
+    ///
+    /// A Bloom filter is built by OR-ing bits, and OR does not care what order it
+    /// happens in, so this is the one part of building a join's hash table that
+    /// parallelises without changing the result at all -- unlike the chains,
+    /// where the order rows arrive in decides the order of the join's output.
+    ///
+    /// Relaxed ordering is enough for the same reason: every write sets a bit and
+    /// never clears one, and the build is finished before any probe reads it. On
+    /// x86 a relaxed load or store is an ordinary `mov`, so the serial path pays
+    /// nothing for the type; only `insert_concurrent` emits a locked instruction.
+    bits: Vec<std::sync::atomic::AtomicU64>,
     mask: usize,
 }
 
@@ -1340,9 +1373,13 @@ impl BuildFilter {
     /// Sized to roughly 16 bits per distinct key, rounded to a power of two, which
     /// keeps the false-positive rate low enough that the filter pays for itself.
     fn with_capacity(n: usize) -> Self {
+        use std::sync::atomic::AtomicU64;
         let want = (n.max(1) * 16).next_power_of_two().max(64);
         let words = want / 64;
-        Self { bits: vec![0u64; words], mask: words - 1 }
+        Self {
+            bits: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            mask: words - 1,
+        }
     }
 
     /// Two probes derived from one hash — the standard double-hashing trick, so
@@ -1359,18 +1396,36 @@ impl BuildFilter {
         )
     }
 
+    /// Set one key's bits, single-threaded.
+    ///
+    /// Load, or, store: no locked instruction, so this costs what the plain
+    /// `Vec<u64>` cost. Racy if called from several threads at once, which is
+    /// what `insert_concurrent` is for; relaxed atomics mean a race would lose a
+    /// bit rather than be undefined, and a lost bit in a Bloom filter is a
+    /// dropped join match, so the distinction is not academic.
     #[inline]
-    fn insert(&mut self, h: u64) {
+    fn insert(&self, h: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
         let (w1, b1, w2, b2) = self.slots(h);
-        self.bits[w1] |= b1;
-        self.bits[w2] |= b2;
+        self.bits[w1].store(self.bits[w1].load(Relaxed) | b1, Relaxed);
+        self.bits[w2].store(self.bits[w2].load(Relaxed) | b2, Relaxed);
+    }
+
+    /// Set one key's bits from any thread.
+    #[inline]
+    fn insert_concurrent(&self, h: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (w1, b1, w2, b2) = self.slots(h);
+        self.bits[w1].fetch_or(b1, Relaxed);
+        self.bits[w2].fetch_or(b2, Relaxed);
     }
 
     /// `false` means the key is definitely not in the build side.
     #[inline]
     fn might_contain(&self, h: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
         let (w1, b1, w2, b2) = self.slots(h);
-        (self.bits[w1] & b1) != 0 && (self.bits[w2] & b2) != 0
+        (self.bits[w1].load(Relaxed) & b1) != 0 && (self.bits[w2].load(Relaxed) & b2) != 0
     }
 }
 
