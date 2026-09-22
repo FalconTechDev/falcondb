@@ -618,6 +618,104 @@ mod perf {
         }
     }
 
+    /// Should the sorted indices stay `u32` all the way to the gather?
+    ///
+    /// The sort works on `(key, u32)` pairs -- the row number is four bytes,
+    /// because a batch cannot have more rows than that. `assemble` then widens
+    /// every one to `usize` so `gather` can take `&[usize]`, which costs a pass
+    /// over the indices and doubles the array the gather then walks: 800 KB
+    /// instead of 400 KB at 100k rows, competing for the same cache as the
+    /// columns being gathered.
+    ///
+    /// `Column::gather_u32` already exists and takes the narrow form. This
+    /// measures whether using it is worth the change, on both halves: the widening
+    /// pass that would disappear, and the gather that would read half as much
+    /// index.
+    ///
+    /// Run with
+    /// `cargo test --release --lib u32_indices_to_the_gather -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn u32_indices_to_the_gather() {
+        const ROWS: usize = 100_000;
+
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("id", DataType::Int64),
+                Field::required("dept", DataType::Utf8),
+                Field::required("score", DataType::Float64),
+            ]),
+            vec![
+                ColumnBuilder::int64((0..ROWS as i64).map(Some).collect()),
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS).map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5])).collect(),
+                ),
+                ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 100) as f64 + 0.5)).collect()),
+            ],
+        )
+        .unwrap();
+
+        // A realistic permutation: what a descending sort on a 100-value column
+        // produces, so the gather is as scattered as the real one.
+        let mut pairs: Vec<(u64, u32)> = (0..ROWS)
+            .map(|i| (!f64_sort_key((i % 100) as f64 + 0.5), i as u32))
+            .collect();
+        pairs.sort_unstable();
+        let narrow: Vec<u32> = pairs.iter().map(|&(_, i)| i).collect();
+        let wide: Vec<usize> = narrow.iter().map(|&i| i as usize).collect();
+
+        // The two gathers must produce the same rows, or the faster one is moot.
+        for c in 0..batch.column_count() {
+            let a = batch.column(c).gather_u32(&narrow);
+            let b = batch.column(c).filter_by_indices(&wide).unwrap();
+            assert_eq!(a.len(), b.len(), "column {c}: length");
+            for r in (0..a.len()).step_by(997) {
+                assert_eq!(a.get(r).unwrap(), b.get(r).unwrap(), "column {c} row {r}");
+            }
+        }
+
+        let time = |label: &str, f: &dyn Fn(), reps: u32| {
+            for _ in 0..3 { f(); }
+            let t = std::time::Instant::now();
+            for _ in 0..reps { f(); }
+            let per = t.elapsed() / reps;
+            println!("  {label:>32}: {per:>9.2?}");
+            per
+        };
+
+        println!("ORDER BY, {ROWS} rows, 3 columns:");
+        let widen = time(
+            "widening u32 -> usize",
+            &|| { std::hint::black_box(narrow.iter().map(|&i| i as usize).collect::<Vec<usize>>()); },
+            200,
+        );
+        let g_wide = time(
+            "gather by usize (today)",
+            &|| {
+                for c in 0..batch.column_count() {
+                    std::hint::black_box(batch.column(c).filter_by_indices(&wide).unwrap());
+                }
+            },
+            60,
+        );
+        let g_narrow = time(
+            "gather by u32",
+            &|| {
+                for c in 0..batch.column_count() {
+                    std::hint::black_box(batch.column(c).gather_u32(&narrow));
+                }
+            },
+            60,
+        );
+
+        println!("  gather alone: {:.2}x", g_narrow.as_secs_f64() / g_wide.as_secs_f64());
+        println!(
+            "  with the widening pass removed too: {:?} -> {:?}",
+            widen + g_wide,
+            g_narrow,
+        );
+    }
+
     /// Where does `ORDER BY` spend its time at the size we lose on?
     ///
     /// `order_by/100k` is 2.29 ms against Polars' 1.62 ms -- a 0.67 ms gap, larger
