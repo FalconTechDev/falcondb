@@ -560,6 +560,83 @@ mod merge_perf {
     };
     use std::time::Instant;
 
+    /// What does `UPDATE` cost on a column the typed splice does not cover?
+    ///
+    /// `splice_typed` handles `Int64`, `Float64`, `Int32` and `Float32`. Anything
+    /// else -- `Utf8`, `Boolean`, `Date32`, `Timestamp`, `Decimal128` -- falls to
+    /// the general path, which reads every row as a `ScalarValue` and rebuilds the
+    /// column from that. For `Utf8` each of those reads allocates a `String`.
+    ///
+    /// The benchmark suite does not reach it: its `UPDATE` sets `score`, a
+    /// `Float64`, which the fast path takes. So a string update is untested for
+    /// speed as well as unoptimised.
+    ///
+    /// Run with
+    /// `cargo test --release --lib update_by_column_type -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn update_by_column_type() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+
+        let make_db = || {
+            let schema = Schema::new(vec![
+                Field::required("id", DataType::Int64),
+                Field::required("dept", DataType::Utf8),
+                Field::required("score", DataType::Float64),
+            ]);
+            let batch = RecordBatch::new(
+                schema,
+                vec![
+                    ColumnBuilder::int64((0..ROWS as i64).map(Some).collect()),
+                    ColumnBuilder::utf8_from_str(
+                        (0..ROWS)
+                            .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5]))
+                            .collect(),
+                    ),
+                    ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 100) as f64)).collect()),
+                ],
+            )
+            .unwrap();
+            let db = Database::in_memory();
+            db.create_table_from_batches("t", vec![batch]).unwrap();
+            db
+        };
+
+        let time = |label: &str, sql: &str| {
+            // A fresh table each time: an UPDATE changes what the next one sees.
+            for _ in 0..2 {
+                let db = make_db();
+                db.sql(sql).unwrap();
+            }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..7 {
+                let db = make_db();
+                let t = Instant::now();
+                db.sql(sql).unwrap();
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>34}: {best:>9.2?}");
+            best
+        };
+
+        println!("UPDATE half of {ROWS} rows:");
+        let f = time("score (Float64, typed splice)", "UPDATE t SET score = score + 1 WHERE score > 50");
+        let u = time("dept (Utf8, ScalarValue path)", "UPDATE t SET dept = 'x' WHERE score > 50");
+        println!(
+            "  the string column costs {:.1}x the float one",
+            u.as_secs_f64() / f.as_secs_f64(),
+        );
+    }
+
     /// What the `ScalarValue` merge cost the RETURNING path.
     ///
     /// `merge_batches_simple` used to rebuild every column by pushing each cell
