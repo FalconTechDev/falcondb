@@ -619,6 +619,12 @@ mod merge_perf {
     /// `Float64`, which the fast path takes. So a string update is untested for
     /// speed as well as unoptimised.
     ///
+    /// Measured before the Utf8 arm existed: 23.99ms against 2.34ms, so 10.3x.
+    /// After it: 8.14-8.27ms, so 3.6x. What is left is not the splice -- it is
+    /// `eval_batch`, which returns a `ScalarValue` per row even when the
+    /// expression is the constant `'x'`, so a string constant is cloned once per
+    /// row of the table before the splice ever sees it.
+    ///
     /// Run with
     /// `cargo test --release --lib update_by_column_type -- --ignored --nocapture`.
     #[test]
