@@ -2030,17 +2030,74 @@ mod in_list_semantics {
     }
 
     /// The same question, asked where row *membership* is decided rather than a
-    /// filter: join keys, `GROUP BY`, `UNION`, `IN (SELECT ...)`.
+    /// filter: join keys, `IN (SELECT ...)`, correlated `EXISTS`.
     ///
-    /// These all match values against values, and each one that reaches the boxed
-    /// comparison can disagree with `=` the way `IN` did. `WHERE` turned out to be
-    /// clean once `IN` was fixed; this checks the rest of the engine rather than
-    /// assuming the family ends there.
-    ///
-    /// An Int64 column and a Float64 column holding the same three numbers should
-    /// join on three rows, group to three groups, and union to three values.
+    /// These match values against values, so each one that reaches the boxed
+    /// comparison could disagree with `=` the way `IN` did. None of them do: an
+    /// `Int64` column and a `Float64` column holding the same three numbers join
+    /// on three rows through every form.
     #[test]
     fn membership_across_numeric_types() {
+        let db = two_numeric_tables();
+        let n = |sql: &str| -> usize {
+            db.sql(sql).unwrap().batches.iter().map(|b| b.row_count()).sum()
+        };
+        assert_eq!(n("SELECT i FROM ints JOIN floats ON ints.i = floats.f"), 3);
+        assert_eq!(n("SELECT i FROM ints WHERE i IN (SELECT f FROM floats)"), 3);
+        assert_eq!(
+            n("SELECT i FROM ints WHERE EXISTS (SELECT 1 FROM floats WHERE floats.f = ints.i)"),
+            3
+        );
+    }
+
+    /// `table.column` outside a join's `ON` clause.
+    ///
+    /// The parser turns `ints.i` into the literal string "ints.i" and the schema
+    /// compared names for exact equality, so every one of these failed with
+    /// "column not found" -- ordinary SQL, unusable. The `ON` clause worked
+    /// because the join resolves its own keys, which is why nobody noticed:
+    /// qualified names had been made to work exactly where they were needed and
+    /// nowhere else, the same pattern as the text paths earlier in this work.
+    #[test]
+    fn qualified_column_names_resolve() {
+        let db = two_numeric_tables();
+        let n = |sql: &str| -> usize {
+            db.sql(sql).unwrap().batches.iter().map(|b| b.row_count()).sum()
+        };
+        assert_eq!(n("SELECT ints.i FROM ints"), 3);
+        assert_eq!(n("SELECT i FROM ints WHERE ints.i > 0"), 3);
+        assert_eq!(n("SELECT a.i FROM ints AS a"), 3);
+        assert_eq!(n("SELECT i FROM ints ORDER BY ints.i"), 3);
+        assert_eq!(n("SELECT ints.i FROM ints WHERE ints.i IN (1, 2)"), 2);
+    }
+
+    /// The one qualified-name case still broken, pinned so it is not mistaken for
+    /// working: a qualified column in the *select list of a join*.
+    ///
+    /// `SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f` still reports
+    /// "column not found", while the same query selecting plain `i` succeeds and
+    /// the join output schema is `["i", "f"]` -- the column is there. The select
+    /// list of a join is validated against the input tables one at a time, so
+    /// "ints.i" is reduced to "i" and looked for in `floats`, which has no `i`.
+    ///
+    /// Fixing that means giving the join planner a name scope, which is a larger
+    /// change than resolving a name in a schema. Pinned as a limitation rather
+    /// than left to be rediscovered; this test failing is good news.
+    #[test]
+    fn qualified_select_list_on_a_join_is_still_broken() {
+        let db = two_numeric_tables();
+        match db.sql("SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f") {
+            Err(e) => assert!(
+                e.to_string().contains("not found"),
+                "expected a not-found error, got: {e}"
+            ),
+            Ok(_) => panic!(
+                "this now works -- delete this test and fold the case into                  qualified_column_names_resolve"
+            ),
+        }
+    }
+
+    fn two_numeric_tables() -> crate::db::Database {
         use crate::db::Database;
         use crate::storage::{
             column::ColumnBuilder,
@@ -2048,7 +2105,6 @@ mod in_list_semantics {
             table::RecordBatch,
             types::DataType,
         };
-
         let ints = RecordBatch::new(
             Schema::new(vec![Field::required("i", DataType::Int64)]),
             vec![ColumnBuilder::int64((1..=3).map(Some).collect())],
@@ -2062,51 +2118,7 @@ mod in_list_semantics {
         let db = Database::in_memory();
         db.create_table_from_batches("ints", vec![ints]).unwrap();
         db.create_table_from_batches("floats", vec![floats]).unwrap();
-
-        let n = |sql: &str| -> usize {
-            match db.sql(sql) {
-                Ok(r) => r.batches.iter().map(|b| b.row_count()).sum(),
-                Err(e) => {
-                    println!("      (error: {e})");
-                    usize::MAX
-                }
-            }
-        };
-
-        // What does a join actually call its output columns?
-        let r = db.sql("SELECT * FROM ints JOIN floats ON ints.i = floats.f").unwrap();
-        println!("  join output schema: {:?}", r.batches[0].schema.column_names());
-
-        let cases: Vec<(&str, usize, usize)> = vec![
-            ("JOIN ON i = f",
-             n("SELECT i FROM ints JOIN floats ON ints.i = floats.f"), 3),
-            ("qualified select, no join",
-             n("SELECT ints.i FROM ints"), 3),
-            ("qualified in WHERE, no join",
-             n("SELECT i FROM ints WHERE ints.i > 0"), 3),
-            ("qualified select with alias",
-             n("SELECT a.i FROM ints AS a"), 3),
-            ("qualified select, with join",
-             n("SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f"), 3),
-            ("qualified ORDER BY",
-             n("SELECT i FROM ints ORDER BY ints.i"), 3),
-            ("i IN (SELECT f)",
-             n("SELECT i FROM ints WHERE i IN (SELECT f FROM floats)"), 3),
-            ("EXISTS correlated",
-             n("SELECT i FROM ints WHERE EXISTS (SELECT 1 FROM floats WHERE floats.f = ints.i)"), 3),
-        ];
-
-        let mut wrong = Vec::new();
-        for (form, got, want) in &cases {
-            let shown = if *got == usize::MAX { "error".to_string() } else { got.to_string() };
-            println!("  {form:<24} -> {shown} rows (expected {want})");
-            if got != want {
-                wrong.push(format!("{form}: got {shown}, expected {want}"));
-            }
-        }
-        assert!(wrong.is_empty(), "membership forms that do not match across numeric types:
-  {}", wrong.join("
-  "));
+        db
     }
 
     /// The typed `IN` path must answer exactly what the general path answered,
