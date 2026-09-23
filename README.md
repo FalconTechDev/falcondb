@@ -40,29 +40,37 @@ reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `SUM(score)` | 10 k | **1.4 µs** | 8.3 µs | 239 µs | 1.29 ms |
-| | 100 k | **8.8 µs** | 19.2 µs | 365 µs | 1.20 ms |
-| | 1 M | **61.5 µs** | 162 µs | 498 µs | 2.63 ms |
-| `SUM(id)` (integer) | 10 k | **2.6 µs** | 7.4 µs | 221 µs | 1.68 ms |
-| | 100 k | 21.0 µs | **14.7 µs** | 356 µs | 2.45 ms |
-| | 1 M | **77.0 µs** | 172 µs | 492 µs | 14.1 ms |
-| `WHERE score > 50` | 10 k | **19.5 µs** | 51.1 µs | 594 µs | 1.27 ms |
-| | 100 k | **126 µs** | 191 µs | 3.89 ms | 2.82 ms |
-| | 1 M | **730 µs** | 2.43 ms | 23.8 ms | 17.1 ms |
+| `SUM(score)` | 10 k | **1.41 µs** | 8.47 µs | 235 µs | 1.16 ms |
+| | 100 k | **8.66 µs** | 19.2 µs | 413 µs | 1.50 ms |
+| | 1 M | **61.1 µs** | 158 µs | 500 µs | 2.63 ms |
+| `SUM(id)` (integer) | 10 k | **2.65 µs** | 7.39 µs | 212 µs | 1.61 ms |
+| | 100 k | 21.4 µs | **14.7 µs** | 359 µs | 2.52 ms |
+| | 1 M | **76.4 µs** | 176 µs | 473 µs | 14.3 ms |
+| `WHERE score > 50` | 10 k | **16.6 µs** | 50.9 µs | 599 µs | 1.19 ms |
+| | 100 k | **127 µs** | 173 µs | 3.98 ms | 2.77 ms |
+| | 1 M | **671 µs** | 2.24 ms | 24.0 ms | 17.6 ms |
 
 ### Grouping, sorting, pipelines
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `GROUP BY` + 3 aggregates | 10 k | **38.2 µs** | 251 µs | 1.89 ms | 1.61 ms |
-| | 100 k | **96.4 µs** | 1.16 ms | 3.55 ms | 2.22 ms |
-| | 1 M | **635 µs** | 9.79 ms | 6.73 ms | 7.23 ms |
-| `ORDER BY score DESC` | 10 k | **239 µs** | 274 µs | 1.89 ms | 947 µs |
-| | 100 k | 1.69 ms | **1.34 ms** | 15.7 ms | 6.57 ms |
-| `DISTINCT` | 100 k | **548 µs** | 617 µs | 2.28 ms | 1.33 ms |
-| | 1 M | **2.14 ms** | 5.84 ms | 4.03 ms | 3.10 ms |
-| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **23.3 µs** | 271 µs | 1.69 ms | 1.56 ms |
-| | 100 k | **90.2 µs** | 1.21 ms | 3.65 ms | 2.07 ms |
+| `GROUP BY` + 3 aggregates | 10 k | **35.9 µs** | 258 µs | 1.85 ms | 1.62 ms |
+| | 100 k | **97.0 µs** | 1.08 ms | 3.60 ms | 2.22 ms |
+| | 1 M | **581 µs** | 10.2 ms | 6.51 ms | 7.12 ms |
+| `ORDER BY score DESC` | 10 k | **242 µs** | 275 µs | 1.86 ms | 938 µs |
+| | 100 k | 1.58 ms | **1.38 ms** | 15.7 ms | 6.46 ms |
+| `DISTINCT` | 100 k | 702 µs † | 600 µs | 2.02 ms | 1.31 ms |
+| | 1 M | **2.42 ms** | 5.21 ms | 3.55 ms | 3.14 ms |
+| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **22.3 µs** | 280 µs | 1.64 ms | 1.56 ms |
+| | 100 k | **91.6 µs** | 1.12 ms | 3.53 ms | 2.08 ms |
+
+† `DISTINCT` at 100 k is the one point this table will not call. FalconDB's
+reading in this run spans 616–837 µs where every other point in the suite spans
+about 1%, and a re-run of that group alone put FalconDB at 589 µs against Polars'
+617 µs — ahead, where the full run had it behind. Two runs disagreeing on the
+*sign* is what "too close to measure" looks like; the median above is the full
+run's, reported as measured rather than replaced with the reading that flatters
+us. At 1 M rows, where the measurement is stable, FalconDB leads.
 
 ### Joins, window functions, DML
 
@@ -73,29 +81,42 @@ used to make — see [Methodology](#methodology).
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `INNER JOIN` | 100 k | **310 µs** | 427 µs | 1.89 ms | 3.86 ms |
-| | 1 M | 3.38 ms | **2.63 ms** | 8.40 ms | 16.8 ms |
-| `LEFT JOIN` | 100 k | **648 µs** | — | 2.40 ms | 4.17 ms |
-| `SEMI JOIN` (`EXISTS`) | 100 k | **623 µs** | — | 2.47 ms | 4.09 ms |
-| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **916 µs** | — | 2.46 ms | 4.19 ms |
-| `ROW_NUMBER() OVER` | 100 k | **3.67 ms** | — | 11.6 ms | 6.21 ms |
-| `UPDATE` (half the rows) | 100 k | **1.76 ms** | — | 3.59 ms | — |
-| `DELETE` (half the rows) | 100 k | **931 µs** | — | 2.71 ms | — |
+| `INNER JOIN` | 100 k | **307 µs** | 425 µs | 1.77 ms | 3.90 ms |
+| | 1 M | 3.41 ms | **2.60 ms** | 7.81 ms | 16.7 ms |
+| `LEFT JOIN` | 100 k | **687 µs** | — | 2.44 ms | 4.13 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **592 µs** | — | 2.46 ms | 4.04 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **856 µs** | — | 2.47 ms | 4.18 ms |
+| `ROW_NUMBER() OVER` | 100 k | **4.31 ms** ‡ | — | 11.6 ms | 5.80 ms |
+| `UPDATE` (half the rows) | 100 k | **1.69 ms** | — | 3.63 ms | — |
+| `DELETE` (half the rows) | 100 k | **914 µs** | — | 2.59 ms | — |
+
+‡ This one moved the wrong way and is not yet explained. The previous run had
+3.67 ms; DuckDB measured the same in both and DataFusion improved 7%, so the
+rivals held while this slid 17%. Nothing in the window path was touched between
+the runs. Recorded here rather than smoothed over, and it is the next thing to
+look at.
 
 ### Where FalconDB is behind
 
-Ahead of every engine in 23 of 26 measured points, and ahead of DuckDB and
-DataFusion in all of them. The exceptions are all against Polars:
+Ahead of every engine in 22 of 26 measured points, level in one, and ahead of
+DuckDB and DataFusion in all 26. The exceptions are all against Polars:
 
 | | FalconDB | Polars | |
 |---|---|---|---|
-| `SUM(id)` 100 k | 21.0 µs | 14.7 µs | 1.4× |
-| `INNER JOIN` 1 M | 3.38 ms | 2.63 ms | 1.3× |
-| `ORDER BY` 100 k | 1.69 ms | 1.34 ms | 1.3× |
+| `SUM(id)` 100 k | 21.4 µs | 14.7 µs | 1.5× |
+| `INNER JOIN` 1 M | 3.41 ms | 2.60 ms | 1.3× |
+| `ORDER BY` 100 k | 1.58 ms | 1.38 ms | 1.1× |
+| `DISTINCT` 100 k | 702 µs | 600 µs | too close to call — see † |
 
-All three have narrowed, and the rivals held still while they did — Polars,
-DuckDB and DataFusion all measure within a few percent of the previous run, so
-the movement is ours.
+`ORDER BY` narrowed from 1.3× to 1.1×, from sorting a text column by dictionary
+rank rather than by string. The other two are within noise of where they were.
+
+The comparison to the previous run is by *ratio*, not by absolute time: the
+rivals drift between runs too, so a FalconDB number that improves while a rival's
+worsens says less than it appears to. The re-measurement of `DISTINCT` above is
+the clearest demonstration in this file — every engine in that run, ours and all
+three rivals, read 15–35% faster than in the full suite purely because fewer
+groups ran before it.
 
 Most of it came from one shape of defect, found twice in an hour: a code path
 that handles NULLs, running over columns that have none, with no cheap check to
@@ -445,12 +466,12 @@ open items are structural rather than a slow loop somewhere:
 
 | Limit | Why it matters | Next step |
 |---|---|---|
-| Scans run above the measured floor | 1 M-row `SUM` takes 63 µs against a 55 µs L3 bandwidth floor | Per-batch overhead. Within 15% of the floor, and the remainder is now smaller than this machine's run-to-run drift |
+| Scans run above the measured floor | 1 M-row `SUM` takes 61 µs against a 55 µs L3 bandwidth floor | Per-batch overhead. Within 15% of the floor, and the remainder is now smaller than this machine's run-to-run drift |
 | A join's hash table is built on one thread | ~1.0 ms of a 4.4 ms 1 M-row join, while the probe uses every core | Not a parallelism problem. Partitioning by bucket and a single-pass radix partition were both tried and both measured slower; the build spends its time allocating and filling ~2.2 MB per join. The next thing to try is allocating less — one bucket per row instead of two, and dropping the `keys` array, which duplicates the key column |
 | Thresholds are calibrated, not derived | Parallel cut-offs come from measurements on *this* laptop | The coarse ones now scale with `rayon::current_num_threads()`; the model is untested on a many-core machine |
 | Batch-count thresholds remain | `PAR_SUM_THRESHOLD` and the group-by still reason in batches, so 65 536-row batches break them | Convert every threshold to rows, then raise the Parquet batch size |
 | No NUMA awareness | A thread may work on memory owned by another socket | Nothing measured yet; needs a server to measure on |
-| `INNER JOIN` trails Polars | 2.7× at 1 M rows, the largest remaining gap | Cause not yet identified — merging, index representation and probe have all been addressed |
+| `INNER JOIN` trails Polars | 1.3× at 1 M rows | Was 2.7×, closed by probing in place and by the hash table borrowing the key column instead of copying it. What remains is not yet identified; merging, index representation and probe have all been addressed |
 | Everything lives in RAM | A table larger than memory cannot be loaded | Spill-to-disk and lazy batch reads |
 | No cost-based optimizer | Join order is whatever the query text says | Cardinality estimates from zone maps |
 | `WHERE` on a right-hand join column | Not supported: the filter is applied during the scan, before the join | Pinned by a test in `tests/join_projection.rs` |
