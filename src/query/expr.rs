@@ -1966,6 +1966,69 @@ mod in_list_semantics {
         assert_eq!(n("SELECT i FROM t WHERE i IN (1, 2)"), 2);
     }
 
+    /// Which other forms of "is this value that value" disagree with `=`?
+    ///
+    /// `IN` did, and the cause was general: comparing boxed `ScalarValue`s with a
+    /// derived `PartialEq`, which is strict about the variant, while `=` goes
+    /// through a path with widening arms. Any form that reaches the boxed
+    /// comparison has the same defect available to it, so this asks all of them
+    /// the same question at once: an integer literal against a `Float64` column
+    /// holding 1.0, 2.0, 3.0.
+    ///
+    /// Every row of the report below should agree with the `=` row. A form that
+    /// does not is a bug of the same family, not a quirk of that syntax.
+    #[test]
+    fn every_comparison_form_coerces_like_equality() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("f", DataType::Float64),
+                Field::required("i", DataType::Int64),
+            ]),
+            vec![
+                ColumnBuilder::float64((1..=3).map(|i| Some(i as f64)).collect()),
+                ColumnBuilder::int64((1..=3).map(Some).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let n = |sql: &str| -> usize {
+            db.sql(sql).unwrap().batches.iter().map(|b| b.row_count()).sum()
+        };
+
+        // Each of these asks "which rows of f equal 1 (or are 1 or 2)", written a
+        // different way. The integer literal is the point: the column is Float64.
+        let forms: Vec<(&str, usize, usize)> = vec![
+            ("f = 1",                    n("SELECT f FROM t WHERE f = 1"), 1),
+            ("f IN (1, 2)",              n("SELECT f FROM t WHERE f IN (1, 2)"), 2),
+            ("f BETWEEN 1 AND 2",        n("SELECT f FROM t WHERE f BETWEEN 1 AND 2"), 2),
+            ("f >= 1 AND f <= 2",        n("SELECT f FROM t WHERE f >= 1 AND f <= 2"), 2),
+            ("NOT (f <> 1)",             n("SELECT f FROM t WHERE NOT (f <> 1)"), 1),
+            ("CASE WHEN f = 1",          n("SELECT f FROM t WHERE CASE WHEN f = 1 THEN true ELSE false END"), 1),
+            ("f = 1 OR f = 2",           n("SELECT f FROM t WHERE f = 1 OR f = 2"), 2),
+        ];
+
+        let mut wrong = Vec::new();
+        for (form, got, want) in &forms {
+            println!("  {form:<24} -> {got} rows (expected {want})");
+            if got != want {
+                wrong.push(format!("{form}: got {got}, expected {want}"));
+            }
+        }
+        assert!(wrong.is_empty(), "forms disagreeing with `=`:
+  {}", wrong.join("
+  "));
+    }
+
     /// The typed `IN` path must answer exactly what the general path answered,
     /// including for NULLs, `NOT IN`, text, and a list with no match in it.
     #[test]
