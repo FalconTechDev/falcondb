@@ -37,11 +37,65 @@ impl Schema {
         self.fields.len()
     }
 
+    /// Find a column by name, accepting `table.column` as well as `column`.
+    ///
+    /// The parser turns `ints.i` into the literal string "ints.i", and this
+    /// compared names only for exact equality, so every qualified reference
+    /// outside a join's `ON` clause failed with "column not found":
+    ///
+    /// ```text
+    ///   SELECT ints.i FROM ints                    -- error
+    ///   SELECT i FROM ints WHERE ints.i > 0        -- error
+    ///   SELECT a.i FROM ints AS a                  -- error
+    ///   SELECT i FROM ints ORDER BY ints.i         -- error
+    ///   SELECT i FROM ints JOIN floats ON ints.i = floats.f   -- worked
+    /// ```
+    ///
+    /// The `ON` clause worked because the join resolves its keys itself, which is
+    /// why the gap went unnoticed: qualified names had been made to work exactly
+    /// where someone needed them.
+    ///
+    /// Exact match still wins, so a schema that really does hold a field named
+    /// "ints.i" -- which a join output can -- keeps its current behaviour.
+    ///
+    /// The qualifier is checked but cannot always disambiguate: a join output that
+    /// keeps unqualified names has no way to tell one table's `i` from another's,
+    /// and this reports that as ambiguous rather than silently picking the first.
+    /// Guessing there would give wrong rows, which is worse than an error message.
     pub fn column_index(&self, name: &str) -> FalconResult<usize> {
-        self.fields
-            .iter()
-            .position(|f| f.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| FalconError::ColumnNotFound(name.to_string()))
+        if let Some(i) = self.fields.iter().position(|f| f.name.eq_ignore_ascii_case(name)) {
+            return Ok(i);
+        }
+
+        if let Some((qualifier, bare)) = name.rsplit_once('.') {
+            // A field carrying the same qualifier is the unambiguous answer.
+            if let Some(i) = self
+                .fields
+                .iter()
+                .position(|f| f.name.eq_ignore_ascii_case(name) || {
+                    matches!(f.name.rsplit_once('.'), Some((q, b))
+                        if q.eq_ignore_ascii_case(qualifier) && b.eq_ignore_ascii_case(bare))
+                })
+            {
+                return Ok(i);
+            }
+
+            let mut hits = self
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.name.eq_ignore_ascii_case(bare));
+            if let Some((i, _)) = hits.next() {
+                if hits.next().is_none() {
+                    return Ok(i);
+                }
+                return Err(FalconError::InvalidQuery(format!(
+                    "column '{bare}' is ambiguous and the qualifier '{qualifier}' cannot                      resolve it, because the schema here keeps unqualified column names"
+                )));
+            }
+        }
+
+        Err(FalconError::ColumnNotFound(name.to_string()))
     }
 
     pub fn field(&self, name: &str) -> FalconResult<&Field> {
