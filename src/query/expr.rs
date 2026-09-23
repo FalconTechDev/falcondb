@@ -685,6 +685,55 @@ impl Expr {
                     _ => None,
                 }
             }
+            // `col IN (literal, ...)` — the union of the equality masks.
+            //
+            // This shape had no typed path, so it fell to `eval_batch`, which
+            // broadcasts *each list member* into a `ScalarValue` per row before
+            // comparing: `IN (1,2,3)` over 100k rows built 400k boxed values to
+            // answer 300k comparisons. Measured at 8.09ms against 98.6us for the
+            // single equality `bucket = 1` on the same column -- 82x the cost of
+            // one comparison to do three.
+            //
+            // Routing each member through `fast_cmp_mask` is not only faster, it
+            // is the only way the two agree. The general path compares boxed
+            // values with a derived `PartialEq`, which is strict about the
+            // variant, so `WHERE f IN (1, 2)` on a `Float64` column matched *no
+            // rows at all* while `WHERE f = 1` matched one: the literals parse as
+            // integers and `Int64(1) != Float64(1.0)`. `fast_cmp_mask` has the
+            // widening arms, so `IN` now coerces exactly as `=` does.
+            Expr::InList { expr, list, negated } => {
+                let Expr::Column(name) = expr.as_ref() else { return None };
+                let col = batch.column_by_name(name).ok()?;
+                // Every member must be a literal; a correlated one is a different
+                // question and stays on the general path.
+                let lits: Vec<&ScalarValue> = list
+                    .iter()
+                    .map(|e| match e {
+                        Expr::Literal(v) => Some(v),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()?;
+
+                let mut acc = vec![0u64; n_words];
+                for lit in lits {
+                    match fast_cmp_mask(col, &BinaryOp::Eq, lit, n_words) {
+                        Ok(m) => zip_bits(&mut acc, &m, |a, b| a | b),
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                if *negated {
+                    // NOT IN is the complement, minus the rows that are NULL:
+                    // a NULL value is neither in nor out, and the general path
+                    // gave those rows `Boolean(None)`, which filters as false.
+                    for w in acc.iter_mut() {
+                        *w = !*w;
+                    }
+                    mask_off_padding(&mut acc, batch.row_count());
+                    clear_null_rows(col, &mut acc);
+                }
+                Some(Ok(acc))
+            }
+
             _ => None,
         }
     }
@@ -854,6 +903,60 @@ fn clear_null_bits<T: Copy + Default>(
     }
 }
 
+/// Clear the bits past the last row.
+///
+/// Complementing a mask sets the padding bits in the final word, which stand for
+/// rows that do not exist. Nothing downstream should ever see them set.
+fn mask_off_padding(mask: &mut [u64], rows: usize) {
+    let used = rows & 63;
+    if used != 0 {
+        if let Some(last) = mask.last_mut() {
+            *last &= (1u64 << used) - 1;
+        }
+    }
+}
+
+/// Clear the bit of every row whose value is NULL, whatever the column's type.
+fn clear_null_rows(col: &crate::storage::column::Column, mask: &mut [u64]) {
+    use crate::storage::column::Column;
+    macro_rules! clear {
+        ($c:expr) => {{
+            if $c.has_nulls() {
+                for i in 0..$c.len() {
+                    if !$c.is_valid(i) {
+                        mask[i >> 6] &= !(1u64 << (i & 63));
+                    }
+                }
+            }
+        }};
+    }
+    match col {
+        Column::Int32(c)     => clear!(c),
+        Column::Int64(c)     => clear!(c),
+        Column::Float32(c)   => clear!(c),
+        Column::Float64(c)   => clear!(c),
+        Column::Boolean(c)   => {
+            for (i, v) in c.values.iter().enumerate() {
+                if v.is_none() {
+                    mask[i >> 6] &= !(1u64 << (i & 63));
+                }
+            }
+        }
+        Column::Date32(c)    => clear!(c),
+        Column::Timestamp(c) => clear!(c),
+        Column::Utf8(c)      => {
+            if c.has_nulls() {
+                for (i, &code) in c.codes().iter().enumerate() {
+                    if crate::storage::column::Utf8Column::is_null_code(code) {
+                        mask[i >> 6] &= !(1u64 << (i & 63));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn zip_bits(dst: &mut [u64], src: &[u64], f: impl Fn(u64, u64) -> u64) {
     for (d, &s) in dst.iter_mut().zip(src.iter()) { *d = f(*d, s); }
 }
@@ -965,17 +1068,35 @@ fn fast_cmp_mask(
         (Column::Timestamp(c), ScalarValue::Timestamp(Some(v))) => cmp_loop!(c, *v, i64),
         (Column::Timestamp(c), ScalarValue::Int64(Some(v)))     => cmp_loop!(c, *v, i64),
         (Column::Utf8(c),  ScalarValue::Utf8(Some(v)))  => {
-            for (i, cell) in c.iter().enumerate() {
-                let pass = cell.as_deref().map_or(false, |x| match op {
-                    BinaryOp::Eq    => x == v.as_str(),
-                    BinaryOp::NotEq => x != v.as_str(),
-                    BinaryOp::Lt    => x <  v.as_str(),
-                    BinaryOp::LtEq  => x <= v.as_str(),
-                    BinaryOp::Gt    => x >  v.as_str(),
-                    BinaryOp::GtEq  => x >= v.as_str(),
+            // Decide the predicate once per distinct string, then read codes.
+            //
+            // The column stores a code per row and the strings once, so asking
+            // the question of every row asks it of the same handful of strings
+            // over and over. The dictionary has five entries where the benchmark
+            // column has a hundred thousand rows; after this table is built the
+            // scan compares nothing but bytes of a `Vec<bool>`.
+            let pass: Vec<bool> = c
+                .dict()
+                .iter()
+                .map(|x| match op {
+                    BinaryOp::Eq    => x.as_str() == v.as_str(),
+                    BinaryOp::NotEq => x.as_str() != v.as_str(),
+                    BinaryOp::Lt    => x.as_str() <  v.as_str(),
+                    BinaryOp::LtEq  => x.as_str() <= v.as_str(),
+                    BinaryOp::Gt    => x.as_str() >  v.as_str(),
+                    BinaryOp::GtEq  => x.as_str() >= v.as_str(),
                     _ => false,
-                });
-                if pass { mask[i >> 6] |= 1u64 << (i & 63); }
+                })
+                .collect();
+            // A NULL cell fails every comparison, as it did row by row above.
+            for (w, chunk) in c.codes().chunks(64).enumerate() {
+                let mut bits = 0u64;
+                for (j, &code) in chunk.iter().enumerate() {
+                    let hit = !crate::storage::column::Utf8Column::is_null_code(code)
+                        && pass[code as usize];
+                    bits |= (hit as u64) << j;
+                }
+                mask[w] = bits;
             }
         }
         _ => {} // null literal or unsupported type → all bits 0 (no rows pass)
@@ -1838,5 +1959,117 @@ mod in_list_semantics {
         println!("i = 1        -> {}", n("SELECT i FROM t WHERE i = 1"));
         println!("i IN (1,2)   -> {}", n("SELECT i FROM t WHERE i IN (1, 2)"));
         println!("f IN (1.0,2.0) -> {}", n("SELECT f FROM t WHERE f IN (1.0, 2.0)"));
+
+        // The point of the fix: `IN` coerces the way `=` does.
+        assert_eq!(n("SELECT f FROM t WHERE f IN (1, 2)"), 2);
+        assert_eq!(n("SELECT f FROM t WHERE f IN (1.0, 2.0)"), 2);
+        assert_eq!(n("SELECT i FROM t WHERE i IN (1, 2)"), 2);
+    }
+
+    /// The typed `IN` path must answer exactly what the general path answered,
+    /// including for NULLs, `NOT IN`, text, and a list with no match in it.
+    #[test]
+    fn typed_in_matches_the_general_path() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::nullable("i", DataType::Int64),
+                Field::nullable("s", DataType::Utf8),
+            ]),
+            vec![
+                ColumnBuilder::int64(vec![Some(1), Some(2), None, Some(3), Some(2)]),
+                ColumnBuilder::utf8_from_str(vec![
+                    Some("a"), Some("b"), None, Some("c"), Some("b"),
+                ]),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let n = |sql: &str| -> usize {
+            db.sql(sql).unwrap().batches.iter().map(|b| b.row_count()).sum()
+        };
+
+        // A NULL row is in neither the IN set nor its complement.
+        assert_eq!(n("SELECT i FROM t WHERE i IN (1, 2)"), 3);
+        assert_eq!(n("SELECT i FROM t WHERE i NOT IN (1, 2)"), 1);
+        assert_eq!(n("SELECT s FROM t WHERE s IN ('a', 'b')"), 3);
+        assert_eq!(n("SELECT s FROM t WHERE s NOT IN ('a', 'b')"), 1);
+        // Nothing in the list occurs.
+        assert_eq!(n("SELECT i FROM t WHERE i IN (7, 8)"), 0);
+        assert_eq!(n("SELECT s FROM t WHERE s IN ('z')"), 0);
+        // NOT IN over a list that matches nothing keeps every non-NULL row.
+        assert_eq!(n("SELECT i FROM t WHERE i NOT IN (7)"), 4);
+        // An empty-ish edge: one member.
+        assert_eq!(n("SELECT i FROM t WHERE i IN (2)"), 2);
+        // AND/OR compose with the new arm.
+        assert_eq!(n("SELECT i FROM t WHERE i IN (1, 2) AND i > 1"), 2);
+        assert_eq!(n("SELECT i FROM t WHERE i IN (1) OR i IN (3)"), 2);
+    }
+
+    /// What `IN` costs now, against the single equality it is built from.
+    ///
+    /// Run with
+    /// `cargo test --release --lib in_list_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn in_list_speed() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("bucket", DataType::Int64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS)
+                        .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5]))
+                        .collect(),
+                ),
+                ColumnBuilder::int64((0..ROWS).map(|i| Some((i % 5) as i64)).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let time = |label: &str, sql: &str| {
+            for _ in 0..3 { db.sql(sql).unwrap(); }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(sql).unwrap());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>36}: {best:>9.2?}");
+            best
+        };
+
+        println!("over {ROWS} rows:");
+        let eq = time("bucket = 1", "SELECT COUNT(*) FROM t WHERE bucket = 1");
+        let ii = time("bucket IN (1,2,3)", "SELECT COUNT(*) FROM t WHERE bucket IN (1,2,3)");
+        let et = time("dept = 'eng'", "SELECT COUNT(*) FROM t WHERE dept = 'eng'");
+        let it = time("dept IN ('eng','hr','ops')", "SELECT COUNT(*) FROM t WHERE dept IN ('eng','hr','ops')");
+        let ni = time("bucket NOT IN (1,2,3)", "SELECT COUNT(*) FROM t WHERE bucket NOT IN (1,2,3)");
+        println!("    integer IN costs {:.1}x one equality", ii.as_secs_f64() / eq.as_secs_f64());
+        println!("    text IN costs {:.1}x one text equality", it.as_secs_f64() / et.as_secs_f64());
+        println!("    NOT IN costs {:.1}x IN", ni.as_secs_f64() / ii.as_secs_f64());
     }
 }
