@@ -1796,3 +1796,47 @@ mod tests {
         assert_eq!(mask, vec![false, true, false]);
     }
 }
+
+#[cfg(test)]
+mod in_list_semantics {
+    /// Does `IN` agree with `=` when the literal's type differs from the column's?
+    ///
+    /// `IN` compares boxed `ScalarValue`s with a derived `PartialEq`, which is
+    /// strict about the variant, while `=` goes through `fast_cmp_mask`, which has
+    /// arms for widening an integer literal to a float column. If those two
+    /// disagree, that is a correctness question to settle before making either
+    /// faster.
+    #[test]
+    fn in_agrees_with_equality_across_numeric_types() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("f", DataType::Float64),
+                Field::required("i", DataType::Int64),
+            ]),
+            vec![
+                ColumnBuilder::float64((1..=5).map(|i| Some(i as f64)).collect()),
+                ColumnBuilder::int64((1..=5).map(Some).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let n = |sql: &str| -> usize {
+            db.sql(sql).unwrap().batches.iter().map(|b| b.row_count()).sum()
+        };
+
+        println!("f = 1        -> {}", n("SELECT f FROM t WHERE f = 1"));
+        println!("f IN (1,2)   -> {}", n("SELECT f FROM t WHERE f IN (1, 2)"));
+        println!("i = 1        -> {}", n("SELECT i FROM t WHERE i = 1"));
+        println!("i IN (1,2)   -> {}", n("SELECT i FROM t WHERE i IN (1, 2)"));
+        println!("f IN (1.0,2.0) -> {}", n("SELECT f FROM t WHERE f IN (1.0, 2.0)"));
+    }
+}

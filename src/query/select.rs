@@ -698,6 +698,90 @@ mod distinct_perf {
     };
     use std::time::Instant;
 
+    /// Two shapes the benchmark suite never runs: a partitioned window, and
+    /// `IN (...)`.
+    ///
+    /// The window benchmark is `ROW_NUMBER() OVER (ORDER BY score DESC)` with no
+    /// `PARTITION BY` at all, and there is no `IN` benchmark of any kind. Both are
+    /// ordinary SQL, and the pattern of this session is that an unmeasured shape
+    /// stays on whatever path it was first given.
+    ///
+    /// Numeric and text versions of each, so a gap between them points at a
+    /// missing typed path rather than at the feature being expensive.
+    ///
+    /// Run with
+    /// `cargo test --release --lib unmeasured_shapes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn unmeasured_shapes() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("bucket", DataType::Int64),
+                Field::required("score", DataType::Float64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS)
+                        .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5]))
+                        .collect(),
+                ),
+                ColumnBuilder::int64((0..ROWS).map(|i| Some((i % 5) as i64)).collect()),
+                ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 100) as f64)).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let time = |label: &str, sql: &str| {
+            for _ in 0..3 { db.sql(sql).unwrap(); }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(sql).unwrap());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>44}: {best:>9.2?}");
+            best
+        };
+
+        println!("over {ROWS} rows:");
+        let wn = time(
+            "ROW_NUMBER, no PARTITION BY (benchmarked)",
+            "SELECT ROW_NUMBER() OVER (ORDER BY score DESC) AS rn FROM t",
+        );
+        let wi = time(
+            "ROW_NUMBER, PARTITION BY bucket (Int64)",
+            "SELECT ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY score DESC) AS rn FROM t",
+        );
+        let wt = time(
+            "ROW_NUMBER, PARTITION BY dept (Utf8)",
+            "SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rn FROM t",
+        );
+        println!("    partitioning by an integer costs {:.1}x the unpartitioned form", wi.as_secs_f64() / wn.as_secs_f64());
+        println!("    partitioning by text costs {:.1}x the integer", wt.as_secs_f64() / wi.as_secs_f64());
+
+        let ii = time("WHERE bucket IN (1,2,3)", "SELECT COUNT(*) FROM t WHERE bucket IN (1,2,3)");
+        let it = time(
+            "WHERE dept IN ('eng','hr','ops')",
+            "SELECT COUNT(*) FROM t WHERE dept IN ('eng','hr','ops')",
+        );
+        let ie = time("WHERE bucket = 1 (for reference)", "SELECT COUNT(*) FROM t WHERE bucket = 1");
+        println!("    IN over integers costs {:.1}x a single equality", ii.as_secs_f64() / ie.as_secs_f64());
+        println!("    IN over text costs {:.1}x the integer IN", it.as_secs_f64() / ii.as_secs_f64());
+    }
+
     /// What does `DISTINCT` cost on a text column against a numeric one?
     ///
     /// The benchmark suite runs `SELECT DISTINCT score`, a `Float64`. `GROUP BY`
