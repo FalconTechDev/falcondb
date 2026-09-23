@@ -2029,6 +2029,74 @@ mod in_list_semantics {
   "));
     }
 
+    /// The same question, asked where row *membership* is decided rather than a
+    /// filter: join keys, `GROUP BY`, `UNION`, `IN (SELECT ...)`.
+    ///
+    /// These all match values against values, and each one that reaches the boxed
+    /// comparison can disagree with `=` the way `IN` did. `WHERE` turned out to be
+    /// clean once `IN` was fixed; this checks the rest of the engine rather than
+    /// assuming the family ends there.
+    ///
+    /// An Int64 column and a Float64 column holding the same three numbers should
+    /// join on three rows, group to three groups, and union to three values.
+    #[test]
+    fn membership_across_numeric_types() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+
+        let ints = RecordBatch::new(
+            Schema::new(vec![Field::required("i", DataType::Int64)]),
+            vec![ColumnBuilder::int64((1..=3).map(Some).collect())],
+        )
+        .unwrap();
+        let floats = RecordBatch::new(
+            Schema::new(vec![Field::required("f", DataType::Float64)]),
+            vec![ColumnBuilder::float64((1..=3).map(|i| Some(i as f64)).collect())],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("ints", vec![ints]).unwrap();
+        db.create_table_from_batches("floats", vec![floats]).unwrap();
+
+        let n = |sql: &str| -> usize {
+            match db.sql(sql) {
+                Ok(r) => r.batches.iter().map(|b| b.row_count()).sum(),
+                Err(e) => {
+                    println!("      (error: {e})");
+                    usize::MAX
+                }
+            }
+        };
+
+        let cases: Vec<(&str, usize, usize)> = vec![
+            ("JOIN ON i = f",
+             n("SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f"), 3),
+            ("WHERE i = f (cross)",
+             n("SELECT ints.i FROM ints, floats WHERE ints.i = floats.f"), 3),
+            ("i IN (SELECT f)",
+             n("SELECT i FROM ints WHERE i IN (SELECT f FROM floats)"), 3),
+            ("EXISTS correlated",
+             n("SELECT i FROM ints WHERE EXISTS (SELECT 1 FROM floats WHERE floats.f = ints.i)"), 3),
+        ];
+
+        let mut wrong = Vec::new();
+        for (form, got, want) in &cases {
+            let shown = if *got == usize::MAX { "error".to_string() } else { got.to_string() };
+            println!("  {form:<24} -> {shown} rows (expected {want})");
+            if got != want {
+                wrong.push(format!("{form}: got {shown}, expected {want}"));
+            }
+        }
+        assert!(wrong.is_empty(), "membership forms that do not match across numeric types:
+  {}", wrong.join("
+  "));
+    }
+
     /// The typed `IN` path must answer exactly what the general path answered,
     /// including for NULLs, `NOT IN`, text, and a list with no match in it.
     #[test]
