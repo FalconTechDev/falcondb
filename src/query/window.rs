@@ -119,24 +119,50 @@ impl WindowExpr {
             .map(|e| e.eval_batch(batch))
             .collect::<FalconResult<_>>()?;
 
-        // 2. Evaluate ORDER BY columns inside the window.
-        let order_vals: Vec<Vec<ScalarValue>> = self.order_by.iter()
-            .map(|s| s.expr.eval_batch(batch))
-            .collect::<FalconResult<_>>()?;
-
-        // A single numeric ORDER BY key can be read as raw f64s, skipping the
-        // `ScalarValue` box per row that the sort below would otherwise unpack again.
-        // `None` here just means the general path is used, as it was before.
+        // 2. A single numeric ORDER BY key can be read as raw f64s, skipping the
+        // `ScalarValue` box per row that the sort below would otherwise unpack
+        // again. `None` here just means the general path is used, as it was
+        // before.
         let order_dense: Option<Vec<f64>> = (self.order_by.len() == 1)
             .then(|| self.order_by[0].expr.eval_dense_f64(batch))
             .flatten();
 
-        // 3. Evaluate input column (for SUM/AVG/LAG/LEAD etc.).
+        // ROW_NUMBER never looks at the ordering key. It numbers rows 1..n by
+        // their position after the sort, so once the dense sort has done the
+        // ordering, nothing downstream reads the boxed copy: `rank_dense`'s
+        // `RowNumber` arm ignores `order_vals` entirely, and the two comparator
+        // sorts that would read it are not reached.
+        //
+        // Evaluating it anyway cost a `ScalarValue` per row -- 100k heap-boxed
+        // floats built and dropped to answer a question no one asked. Measured
+        // against the plain `ORDER BY score DESC` over the same column, used as
+        // the reference because it does the same sort and was not changed:
+        // ROW_NUMBER cost 3.03x the plain sort, while the same query with no
+        // ORDER BY at all cost 0.36x -- so the numbering itself was never the
+        // expense.
+        //
+        // RANK and DENSE_RANK are deliberately left alone: they compare adjacent
+        // keys to find ties, and deciding ties from raw f64s would disagree with
+        // `cmp_scalar` on NaN and on -0.0. That is a semantic change, not a
+        // speed-up, and it is not worth the milliseconds.
+        let needs_order_vals = !matches!(self.func, WindowFunc::RowNumber)
+            || !(self.order_by.is_empty() || order_dense.is_some());
+
+        // 3. Evaluate ORDER BY columns inside the window.
+        let order_vals: Vec<Vec<ScalarValue>> = if needs_order_vals {
+            self.order_by.iter()
+                .map(|s| s.expr.eval_batch(batch))
+                .collect::<FalconResult<_>>()?
+        } else {
+            Vec::new()
+        };
+
+        // 4. Evaluate input column (for SUM/AVG/LAG/LEAD etc.).
         let input_vals: Option<Vec<ScalarValue>> = self.input.as_ref()
             .map(|e| e.eval_batch(batch))
             .transpose()?;
 
-        // 4. Group rows into partitions (preserve insertion order for determinism).
+        // 5. Group rows into partitions (preserve insertion order for determinism).
         //
         // Without PARTITION BY there is exactly one partition holding every row, so
         // the map is skipped entirely. Building it anyway meant formatting a key and
@@ -157,7 +183,7 @@ impl WindowExpr {
             part_order.iter().map(|k| part_map[k].clone()).collect()
         };
 
-        // 5. Apply window function per partition.
+        // 6. Apply window function per partition.
         // ROW_NUMBER, RANK and DENSE_RANK all produce a non-NULL i64 per row, so
         // their result is written densely instead of through a `ScalarValue` per
         // row and a conversion pass afterwards. Every other function keeps the
@@ -170,7 +196,9 @@ impl WindowExpr {
             let mut ranks: Vec<i64> = vec![0; n];
             for indices in &partitions {
                 let mut sorted = indices.clone();
-                if !order_vals.is_empty()
+                // Asks about the ORDER BY clause, not about the boxed keys: with
+                // the skip above they are no longer the same question.
+                if !self.order_by.is_empty()
                     && !try_dense_partition_sort(order_dense.as_deref(), &self.order_by, &mut sorted)
                     && !try_typed_partition_sort(&order_vals, &self.order_by, &mut sorted)
                 {
@@ -875,6 +903,75 @@ mod tests {
                 Some(100.0), Some(120.0), Some(80.0), Some(90.0), Some(110.0),
             ]),
         ]).unwrap()
+    }
+
+    #[test]
+    /// What ROW_NUMBER costs beyond the sort it is built on.
+    ///
+    /// The plain `ORDER BY` is the reference: it does the same sort over the same
+    /// column and is not being changed, so the *ratio* between the two is read on
+    /// one machine at one moment and survives the run-to-run drift that makes
+    /// absolute times from different runs incomparable.
+    ///
+    /// Run with
+    /// `cargo test --release --lib window_overhead -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn window_overhead() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("score", DataType::Float64),
+                Field::required("dept", DataType::Utf8),
+            ]),
+            vec![
+                ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 1000) as f64)).collect()),
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS)
+                        .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5]))
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let time = |label: &str, sql: &str| {
+            for _ in 0..3 { db.sql(sql).unwrap(); }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(sql).unwrap());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>52}: {best:>9.2?}");
+            best
+        };
+
+        println!("over {ROWS} rows:");
+        let plain = time("ORDER BY score DESC (the reference)", "SELECT score FROM t ORDER BY score DESC");
+        let rn = time(
+            "ROW_NUMBER() OVER (ORDER BY score DESC)",
+            "SELECT ROW_NUMBER() OVER (ORDER BY score DESC) AS rn FROM t",
+        );
+        let rk = time(
+            "RANK() OVER (ORDER BY score DESC)",
+            "SELECT RANK() OVER (ORDER BY score DESC) AS rk FROM t",
+        );
+        let bare = time("ROW_NUMBER() OVER () (no ORDER BY)", "SELECT ROW_NUMBER() OVER () AS rn FROM t");
+        println!("    ROW_NUMBER costs {:.2}x the plain sort", rn.as_secs_f64() / plain.as_secs_f64());
+        println!("    RANK costs       {:.2}x the plain sort", rk.as_secs_f64() / plain.as_secs_f64());
+        println!("    an unordered ROW_NUMBER costs {:.2}x the plain sort", bare.as_secs_f64() / plain.as_secs_f64());
     }
 
     #[test]
