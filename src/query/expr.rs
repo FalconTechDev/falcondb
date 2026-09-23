@@ -2073,6 +2073,10 @@ mod in_list_semantics {
             }
         };
 
+        // What does a join actually call its output columns?
+        let r = db.sql("SELECT * FROM ints JOIN floats ON ints.i = floats.f").unwrap();
+        println!("  join output schema: {:?}", r.batches[0].schema.column_names());
+
         let cases: Vec<(&str, usize, usize)> = vec![
             ("JOIN ON i = f",
              n("SELECT i FROM ints JOIN floats ON ints.i = floats.f"), 3),
