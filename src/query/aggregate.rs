@@ -1677,6 +1677,128 @@ mod int_sum {
 }
 
 #[cfg(test)]
+mod text_aggregates {
+    use super::*;
+    use crate::db::Database;
+    use crate::storage::{
+        column::ColumnBuilder,
+        schema::{Field, Schema},
+        table::RecordBatch,
+        types::DataType,
+    };
+
+    fn db_with(batches: Vec<Vec<Option<&str>>>) -> Database {
+        let schema = Schema::new(vec![Field::nullable("s", DataType::Utf8)]);
+        let batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .map(|vals| {
+                RecordBatch::new(schema.clone(), vec![ColumnBuilder::utf8_from_str(vals)]).unwrap()
+            })
+            .collect();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", batches).unwrap();
+        db
+    }
+
+    fn one(db: &Database, sql: &str) -> String {
+        let rows = db.sql(sql).unwrap().to_rows();
+        assert_eq!(rows.len(), 1, "aggregate should return one row");
+        rows[0][0].clone()
+    }
+
+    /// MIN and MAX over text answer from the dictionary, so they have to pick the
+    /// smallest and largest string that actually occurs -- not the first or last
+    /// dictionary entry, which is in first-seen order.
+    #[test]
+    fn min_max_pick_by_string_not_by_dictionary_order() {
+        let db = db_with(vec![vec![Some("pear"), Some("apple"), Some("fig")]]);
+        assert_eq!(one(&db, "SELECT MIN(s) FROM t"), "apple");
+        assert_eq!(one(&db, "SELECT MAX(s) FROM t"), "pear");
+    }
+
+    /// Several batches means several accumulators merged, and a dictionary per
+    /// batch. A value that is smallest overall but appears only in the second
+    /// batch is the case that catches a merge that keeps the wrong side.
+    #[test]
+    fn min_max_and_distinct_span_batches() {
+        let db = db_with(vec![
+            vec![Some("m"), Some("z")],
+            vec![Some("a"), Some("z")],
+        ]);
+        assert_eq!(one(&db, "SELECT MIN(s) FROM t"), "a");
+        assert_eq!(one(&db, "SELECT MAX(s) FROM t"), "z");
+        // a, m, z
+        assert_eq!(one(&db, "SELECT COUNT(DISTINCT s) FROM t"), "3");
+    }
+
+    /// A dictionary can hold entries that no row uses -- after a filter, or
+    /// because the column was built that way. Those must not be counted.
+    #[test]
+    fn ignores_dictionary_entries_no_row_uses() {
+        let db = db_with(vec![vec![Some("b"), Some("c"), Some("a")]]);
+        assert_eq!(one(&db, "SELECT MIN(s) FROM t WHERE s > 'a'"), "b");
+        assert_eq!(one(&db, "SELECT COUNT(DISTINCT s) FROM t WHERE s > 'a'"), "2");
+    }
+
+    /// NULLs are not values: they are not the minimum, and they are not distinct
+    /// values either.
+    #[test]
+    fn nulls_are_not_values() {
+        let db = db_with(vec![vec![None, Some("b"), None, Some("a")]]);
+        assert_eq!(one(&db, "SELECT MIN(s) FROM t"), "a");
+        assert_eq!(one(&db, "SELECT MAX(s) FROM t"), "b");
+        assert_eq!(one(&db, "SELECT COUNT(DISTINCT s) FROM t"), "2");
+
+        let all_null = db_with(vec![vec![None, None]]);
+        assert_eq!(one(&all_null, "SELECT COUNT(DISTINCT s) FROM t"), "0");
+    }
+
+    /// The typed distinct set has to keep two things the old text-based one did,
+    /// both observable: every NaN counted once because they all print `NaN`, and
+    /// `-0.0` counted separately from `0.0` because they print differently.
+    #[test]
+    fn float_distinct_keeps_the_old_answers() {
+        let schema = Schema::new(vec![Field::required("f", DataType::Float64)]);
+        let batch = RecordBatch::new(
+            schema,
+            vec![ColumnBuilder::float64(vec![
+                Some(f64::NAN),
+                Some(-f64::NAN),
+                Some(0.0),
+                Some(-0.0),
+                Some(1.5),
+                Some(1.5),
+            ])],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+        // NaN once, 0.0 and -0.0 as two, 1.5 once => 4
+        assert_eq!(one(&db, "SELECT COUNT(DISTINCT f) FROM t"), "4");
+    }
+
+    /// Integers and floats that print alike used to collapse into one value,
+    /// because everything went through its text form. A column holds one type, so
+    /// this only arises across a union; the set falls back to text when it sees
+    /// two kinds, which keeps that answer.
+    #[test]
+    fn mixed_kinds_fall_back_to_text() {
+        let mut set = DistinctSet::default();
+        set.insert(&ScalarValue::Int64(Some(1)));
+        set.insert(&ScalarValue::Float64(Some(1.0)));
+        assert_eq!(set.len(), 1, "1 and 1.0 both print as 1");
+
+        let mut ints = DistinctSet::default();
+        ints.insert(&ScalarValue::Int64(Some(1)));
+        ints.insert(&ScalarValue::Int64(Some(2)));
+        let mut floats = DistinctSet::default();
+        floats.insert(&ScalarValue::Float64(Some(2.0)));
+        ints.merge(&floats);
+        assert_eq!(ints.len(), 2, "merging kinds compares as text too");
+    }
+}
+
+#[cfg(test)]
 mod sum_perf {
     use super::*;
     use std::time::Instant;
@@ -2681,11 +2803,46 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column, may_split: bool) -> boo
         };
     }
 
+    /// Which dictionary entries actually occur in this batch.
+    ///
+    /// Aggregating a text column row by row asks the same question about the
+    /// same handful of strings a hundred thousand times. The dictionary holds
+    /// distinct values, so one pass over the codes answers it, and the work that
+    /// follows is proportional to the number of distinct values rather than to
+    /// the number of rows.
+    fn present_codes(c: &crate::storage::column::Utf8Column) -> Vec<bool> {
+        let mut present = vec![false; c.dict().len()];
+        for &code in c.codes() {
+            if !crate::storage::column::Utf8Column::is_null_code(code) {
+                present[code as usize] = true;
+            }
+        }
+        present
+    }
+
     match acc {
         Accumulator::Count { n } => {
             // COUNT(expr) counts non-NULL values; the count is metadata, not data.
             *n += (col.len() - col.null_count()) as i64;
             true
+        }
+
+        // COUNT(DISTINCT) over text: the answer is about the dictionary, and the
+        // rows only say which of its entries to consider. Without this the caller
+        // falls back to `eval_batch`, which builds a `String` per row before the
+        // set ever sees it -- so the set being typed did not help here, and
+        // COUNT(DISTINCT dept) stayed at 13ms while COUNT(DISTINCT score) went
+        // from 14.6ms to 3.6ms.
+        Accumulator::CountDistinct { seen } => {
+            if let C::Utf8(c) = col {
+                for (i, &occurs) in present_codes(c).iter().enumerate() {
+                    if occurs {
+                        seen.insert(&ScalarValue::Utf8(Some(c.dict()[i].clone())));
+                    }
+                }
+                return true;
+            }
+            false
         }
         Accumulator::Sum { total, valid } => {
             // Fast paths for no-null columns: a single reduction without branches.
@@ -2772,7 +2929,28 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column, may_split: bool) -> boo
             *count += n;
             true
         }
-        Accumulator::Min { value, .. } => {
+        Accumulator::Min { value, str_value } => {
+            // Text compares as text, and the smallest value present is the
+            // smallest dictionary entry that occurs. Row-by-row this was 130x the
+            // cost of the same aggregate over a float column, because every row
+            // became a `ScalarValue::Utf8` -- a heap allocation -- before being
+            // compared.
+            if let C::Utf8(c) = col {
+                let present = present_codes(c);
+                let smallest = c
+                    .dict()
+                    .iter()
+                    .zip(&present)
+                    .filter(|(_, &occurs)| occurs)
+                    .map(|(text, _)| text)
+                    .min();
+                if let Some(text) = smallest {
+                    if str_value.as_deref().is_none_or(|cur| text.as_str() < cur) {
+                        *str_value = Some(text.clone());
+                    }
+                }
+                return true;
+            }
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
                     let dense = c.dense();
@@ -2798,7 +2976,24 @@ fn accumulate_typed(acc: &mut Accumulator, col: &Column, may_split: bool) -> boo
             }
             true
         }
-        Accumulator::Max { value, .. } => {
+        Accumulator::Max { value, str_value } => {
+            // See `Min` above.
+            if let C::Utf8(c) = col {
+                let present = present_codes(c);
+                let largest = c
+                    .dict()
+                    .iter()
+                    .zip(&present)
+                    .filter(|(_, &occurs)| occurs)
+                    .map(|(text, _)| text)
+                    .max();
+                if let Some(text) = largest {
+                    if str_value.as_deref().is_none_or(|cur| text.as_str() > cur) {
+                        *str_value = Some(text.clone());
+                    }
+                }
+                return true;
+            }
             if let C::Float64(c) = col {
                 if !c.has_nulls() {
                     let dense = c.dense();
