@@ -1620,6 +1620,70 @@ impl SumLane for i32 {
 mod sum_threshold {
     use crate::query::aggregate::{par_sum_i64, sum_i64};
 
+    /// End to end: what does `SUM` over an integer column cost against `SUM`
+    /// over a float column of the same shape?
+    ///
+    /// The kernel comment claims the integer accumulator runs at 0.82-0.92x the
+    /// float one, but the benchmark suite has `SUM(id)` at 20.8us and
+    /// `SUM(score)` at 8.64us over the same 100k rows -- 2.4x, the other way.
+    /// One of those is measuring something the query does not do, and the query
+    /// is the thing that matters.
+    ///
+    /// Both columns live in the same table and are summed alternately, so the
+    /// comparison is a ratio read in one process.
+    ///
+    /// Run with
+    /// `cargo test --release --lib integer_against_float_sum -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn integer_against_float_sum() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        for &rows in &[10_000usize, 100_000, 1_000_000] {
+            let batch = RecordBatch::new(
+                Schema::new(vec![
+                    Field::required("id", DataType::Int64),
+                    Field::required("score", DataType::Float64),
+                ]),
+                vec![
+                    ColumnBuilder::int64((0..rows as i64).map(Some).collect()),
+                    ColumnBuilder::float64((0..rows).map(|i| Some(i as f64)).collect()),
+                ],
+            )
+            .unwrap();
+            let db = Database::in_memory();
+            db.create_table_from_batches("t", vec![batch]).unwrap();
+
+            let int_sql = "SELECT SUM(id) AS s FROM t";
+            let flt_sql = "SELECT SUM(score) AS s FROM t";
+            for _ in 0..5 {
+                db.sql(int_sql).unwrap();
+                db.sql(flt_sql).unwrap();
+            }
+            let (mut bi, mut bf) = (std::time::Duration::MAX, std::time::Duration::MAX);
+            for _ in 0..15 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(int_sql).unwrap());
+                bi = bi.min(t.elapsed());
+
+                let t = Instant::now();
+                std::hint::black_box(db.sql(flt_sql).unwrap());
+                bf = bf.min(t.elapsed());
+            }
+            println!(
+                "{rows:>9} rows: SUM(id) {bi:>9.2?}   SUM(score) {bf:>9.2?}   integer costs {:.2}x",
+                bi.as_secs_f64() / bf.as_secs_f64()
+            );
+        }
+    }
+
     /// Where does splitting the integer sum across cores actually start paying?
     ///
     /// `PAR_SUM_THRESHOLD` is 65_536, a number that was chosen rather than
