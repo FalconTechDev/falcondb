@@ -82,10 +82,161 @@ impl GroupKey {
     }
 }
 
+use crate::query::hash::FastSet;
+
+/// The distinct values `COUNT(DISTINCT x)` has seen.
+///
+/// This was a `HashSet<String>`, and every row went into it as `val.to_string()`
+/// -- so a number was *formatted* into a fresh heap allocation before it could be
+/// looked up, and then dropped again in the usual case where the value was
+/// already there. Over 100k rows with a hundred distinct values that is 100k
+/// allocations to learn a hundred facts; `COUNT(DISTINCT score)` measured 14.6ms.
+///
+/// Values now stay in their own representation. The text form is only used when
+/// a column really does mix kinds, which keeps the old answer for that case.
+///
+/// Two details of the old behaviour are deliberately preserved, because they are
+/// observable:
+///
+///   - every `NaN` counted as one value, since they all print as `NaN`. Float
+///     bits are canonicalised for that reason.
+///   - `-0.0` and `0.0` counted as two, since they print as `-0` and `0`. Their
+///     bit patterns differ, so that still holds.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum DistinctSet {
+    #[default]
+    Empty,
+    Ints(FastSet<i64>),
+    Floats(FastSet<u64>),
+    Bools(FastSet<bool>),
+    Strings(FastSet<String>),
+    /// More than one kind of value in one column, compared as text as before.
+    Mixed(FastSet<String>),
+}
+
+impl DistinctSet {
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Ints(s) => s.len(),
+            Self::Floats(s) => s.len(),
+            Self::Bools(s) => s.len(),
+            Self::Strings(s) => s.len(),
+            Self::Mixed(s) => s.len(),
+        }
+    }
+
+    /// `NaN` has many bit patterns and they all print alike, so they collapse to
+    /// one. Zero is left alone: `-0.0` and `0.0` print differently and always
+    /// counted as two.
+    #[inline]
+    fn float_key(v: f64) -> u64 {
+        if v.is_nan() { f64::NAN.to_bits() } else { v.to_bits() }
+    }
+
+    /// Everything this set holds, rendered as text.
+    fn to_strings(&self) -> FastSet<String> {
+        match self {
+            Self::Empty => FastSet::default(),
+            Self::Ints(s) => s.iter().map(|v| v.to_string()).collect(),
+            Self::Floats(s) => s.iter().map(|&b| f64::from_bits(b).to_string()).collect(),
+            Self::Bools(s) => s.iter().map(|v| v.to_string()).collect(),
+            Self::Strings(s) | Self::Mixed(s) => s.clone(),
+        }
+    }
+
+    fn insert(&mut self, val: &ScalarValue) {
+        // Which variant does this value belong in? `None` means it has no
+        // compact form here and the set becomes textual.
+        enum Kind { Int(i64), Float(f64), Bool(bool), Str(String), Other }
+        let kind = match val {
+            ScalarValue::Int32(Some(v))     => Kind::Int(*v as i64),
+            ScalarValue::Int64(Some(v))     => Kind::Int(*v),
+            ScalarValue::Date32(Some(v))    => Kind::Int(*v as i64),
+            ScalarValue::Timestamp(Some(v)) => Kind::Int(*v),
+            ScalarValue::Float32(Some(v))   => Kind::Float(*v as f64),
+            ScalarValue::Float64(Some(v))   => Kind::Float(*v),
+            ScalarValue::Boolean(Some(v))   => Kind::Bool(*v),
+            ScalarValue::Utf8(Some(v))      => Kind::Str(v.clone()),
+            _ => Kind::Other,
+        };
+
+        // A value of a different kind than the set holds: fall back to text, and
+        // keep what is already there by rendering it.
+        let compatible = matches!(
+            (&*self, &kind),
+            (Self::Empty, _)
+                | (Self::Ints(_), Kind::Int(_))
+                | (Self::Floats(_), Kind::Float(_))
+                | (Self::Bools(_), Kind::Bool(_))
+                | (Self::Strings(_), Kind::Str(_))
+                | (Self::Mixed(_), _)
+        );
+        if !compatible || matches!(kind, Kind::Other) {
+            let mut text = self.to_strings();
+            text.insert(val.to_string());
+            *self = Self::Mixed(text);
+            return;
+        }
+
+        match (self, kind) {
+            (this @ Self::Empty, Kind::Int(v)) => {
+                let mut s = FastSet::default();
+                s.insert(v);
+                *this = Self::Ints(s);
+            }
+            (this @ Self::Empty, Kind::Float(v)) => {
+                let mut s = FastSet::default();
+                s.insert(Self::float_key(v));
+                *this = Self::Floats(s);
+            }
+            (this @ Self::Empty, Kind::Bool(v)) => {
+                let mut s = FastSet::default();
+                s.insert(v);
+                *this = Self::Bools(s);
+            }
+            (this @ Self::Empty, Kind::Str(v)) => {
+                let mut s = FastSet::default();
+                s.insert(v);
+                *this = Self::Strings(s);
+            }
+            (Self::Ints(s), Kind::Int(v)) => { s.insert(v); }
+            (Self::Floats(s), Kind::Float(v)) => { s.insert(Self::float_key(v)); }
+            (Self::Bools(s), Kind::Bool(v)) => { s.insert(v); }
+            (Self::Strings(s), Kind::Str(v)) => {
+                // Only allocate when the value is new.
+                if !s.contains(v.as_str()) {
+                    s.insert(v);
+                }
+            }
+            (Self::Mixed(s), _) => { s.insert(val.to_string()); }
+            _ => unreachable!("compatibility was checked above"),
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        match (&mut *self, other) {
+            (_, Self::Empty) => {}
+            (this @ Self::Empty, _) => *this = other.clone(),
+            (Self::Ints(a), Self::Ints(b)) => a.extend(b.iter().copied()),
+            (Self::Floats(a), Self::Floats(b)) => a.extend(b.iter().copied()),
+            (Self::Bools(a), Self::Bools(b)) => a.extend(b.iter().copied()),
+            (Self::Strings(a), Self::Strings(b)) => a.extend(b.iter().cloned()),
+            // Mismatched kinds, or either side already textual: compare as text,
+            // which is what the whole accumulator used to do.
+            (this, other) => {
+                let mut text = this.to_strings();
+                text.extend(other.to_strings());
+                *this = Self::Mixed(text);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Accumulator {
     Count        { n: i64 },
-    CountDistinct { seen: std::collections::HashSet<String> },
+    CountDistinct { seen: DistinctSet },
     Sum          { total: f64, valid: bool },
     Avg          { total: f64, count: i64 },
     Min          { value: Option<f64>, str_value: Option<String> },
@@ -103,7 +254,7 @@ impl Accumulator {
     fn new(func: &AggFunc) -> Self {
         match func {
             AggFunc::Count         => Self::Count { n: 0 },
-            AggFunc::CountDistinct => Self::CountDistinct { seen: std::collections::HashSet::new() },
+            AggFunc::CountDistinct => Self::CountDistinct { seen: DistinctSet::default() },
             AggFunc::Sum           => Self::Sum  { total: 0.0, valid: false },
             AggFunc::Avg           => Self::Avg  { total: 0.0, count: 0 },
             AggFunc::Min           => Self::Min  { value: None, str_value: None },
@@ -122,7 +273,7 @@ impl Accumulator {
         if val.is_null() { return; }
         match self {
             Self::Count { n } => *n += 1,
-            Self::CountDistinct { seen } => { seen.insert(val.to_string()); }
+            Self::CountDistinct { seen } => seen.insert(val),
             Self::Sum { total, valid } => {
                 if let Some(v) = val.as_f64() { *total += v; *valid = true; }
             }
@@ -187,7 +338,7 @@ impl Accumulator {
         match (self, other) {
             (Self::Count { n }, Self::Count { n: m }) => *n += m,
             (Self::CountDistinct { seen }, Self::CountDistinct { seen: other }) => {
-                seen.extend(other);
+                seen.merge(&other);
             }
             (Self::Sum { total, valid }, Self::Sum { total: t2, valid: v2 }) => {
                 *total += t2;
@@ -2228,6 +2379,76 @@ serial vs parallel (mean of a repetition block):");
                 gb(sm), gb(pm), pm.as_secs_f64() / sm.as_secs_f64(),
             );
         }
+    }
+
+    /// What do aggregates cost on a string column?
+    ///
+    /// `accumulate_typed` handles the primitive types. When it declines, the
+    /// caller falls back to `eval_batch` -- a `ScalarValue` per row, which for
+    /// text means a heap-allocated `String` per row -- and then updates the
+    /// accumulator one value at a time.
+    ///
+    /// Two of those accumulators can do much better on a dictionary column.
+    /// `MIN`/`MAX` only need the smallest or largest value that actually occurs,
+    /// which is a question about the dictionary once you know which codes appear.
+    /// `COUNT(DISTINCT)` keeps a `HashSet<String>`, where the answer is the
+    /// number of distinct codes and needs no strings at all.
+    ///
+    /// The benchmark suite aggregates `score`, a `Float64`, so none of this is
+    /// measured by it.
+    ///
+    /// Run with
+    /// `cargo test --release --lib aggregates_by_column_type -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn aggregates_by_column_type() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("score", DataType::Float64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS)
+                        .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5]))
+                        .collect(),
+                ),
+                ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 100) as f64)).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let time = |label: &str, sql: &str| {
+            for _ in 0..3 { db.sql(sql).unwrap(); }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..9 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(sql).unwrap());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>34}: {best:>9.2?}");
+            best
+        };
+
+        println!("over {ROWS} rows:");
+        let fmin = time("MIN(score)  Float64", "SELECT MIN(score) FROM t");
+        let umin = time("MIN(dept)   Utf8", "SELECT MIN(dept) FROM t");
+        let fcd  = time("COUNT(DISTINCT score)", "SELECT COUNT(DISTINCT score) FROM t");
+        let ucd  = time("COUNT(DISTINCT dept)", "SELECT COUNT(DISTINCT dept) FROM t");
+        println!("  MIN on text costs {:.1}x the float", umin.as_secs_f64() / fmin.as_secs_f64());
+        println!("  COUNT(DISTINCT) on text costs {:.1}x the float", ucd.as_secs_f64() / fcd.as_secs_f64());
     }
 
     /// What does widening every integer to `f64` cost a `SUM`?
