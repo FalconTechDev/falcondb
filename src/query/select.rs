@@ -322,6 +322,53 @@ fn dedup_single_primitive(batches: &[RecordBatch]) -> Option<Vec<Vec<bool>>> {
 
     let total_rows: usize = batches.iter().map(|b| b.row_count()).sum();
 
+    // Text: number the distinct strings once, then dedup numbers.
+    //
+    // A dictionary column already knows its distinct values, but each batch has
+    // its own dictionary, so a code means nothing across batches. Numbering the
+    // strings globally -- one pass over the dictionaries, which hold distinct
+    // values rather than rows -- turns the whole question into the integer one
+    // the arms below already answer.
+    //
+    // The number is an identity, not a hash. A 64-bit hash of the string would
+    // fit the same machinery and be slightly cheaper, but two different strings
+    // that collided would be silently deduplicated, and returning the wrong rows
+    // is not a trade worth making for a few nanoseconds.
+    //
+    // Without this, `SELECT DISTINCT` on a text column took the general path --
+    // a hash map of buckets holding row positions, with a full row comparison per
+    // candidate. Measured at 100k rows: 3.90ms against 772us for the same query
+    // over a float column, while the text column had five distinct values to the
+    // float's hundred.
+    if matches!(first.column(0), Column::Utf8(_)) {
+        let mut ids: super::hash::FastMap<&str, u64> = super::hash::FastMap::default();
+        let mut next_id = 0u64;
+        let mut keys: Vec<Vec<u64>> = Vec::with_capacity(batches.len());
+
+        for b in batches {
+            let Column::Utf8(c) = b.column(0) else { return None };
+            // Local code -> global id, built from this batch's dictionary.
+            let mut local = vec![0u64; c.dict().len()];
+            for (code, text) in c.dict().iter().enumerate() {
+                let id = *ids.entry(text.as_str()).or_insert_with(|| {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                });
+                local[code] = id;
+            }
+            keys.push(c.codes().iter().map(|&code| local[code as usize]).collect());
+        }
+
+        // First occurrence wins, which is what DISTINCT keeps.
+        let mut seen: FastSet<u64> = FastSet::default();
+        let keeps = keys
+            .iter()
+            .map(|batch_keys| batch_keys.iter().map(|&id| seen.insert(id)).collect())
+            .collect();
+        return Some(keeps);
+    }
+
     macro_rules! run {
         ($variant:ident, $key:expr) => {{
             // Hashing every row is the bulk of the work and each row is independent,
@@ -638,6 +685,68 @@ pub fn display_results(batches: &[RecordBatch]) -> String {
     out.push('\n');
     out.push_str(&format!("({} rows)\n", rows.len()));
     out
+}
+
+#[cfg(test)]
+mod distinct_perf {
+    use crate::db::Database;
+    use crate::storage::{
+        column::ColumnBuilder,
+        schema::{Field, Schema},
+        table::RecordBatch,
+        types::DataType,
+    };
+    use std::time::Instant;
+
+    /// What does `DISTINCT` cost on a text column against a numeric one?
+    ///
+    /// The benchmark suite runs `SELECT DISTINCT score`, a `Float64`. `GROUP BY`
+    /// in that suite *is* on a text column and is one of this engine's strongest
+    /// points, so the dictionary machinery exists -- the question is whether
+    /// `DISTINCT` reaches it.
+    ///
+    /// Run with
+    /// `cargo test --release --lib distinct_by_column_type -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn distinct_by_column_type() {
+        const ROWS: usize = 100_000;
+
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("score", DataType::Float64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS)
+                        .map(|i| Some(["eng", "sales", "hr", "ops", "legal"][i % 5]))
+                        .collect(),
+                ),
+                ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 100) as f64)).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let time = |label: &str, sql: &str| {
+            for _ in 0..3 { db.sql(sql).unwrap(); }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..9 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(sql).unwrap());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>30}: {best:>9.2?}");
+            best
+        };
+
+        println!("DISTINCT over {ROWS} rows:");
+        let f = time("score (Float64)", "SELECT DISTINCT score FROM t");
+        let u = time("dept (Utf8)", "SELECT DISTINCT dept FROM t");
+        println!("  text costs {:.2}x the float", u.as_secs_f64() / f.as_secs_f64());
+    }
 }
 
 #[cfg(test)]
