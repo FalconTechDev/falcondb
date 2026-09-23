@@ -2075,9 +2075,9 @@ mod in_list_semantics {
 
         let cases: Vec<(&str, usize, usize)> = vec![
             ("JOIN ON i = f",
+             n("SELECT i FROM ints JOIN floats ON ints.i = floats.f"), 3),
+            ("JOIN, qualified select",
              n("SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f"), 3),
-            ("WHERE i = f (cross)",
-             n("SELECT ints.i FROM ints, floats WHERE ints.i = floats.f"), 3),
             ("i IN (SELECT f)",
              n("SELECT i FROM ints WHERE i IN (SELECT f FROM floats)"), 3),
             ("EXISTS correlated",
