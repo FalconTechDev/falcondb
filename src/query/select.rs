@@ -767,6 +767,49 @@ mod tests {
     /// Two implementations of the same semantics is how a 100x-slow join went
     /// unnoticed in this codebase, so the fast path is pinned to the slow one
     /// rather than just to a hand-written expectation.
+    /// Text dedup numbers the distinct strings globally, so batches with
+    /// different dictionaries have to agree on what is a duplicate.
+    ///
+    /// The second batch's dictionary is deliberately in a different order from
+    /// the first's, which is what catches treating a local code as an identity.
+    #[test]
+    fn text_distinct_spans_dictionaries() {
+        use crate::storage::{column::ColumnBuilder, schema::{Field, Schema}, types::DataType};
+
+        let schema = Schema::new(vec![Field::required("s", DataType::Utf8)]);
+        let mk = |vals: Vec<&str>| {
+            RecordBatch::new(
+                schema.clone(),
+                vec![ColumnBuilder::utf8_from_str(vals.into_iter().map(Some).collect())],
+            )
+            .unwrap()
+        };
+        // First batch sees a, b; second sees b, a, c -- so "b" is code 0 there
+        // and code 1 here.
+        let batches = vec![mk(vec!["a", "b", "a"]), mk(vec!["b", "a", "c"])];
+
+        let keeps = dedup_single_primitive(&batches).expect("text should take the typed path");
+        assert_eq!(keeps[0], vec![true, true, false], "a, b kept; second a dropped");
+        assert_eq!(
+            keeps[1],
+            vec![false, false, true],
+            "b and a already seen in the first batch; c is new",
+        );
+
+        // And the whole thing end to end keeps first occurrences in order.
+        let out = dedup_batches(batches);
+        let seen: Vec<String> = out
+            .iter()
+            .flat_map(|b| {
+                (0..b.row_count()).map(move |r| match b.column(0).get(r).unwrap() {
+                    ScalarValue::Utf8(Some(v)) => v,
+                    other => panic!("unexpected {other:?}"),
+                })
+            })
+            .collect();
+        assert_eq!(seen, vec!["a", "b", "c"]);
+    }
+
     #[test]
     fn typed_distinct_agrees_with_the_general_path() {
         let schema = Schema::new(vec![Field::required("v", DataType::Int64)]);
