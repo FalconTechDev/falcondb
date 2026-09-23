@@ -1617,6 +1617,52 @@ impl SumLane for i32 {
 }
 
 #[cfg(test)]
+mod sum_threshold {
+    use crate::query::aggregate::{par_sum_i64, sum_i64};
+
+    /// Where does splitting the integer sum across cores actually start paying?
+    ///
+    /// `PAR_SUM_THRESHOLD` is 65_536, a number that was chosen rather than
+    /// measured, and the benchmark's shape says it is wrong: `SUM(id)` is 2.8x
+    /// ahead of Polars at 10k rows and 2.2x ahead at 1M, but *behind* at 100k --
+    /// the one size that lands just above the threshold. Losing only in the
+    /// middle is the signature of a switch thrown too early, not of a slow
+    /// kernel.
+    ///
+    /// Both kernels are called alternately in one process so the comparison is
+    /// not spread across two runs of a machine that drifts.
+    ///
+    /// Run with
+    /// `cargo test --release --lib sum_threshold -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn where_parallel_sum_starts_paying() {
+        use std::time::Instant;
+
+        println!("threads: {}", rayon::current_num_threads());
+        println!("{:>10}  {:>10}  {:>10}  {:>8}", "rows", "serial", "parallel", "par/ser");
+        for &rows in &[16_384usize, 32_768, 65_536, 100_000, 200_000, 400_000, 1_000_000] {
+            let dense: Vec<i64> = (0..rows as i64).map(|i| i % 1000).collect();
+
+            let mut best_ser = std::time::Duration::MAX;
+            let mut best_par = std::time::Duration::MAX;
+            // Alternate, so a machine that slows down mid-test slows both.
+            for _ in 0..25 {
+                let t = Instant::now();
+                std::hint::black_box(sum_i64(&dense));
+                best_ser = best_ser.min(t.elapsed());
+
+                let t = Instant::now();
+                std::hint::black_box(par_sum_i64(&dense));
+                best_par = best_par.min(t.elapsed());
+            }
+            let ratio = best_par.as_secs_f64() / best_ser.as_secs_f64();
+            let verdict = if ratio < 0.95 { "parallel wins" } else if ratio > 1.05 { "serial wins" } else { "level" };
+            println!("{rows:>10}  {best_ser:>10.2?}  {best_par:>10.2?}  {ratio:>7.2}x  {verdict}");
+        }
+    }
+}
+
 mod int_sum {
     use super::*;
 
