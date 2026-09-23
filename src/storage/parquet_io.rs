@@ -446,6 +446,30 @@ pub fn read_parquet_projected(
     let per_group: FalconResult<Vec<Vec<RecordBatch>>> = (0..n_groups)
         .into_par_iter()
         .map(|g| -> FalconResult<Vec<RecordBatch>> {
+            // READ THIS FIRST: the code below does NOT do what the rest of this
+            // comment argues for. It calls `.with_batch_size(DEFAULT_BATCH_SIZE)`
+            // -- 65_536 -- which the paragraphs below measured as 8x slower and
+            // concluded should wait until every batch-counting threshold had been
+            // converted to rows.
+            //
+            // The call was added on 2026-09-20; this comment was written on
+            // 2026-09-07 and never updated. So one of the two is wrong, and which
+            // one has not been established: the measurements below predate the
+            // change and have not been re-confirmed against it, and no measurement
+            // justifying the change was recorded with it.
+            //
+            // This matters for more than tidiness. At 65_536, a 100k-row table
+            // loads as two batches -- too few for the per-batch fan-out to spread
+            // over, and `SUM(id)` at 100k is the one point in the benchmark suite
+            // where FalconDB trails Polars while winning at both 10k and 1M. That
+            // is the shape of a batching problem, not a kernel problem, but it is
+            // a hypothesis until measured.
+            //
+            // Do not resolve this by reading. Measure both settings against the
+            // rival engines in the same run, on AC power.
+            //
+            // --- the original comment follows, unchanged ---
+            //
             // Batch size is deliberately left at the arrow-rs default of 1024, which
             // makes a Parquet load land as many small batches (1M rows -> 977).
             //
