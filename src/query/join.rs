@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use rayon::prelude::*;
 
 use super::hash::{FastMap, FastSet};
@@ -98,7 +100,11 @@ pub fn execute_hash_semi_anti_join(
         }
         let matched = match &hash_table {
             JoinKeyMap::Int(t) => t.contains(int_key(left_key_cols[0], l_row)),
-            JoinKeyMap::Str(t) => t.contains_key(&row_key(&left_key_cols, l_row)?),
+            JoinKeyMap::Str(t) => match single_text_key(&left_key_cols, l_row) {
+                Some(key) => t.contains_key(key),
+                None if matches!(left_key_cols.as_slice(), [Column::Utf8(_)]) => false,
+                None => t.contains_key(&row_key(&left_key_cols, l_row)?),
+            },
         };
         Ok(if anti { !matched } else { matched })
     };
@@ -622,7 +628,7 @@ fn build_hash_table(
         return Ok((JoinKeyMap::Int(table), bloom));
     }
 
-    let mut table: FastMap<String, Vec<usize>> = FastMap::default();
+    let mut table: FastMap<String, SmallVec<[usize; 1]>> = FastMap::default();
     for row in 0..n {
         let key = row_key(&key_cols, row)?;
         table.entry(key).or_default().push(row);
@@ -675,7 +681,15 @@ fn probe_one(
     match hash_table {
         JoinKeyMap::Int(t) => t.collect_matches(int_key(left_key_cols[0], l_row), scratch),
         JoinKeyMap::Str(t) => {
-            if let Some(rows) = t.get(&row_key(left_key_cols, l_row)?) {
+            // Borrowed lookup when the key is a single text column; see
+            // `single_text_key`. `HashMap<String, _>` accepts `&str`, so this
+            // costs no allocation at all.
+            let found = match single_text_key(left_key_cols, l_row) {
+                Some(key) => t.get(key),
+                None if matches!(left_key_cols, [Column::Utf8(_)]) => None, // NULL key
+                None => t.get(&row_key(left_key_cols, l_row)?),
+            };
+            if let Some(rows) = found {
                 scratch.extend_from_slice(rows);
             }
         }
@@ -912,6 +926,25 @@ fn build_output(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// The key of one row, borrowed, when the join has a single text key column.
+///
+/// `row_key` renders every key column into a `String` and joins them, so a probe
+/// row costs two allocations before the hash table is consulted -- which is what
+/// the Bloom filter was added to avoid paying for rows that cannot match.
+///
+/// A `HashMap<String, _>` can be looked up by `&str`, so for the single-text-key
+/// case none of that is needed. Measured on a 100k-row build against 1M probe
+/// rows, an INNER JOIN on a text key took 95.86ms against 6.22ms for the same
+/// join on an integer key.
+///
+/// `None` means either "not this shape" or "this row's key is NULL"; both send
+/// the caller down the general path, and a NULL key matches nothing anyway.
+#[inline]
+fn single_text_key<'a>(key_cols: &[&'a Column], row: usize) -> Option<&'a str> {
+    let [Column::Utf8(c)] = key_cols else { return None };
+    c.get_str(row)
+}
+
 fn row_key(key_cols: &[&Column], row: usize) -> FalconResult<String> {
     let parts: FalconResult<Vec<String>> = key_cols.iter()
         .map(|col| col.get(row).map(|v| v.to_string()))
@@ -930,7 +963,15 @@ fn row_key(key_cols: &[&Column], row: usize) -> FalconResult<String> {
 /// itself allocates nothing.
 enum JoinKeyMap {
     Int(IntHashTable),
-    Str(FastMap<String, Vec<usize>>),
+    /// One entry per distinct key, holding the build rows that carry it.
+    ///
+    /// `SmallVec<[usize; 1]>` rather than `Vec<usize>`: a join key is usually
+    /// unique on the build side, and a `Vec` for every one of them is a heap
+    /// allocation per distinct key -- 100k of them for a 100k-row build side,
+    /// each holding a single number, each a pointer to chase on every probe that
+    /// hits it. The integer table solved the same problem with chains in a flat
+    /// array; this keeps the common case inline instead.
+    Str(FastMap<String, SmallVec<[usize; 1]>>),
 }
 
 /// Chained hash table over integer keys, in three flat arrays.
@@ -2484,6 +2525,77 @@ mod tests {
             bw.as_secs_f64() * 1e6 + pw.as_secs_f64() * 1e5,
             bo.as_secs_f64() * 1e6 + po.as_secs_f64() * 1e5,
         );
+    }
+
+    /// What does a join on a text key cost against the same join on an integer?
+    ///
+    /// `int_keys_usable` gates the typed path on integer keys. A text key falls
+    /// to `row_key`, which builds a `String` per probe row before the hash table
+    /// is consulted -- the Bloom filter exists precisely to skip that allocation
+    /// for rows that cannot match, which is an admission of how expensive it is.
+    ///
+    /// Joining on a string column is ordinary SQL and the benchmark suite joins
+    /// on `id`, an integer, so this is unmeasured.
+    ///
+    /// Run with
+    /// `cargo test --release --lib join_by_key_type -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn join_by_key_type() {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+        use std::time::Instant;
+
+        const BUILD: usize = 100_000;
+        const PROBE: usize = 1_000_000;
+
+        let int_batch = |name: &str, vals: Vec<i64>| {
+            RecordBatch::new(
+                Schema::new(vec![Field::required(name, DataType::Int64)]),
+                vec![ColumnBuilder::int64(vals.into_iter().map(Some).collect())],
+            )
+            .unwrap()
+        };
+        let text_batch = |name: &str, vals: Vec<String>| {
+            RecordBatch::new(
+                Schema::new(vec![Field::required(name, DataType::Utf8)]),
+                vec![ColumnBuilder::utf8(vals.into_iter().map(Some).collect())],
+            )
+            .unwrap()
+        };
+
+        // Same shape either way: a tenth of the probe side matches.
+        let right_i = int_batch("rk", (0..BUILD as i64).map(|i| i * 10).collect());
+        let left_i = int_batch("k", (0..PROBE as i64).collect());
+        let right_s = text_batch("rk", (0..BUILD).map(|i| format!("k{:08}", i * 10)).collect());
+        let left_s = text_batch("k", (0..PROBE).map(|i| format!("k{i:08}")).collect());
+
+        let time = |label: &str, left: &RecordBatch, right: &RecordBatch| {
+            let run = || {
+                let out = execute_hash_join(
+                    std::slice::from_ref(left),
+                    std::slice::from_ref(right),
+                    &["k"],
+                    &["rk"],
+                    JoinType::Inner,
+                )
+                .unwrap();
+                assert_eq!(out.row_count(), BUILD, "a tenth of the probe side should match");
+            };
+            for _ in 0..2 { run(); }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..5 {
+                let t = Instant::now();
+                run();
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>28}: {best:>9.2?}");
+            best
+        };
+
+        println!("INNER JOIN, {BUILD} build rows against {PROBE} probe rows:");
+        let i = time("integer key", &left_i, &right_i);
+        let s = time("text key", &left_s, &right_s);
+        println!("  the text key costs {:.1}x the integer one", s.as_secs_f64() / i.as_secs_f64());
     }
 
     /// How many buckets per row should the join table have?
