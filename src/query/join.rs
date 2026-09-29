@@ -835,8 +835,31 @@ fn output_plan(
     // Both the source name and the post-join name are accepted, so a reference that
     // survived a rename is not pruned by accident: erring toward keeping a column
     // costs time, dropping one the query reads is a wrong answer.
+    //
+    // A table-qualified reference is matched on the part after the dot. The parser
+    // hands `ints.i` through as the literal string "ints.i", and comparing that to
+    // the column's own name -- "i" -- matched nothing, so
+    //
+    //     SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f
+    //
+    // pruned away every column it asked for, fell to the one-column fallback
+    // below, and then failed with "column 'ints.i' not found" while the same query
+    // selecting plain `i` worked. Only the select list of a *join* was affected;
+    // `Schema::column_index` had already learned this rule for everywhere else.
+    //
+    // Matching on the bare name can keep a column the query did not want -- both
+    // sides' `i`, when only one was asked for -- which is the direction this
+    // function already errs in, and for the same reason.
     let wanted = |src: &str, out: &str| -> bool {
-        keep.is_none_or(|k| k.contains(src) || k.contains(out))
+        keep.is_none_or(|k| {
+            k.contains(src)
+                || k.contains(out)
+                || k.iter().any(|w| {
+                    w.rsplit_once('.').is_some_and(|(_, bare)| {
+                        bare.eq_ignore_ascii_case(src) || bare.eq_ignore_ascii_case(out)
+                    })
+                })
+        })
     };
 
     for (i, field) in left.fields.iter().enumerate() {
