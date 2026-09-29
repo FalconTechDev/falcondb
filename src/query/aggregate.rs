@@ -1818,6 +1818,7 @@ mod int_sum_kernel {
 }
 
 mod sum_threshold {
+    use crate::query::aggregate::{par_sum_i64, sum_i64};
 
     /// End to end: what does `SUM` over an integer column cost against `SUM`
     /// over a float column of the same shape?
