@@ -1672,6 +1672,116 @@ mod int_sum_kernel {
     }
 
 
+    /// Two things could explain the integer sum's cost, and they were tangled:
+    /// how overflow is handled, and how many lanes the loop carries. The float
+    /// kernel uses eight, both integer kernels use four.
+    ///
+    /// So vary them independently -- four strategies at four lanes and at eight --
+    /// and let the grid say which axis matters. The unchecked column is the floor:
+    /// it is not a candidate, because a database may not wrap silently, but it
+    /// says what the addition alone costs.
+    ///
+    /// Run with
+    /// `cargo test --release --lib lanes_against_overflow_strategy -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn lanes_against_overflow_strategy() {
+        use std::time::Instant;
+
+        fn unchecked<const L: usize>(dense: &[i64]) -> i64 {
+            let mut acc = [0i64; L];
+            let mut chunks = dense.chunks_exact(L);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..L { acc[i] = acc[i].wrapping_add(c[i]); }
+            }
+            let mut t = acc.iter().fold(0i64, |a, &b| a.wrapping_add(b));
+            for &v in chunks.remainder() { t = t.wrapping_add(v); }
+            t
+        }
+
+        fn checked<const L: usize>(dense: &[i64]) -> Option<i64> {
+            let mut acc = [0i64; L];
+            let mut chunks = dense.chunks_exact(L);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..L { acc[i] = acc[i].checked_add(c[i])?; }
+            }
+            let mut t = 0i64;
+            for &a in &acc { t = t.checked_add(a)?; }
+            for &v in chunks.remainder() { t = t.checked_add(v)?; }
+            Some(t)
+        }
+
+        fn signbits<const L: usize>(dense: &[i64]) -> Option<i64> {
+            let mut acc = [0i64; L];
+            let mut ovf = [0i64; L];
+            let mut chunks = dense.chunks_exact(L);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..L {
+                    let (a, b) = (acc[i], c[i]);
+                    let sum = a.wrapping_add(b);
+                    ovf[i] |= (a ^ sum) & (b ^ sum);
+                    acc[i] = sum;
+                }
+            }
+            let mut bits = ovf.iter().fold(0i64, |a, &b| a | b);
+            let mut t = 0i64;
+            for &a in &acc {
+                let sum = t.wrapping_add(a);
+                bits |= (t ^ sum) & (a ^ sum);
+                t = sum;
+            }
+            for &v in chunks.remainder() {
+                let sum = t.wrapping_add(v);
+                bits |= (t ^ sum) & (v ^ sum);
+                t = sum;
+            }
+            if bits < 0 { None } else { Some(t) }
+        }
+
+        const N: usize = 65_536;
+        let ints: Vec<i64> = (0..N as i64).collect();
+        let floats: Vec<f64> = (0..N).map(|i| i as f64).collect();
+
+        let mut t_f = std::time::Duration::MAX;
+        let mut r = [[std::time::Duration::MAX; 2]; 3]; // [strategy][lanes 4/8]
+
+        for _ in 0..200 {
+            let t = Instant::now();
+            std::hint::black_box(sum_lanes(&floats));
+            t_f = t_f.min(t.elapsed());
+
+            macro_rules! run {
+                ($row:expr, $col:expr, $e:expr) => {{
+                    let t = Instant::now();
+                    std::hint::black_box($e);
+                    r[$row][$col] = r[$row][$col].min(t.elapsed());
+                }};
+            }
+            run!(0, 0, unchecked::<4>(&ints));
+            run!(0, 1, unchecked::<8>(&ints));
+            run!(1, 0, checked::<4>(&ints));
+            run!(1, 1, checked::<8>(&ints));
+            run!(2, 0, signbits::<4>(&ints));
+            run!(2, 1, signbits::<8>(&ints));
+        }
+
+        println!("{N} values, f64 reference = {t_f:.2?}
+");
+        println!("{:<28}{:>12}{:>12}", "strategy", "4 lanes", "8 lanes");
+        for (name, row) in [("unchecked (the floor)", 0), ("checked_add", 1), ("sign-bit detection", 2)] {
+            println!("{name:<28}{:>11.2?}{:>12.2?}", r[row][0], r[row][1]);
+        }
+        println!();
+        for (name, row) in [("unchecked (the floor)", 0), ("checked_add", 1), ("sign-bit detection", 2)] {
+            println!("  {name:<26} 8 lanes is {:.2}x of 4, and {:.2}x the f64 kernel",
+                r[row][1].as_secs_f64() / r[row][0].as_secs_f64(),
+                r[row][1].as_secs_f64() / t_f.as_secs_f64());
+        }
+    }
+
     /// Why does summing an `Int64` column cost 2.4x summing a `Float64` one?
     ///
     /// Both benchmarks run `SELECT SUM(col)` over the same Parquet file with the
