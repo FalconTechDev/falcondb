@@ -446,61 +446,37 @@ pub fn read_parquet_projected(
     let per_group: FalconResult<Vec<Vec<RecordBatch>>> = (0..n_groups)
         .into_par_iter()
         .map(|g| -> FalconResult<Vec<RecordBatch>> {
-            // READ THIS FIRST: the code below does NOT do what the rest of this
-            // comment argues for. It calls `.with_batch_size(DEFAULT_BATCH_SIZE)`
-            // -- 65_536 -- which the paragraphs below measured as 8x slower and
-            // concluded should wait until every batch-counting threshold had been
-            // converted to rows.
+            // Batch size is DEFAULT_BATCH_SIZE (65_536), and that is now measured.
             //
-            // The call was added on 2026-09-20; this comment was written on
-            // 2026-09-07 and never updated. So one of the two is wrong, and which
-            // one has not been established: the measurements below predate the
-            // change and have not been re-confirmed against it, and no measurement
-            // justifying the change was recorded with it.
+            // This comment used to argue the opposite at length -- that the size
+            // must stay at the arrow-rs default of 1024, with a table of figures
+            // showing 65_536 was up to 8x slower. Those figures were taken before
+            // `query::aggregate` learned to size its rayon tasks in rows instead of
+            // batches. The reasoning had been sound and its conclusion outlived it.
             //
-            // This matters for more than tidiness. At 65_536, a 100k-row table
-            // loads as two batches -- too few for the per-batch fan-out to spread
-            // over, and `SUM(id)` at 100k is the one point in the benchmark suite
-            // where FalconDB trails Polars while winning at both 10k and 1M. That
-            // is the shape of a batching problem, not a kernel problem, but it is
-            // a hypothesis until measured.
+            // Both settings measured again, same filter, same session, on AC power,
+            // with Polars in the run as the machine reference (it read within 1-4%
+            // across the two runs, so the machine held still):
             //
-            // Do not resolve this by reading. Measure both settings against the
-            // rival engines in the same run, on AC power.
+            //                       1024      65_536
+            //   full_scan/1M      93.7us      61.1us    1.53x faster
+            //   int_sum/1M         106us      76.2us    1.39x
+            //   group_by/1M        897us       667us    1.35x
+            //   full_scan/100k    11.7us      8.71us    1.34x
+            //   group_by/100k      133us      99.3us    1.34x
+            //   int_sum/100k      26.1us      20.9us    1.25x
+            //   group_by/10k      35.1us      36.1us    0.97x  (the one loss)
             //
-            // --- the original comment follows, unchanged ---
+            // The old comment's explanation was that the engine gets its
+            // parallelism from having many batches to fan out over. It still does;
+            // what changed is that the thresholds deciding when to fan out now
+            // count rows, so sixteen large batches no longer look like a tiny
+            // table. With that fixed, the per-batch overhead the small sizes paid
+            // -- 977 batches for a million rows -- is what dominates.
             //
-            // Batch size is deliberately left at the arrow-rs default of 1024, which
-            // makes a Parquet load land as many small batches (1M rows -> 977).
-            //
-            // That looks wrong — the engine's per-batch thresholds are written
-            // against DEFAULT_BATCH_SIZE (65_536), so at 1024 the intra-batch
-            // parallel kernels never engage — and setting `.with_batch_size(
-            // Table::DEFAULT_BATCH_SIZE)` here was tried. It is 8x slower:
-            //
-            //   full_scan/1M     170us -> 1.58ms   (+828%)
-            //   group_by/1M     1.00ms -> 3.23ms   (+221%)
-            //   full_scan/100k  63.4us -> 131us    (+107%)
-            //   filter_where/1M 1.48ms -> 2.68ms    (+81%)
-            //
-            // The engine gets its parallelism from having *many batches to fan out
-            // over* (`AGG_PARALLEL_THRESHOLD` = 32 batches), not from splitting one
-            // big batch. 1M rows as 977 batches spreads across every core; as 16
-            // batches it falls under the threshold and runs serially. Small batches
-            // also keep each column slice inside L2 for the whole pass.
-            //
-            // Retested after `query::aggregate` was changed to size its rayon tasks in
-            // rows rather than batches, which was the reason for the first failure.
-            // With that fixed, 65_536-row batches do help the largest scans —
-            // full_scan/1M -14%, int_sum/1M -8%, confirming the per-batch overhead —
-            // but they still cost far more elsewhere: full_scan/100k +170%,
-            // group_by/100k +114%, group_by/1M +187%.
-            //
-            // The remaining thresholds are why. `PAR_SUM_THRESHOLD` fires inside a
-            // 65_536-row batch and enters rayon from the serial path, and the
-            // group-by still counts *batches*, so sixteen of them look like a tiny
-            // table. Raising this needs every one of those converted to rows first;
-            // until then the small batches are load-bearing.
+            // Kept as a warning rather than deleted: a measurement's conclusion is
+            // only as durable as the code it was taken against, and this one
+            // outlived its own reasoning by weeks while reading as settled fact.
             let reader = ParquetRecordBatchReaderBuilder::try_new(open()?)
                 .map_err(|e| FalconError::InvalidQuery(e.to_string()))?
                 .with_projection(mask.clone())
