@@ -1741,12 +1741,40 @@ mod int_sum_kernel {
             if bits < 0 { None } else { Some(t) }
         }
 
+        /// Split each value into its high and low halves and sum those.
+        ///
+        /// `v = (v >> 32) * 2^32 + (v & 0xffff_ffff)`. The high parts are each in
+        /// `[-2^31, 2^31)` and the low parts in `[0, 2^32)`, so over any batch this
+        /// engine will ever hold, neither running sum can leave `i64` -- it would
+        /// take more than two billion rows in one batch. That buys plain wrapping
+        /// adds in the inner loop and one checked recombination at the end,
+        /// instead of a check per element.
+        fn hilo<const L: usize>(dense: &[i64]) -> Option<i64> {
+            let mut hi = [0i64; L];
+            let mut lo = [0i64; L];
+            let mut chunks = dense.chunks_exact(L);
+            for c in &mut chunks {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..L {
+                    hi[i] += c[i] >> 32;
+                    lo[i] += c[i] & 0xffff_ffff;
+                }
+            }
+            let mut h = hi.iter().sum::<i64>();
+            let mut l = lo.iter().sum::<i64>();
+            for &v in chunks.remainder() {
+                h += v >> 32;
+                l += v & 0xffff_ffff;
+            }
+            h.checked_mul(1i64 << 32)?.checked_add(l)
+        }
+
         const N: usize = 65_536;
         let ints: Vec<i64> = (0..N as i64).collect();
         let floats: Vec<f64> = (0..N).map(|i| i as f64).collect();
 
         let mut t_f = std::time::Duration::MAX;
-        let mut r = [[std::time::Duration::MAX; 2]; 3]; // [strategy][lanes 4/8]
+        let mut r = [[std::time::Duration::MAX; 2]; 4]; // [strategy][lanes 4/8]
 
         for _ in 0..200 {
             let t = Instant::now();
@@ -1766,16 +1794,18 @@ mod int_sum_kernel {
             run!(1, 1, checked::<8>(&ints));
             run!(2, 0, signbits::<4>(&ints));
             run!(2, 1, signbits::<8>(&ints));
+            run!(3, 0, hilo::<4>(&ints));
+            run!(3, 1, hilo::<8>(&ints));
         }
 
         println!("{N} values, f64 reference = {t_f:.2?}
 ");
         println!("{:<28}{:>12}{:>12}", "strategy", "4 lanes", "8 lanes");
-        for (name, row) in [("unchecked (the floor)", 0), ("checked_add", 1), ("sign-bit detection", 2)] {
+        for (name, row) in [("unchecked (the floor)", 0), ("checked_add", 1), ("sign-bit detection", 2), ("hi/lo split", 3)] {
             println!("{name:<28}{:>11.2?}{:>12.2?}", r[row][0], r[row][1]);
         }
         println!();
-        for (name, row) in [("unchecked (the floor)", 0), ("checked_add", 1), ("sign-bit detection", 2)] {
+        for (name, row) in [("unchecked (the floor)", 0), ("checked_add", 1), ("sign-bit detection", 2), ("hi/lo split", 3)] {
             println!("  {name:<26} 8 lanes is {:.2}x of 4, and {:.2}x the f64 kernel",
                 r[row][1].as_secs_f64() / r[row][0].as_secs_f64(),
                 r[row][1].as_secs_f64() / t_f.as_secs_f64());
