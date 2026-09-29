@@ -1617,6 +1617,65 @@ impl SumLane for i32 {
 }
 
 #[cfg(test)]
+mod int_sum_kernel {
+    use crate::query::aggregate::{checked_sum_i64, sum_lanes};
+
+    /// Why does summing an `Int64` column cost 2.4x summing a `Float64` one?
+    ///
+    /// Both benchmarks run `SELECT SUM(col)` over the same Parquet file with the
+    /// same row count -- `full_scan` sums `score`, `int_sum` sums `id` -- so the
+    /// only difference is the column's type. In one run at 100k rows they read
+    /// 8.71us and 20.88us.
+    ///
+    /// The two kernels are shaped differently. The float path accumulates into
+    /// eight `f64` lanes, which vectorises. The integer path is four lanes of
+    /// `checked_add`, and a checked add is a branch per element, so it does not.
+    ///
+    /// Measured at the sizes a 100k-row table actually produces: batches of 65_536
+    /// and 34_464, which is what the loader hands the aggregate.
+    ///
+    /// Run with
+    /// `cargo test --release --lib int_sum_kernel -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn why_integer_sum_is_slower() {
+        use std::time::Instant;
+
+        for &n in &[34_464usize, 65_536, 100_000] {
+            let ints: Vec<i64> = (0..n as i64).collect();
+            let floats: Vec<f64> = (0..n).map(|i| i as f64).collect();
+
+            let mut best_f = std::time::Duration::MAX;
+            let mut best_checked = std::time::Duration::MAX;
+            let mut best_widened = std::time::Duration::MAX;
+
+            // Alternate all three, so a machine that drifts drifts under each.
+            for _ in 0..200 {
+                let t = Instant::now();
+                std::hint::black_box(sum_lanes(&floats));
+                best_f = best_f.min(t.elapsed());
+
+                let t = Instant::now();
+                std::hint::black_box(checked_sum_i64(&ints));
+                best_checked = best_checked.min(t.elapsed());
+
+                // The same integers through the float kernel: what the integer
+                // path already falls back to when a checked add overflows.
+                let t = Instant::now();
+                std::hint::black_box(sum_lanes(&ints));
+                best_widened = best_widened.min(t.elapsed());
+            }
+
+            println!("{n} values:");
+            println!("  f64 through sum_lanes (8 lanes)   {best_f:>9.2?}");
+            println!("  i64 through checked_sum_i64       {best_checked:>9.2?}   {:.2}x the float kernel",
+                best_checked.as_secs_f64() / best_f.as_secs_f64());
+            println!("  i64 through sum_lanes (widened)   {best_widened:>9.2?}   {:.2}x the float kernel",
+                best_widened.as_secs_f64() / best_f.as_secs_f64());
+        }
+    }
+}
+
 mod sum_threshold {
     use crate::query::aggregate::{par_sum_i64, sum_i64};
 
