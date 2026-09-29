@@ -504,6 +504,7 @@ pub fn read_parquet_projected(
             let reader = ParquetRecordBatchReaderBuilder::try_new(open()?)
                 .map_err(|e| FalconError::InvalidQuery(e.to_string()))?
                 .with_projection(mask.clone())
+                .with_batch_size(crate::storage::table::Table::DEFAULT_BATCH_SIZE)
                 .with_row_groups(vec![g])
                 .build()
                 .map_err(|e| FalconError::InvalidQuery(e.to_string()))?;
