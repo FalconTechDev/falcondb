@@ -38,7 +38,8 @@ param(
     [string]$Save     = "",
     [string]$Baseline = "",
     [string]$Out      = "$env:TEMP\falcon_bench.txt",
-    [switch]$AllowBattery
+    [switch]$AllowBattery,
+    [switch]$AllowBusy
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,6 +58,44 @@ if ($battery -and $battery.BatteryStatus -eq 1) {
     }
     Write-Warning "$msg`nContinuing because -AllowBattery was passed: compare engines against each other, not against saved numbers."
 }
+# Refuses to run while another process is competing for the machine.
+#
+# Same failure as the battery one and just as invisible: a run made while
+# something else was busy looked like ordinary output, with every engine about
+# twice as slow -- FalconDB 20.8us -> 42.2us on int_sum/100k, but also Polars
+# 14.9 -> 27.6, DuckDB 408 -> 593 and DataFusion 2.39ms -> 5.08ms. When the
+# rivals move with us the machine moved, not the code, and the other tell-tale is
+# the confidence intervals widening from about 1% to 7%.
+#
+# That run cost a full suite before anyone looked at the process list, where a
+# javaw holding 1.5 GB had been taking cores throughout. A two-second load check
+# is cheap against half an hour of benchmarking.
+#
+# Measures idle time rather than the load counter, which lags, and names the
+# heaviest processes so there is something to act on.
+$idle = (Get-Counter '\Processor(_Total)\% Idle Time' -SampleInterval 1 -MaxSamples 2 -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty CounterSamples |
+    Measure-Object -Property CookedValue -Average).Average
+if ($null -ne $idle) {
+    $busy = [math]::Round(100 - $idle, 1)
+    if ($busy -gt 10) {
+        $top = Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Id -ne $PID -and $_.CPU } |
+            Sort-Object CPU -Descending |
+            Select-Object -First 3 |
+            ForEach-Object { "$($_.ProcessName) ($([math]::Round($_.CPU))s CPU, $([math]::Round($_.WorkingSet/1MB))MB)" }
+        $msg = "The machine is $busy% busy before the run has started. " +
+               "Another process competing for cores or memory bandwidth slows every " +
+               "engine at once, which looks like ordinary output and is comparable " +
+               "with nothing.`nHeaviest processes: " + ($top -join ", ")
+        if (-not $AllowBusy) {
+            Write-Error "$msg`nClose what you can, or pass -AllowBusy to measure anyway."
+            exit 1
+        }
+        Write-Warning "$msg`nContinuing because -AllowBusy was passed: treat the absolute numbers as unusable."
+    }
+}
+
 
 $env:CARGO_TARGET_DIR = "E:\rust-target"
 $repo = Split-Path -Parent $PSScriptRoot
