@@ -1618,7 +1618,59 @@ impl SumLane for i32 {
 
 #[cfg(test)]
 mod int_sum_kernel {
-    use crate::query::aggregate::{checked_sum_i64, sum_lanes};
+    use crate::query::aggregate::{checked_sum_i64, sum_lanes, wrapping_sum_i64};
+
+    /// The branch-free sum must agree with the checked one on every input,
+    /// including *declining* on exactly the same inputs.
+    ///
+    /// A faster sum that answers differently is not a faster sum.
+    #[test]
+    fn overflow_free_sum_matches_checked() {
+        // A cheap deterministic generator; no dev-dependency needed for this.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // Ordinary data, several lengths including ones that do not divide by 4.
+        for len in [0usize, 1, 2, 3, 4, 5, 7, 8, 33, 1000, 4096, 65_536] {
+            let v: Vec<i64> = (0..len).map(|_| (next() as i64) >> 20).collect();
+            assert_eq!(
+                wrapping_sum_i64(&v),
+                checked_sum_i64(&v),
+                "disagreement on ordinary data, len {len}"
+            );
+        }
+
+        // Values chosen to sit against the boundary, where the two must agree on
+        // when to give up.
+        let edges: Vec<Vec<i64>> = vec![
+            vec![i64::MAX, 1],
+            vec![i64::MAX, -1],
+            vec![i64::MIN, -1],
+            vec![i64::MIN, 1],
+            vec![i64::MAX, i64::MIN],
+            vec![i64::MAX / 2, i64::MAX / 2, i64::MAX / 2],
+            vec![i64::MAX, 0, 0, 0, 0],
+            vec![i64::MIN, 0, 0, 0, -1],
+            // Overflows only in the cross-lane reduction, not within a lane.
+            vec![i64::MAX, i64::MAX, i64::MAX, i64::MAX],
+            // Overflows and then comes back: wrapping alone would hide this.
+            vec![i64::MAX, i64::MAX, i64::MIN, i64::MIN],
+            vec![1, 2, 3, 4, 5, 6, 7],
+        ];
+        for v in &edges {
+            assert_eq!(
+                wrapping_sum_i64(v),
+                checked_sum_i64(v),
+                "disagreement on boundary data: {v:?}"
+            );
+        }
+    }
+
 
     /// Why does summing an `Int64` column cost 2.4x summing a `Float64` one?
     ///
@@ -1648,6 +1700,7 @@ mod int_sum_kernel {
             let mut best_f = std::time::Duration::MAX;
             let mut best_checked = std::time::Duration::MAX;
             let mut best_widened = std::time::Duration::MAX;
+            let mut best_wrapping = std::time::Duration::MAX;
 
             // Alternate all three, so a machine that drifts drifts under each.
             for _ in 0..200 {
@@ -1664,6 +1717,10 @@ mod int_sum_kernel {
                 let t = Instant::now();
                 std::hint::black_box(sum_lanes(&ints));
                 best_widened = best_widened.min(t.elapsed());
+
+                let t = Instant::now();
+                std::hint::black_box(wrapping_sum_i64(&ints));
+                best_wrapping = best_wrapping.min(t.elapsed());
             }
 
             println!("{n} values:");
@@ -1672,6 +1729,9 @@ mod int_sum_kernel {
                 best_checked.as_secs_f64() / best_f.as_secs_f64());
             println!("  i64 through sum_lanes (widened)   {best_widened:>9.2?}   {:.2}x the float kernel",
                 best_widened.as_secs_f64() / best_f.as_secs_f64());
+            println!("  i64 through wrapping_sum_i64      {best_wrapping:>9.2?}   {:.2}x the float kernel, {:.2}x the checked one",
+                best_wrapping.as_secs_f64() / best_f.as_secs_f64(),
+                best_wrapping.as_secs_f64() / best_checked.as_secs_f64());
         }
     }
 }
@@ -2899,6 +2959,65 @@ fn sum_i64(dense: &[i64]) -> f64 {
 /// Four lanes, because four `i64` is one AVX2 register and the loop stops
 /// vectorising at eight -- the opposite of what floats want, which is why
 /// `SUM_LANES` cannot serve both.
+/// Sum `i64` exactly, detecting overflow without a branch per element.
+///
+/// `checked_sum_i64` asks `checked_add` per value, and a checked add is a
+/// conditional, so the loop cannot vectorise. Measured against the `f64` kernel
+/// over the same count -- both read eight bytes per element and do one add -- it
+/// came out 2.19-2.33x, and widening the integers into the float kernel instead
+/// was worse still at 2.44-2.60x, because that pays a conversion per element.
+///
+/// Overflow of `a + b` is a property of three sign bits: it happens exactly when
+/// `a` and `b` share a sign and the result differs from it. That is
+///
+/// ```text
+///     (a ^ sum) & (b ^ sum) < 0
+/// ```
+///
+/// which is bitwise arithmetic, not a branch, so it vectorises alongside the
+/// addition. Accumulate those bits across the whole pass and inspect them once at
+/// the end.
+///
+/// The answer is identical to the checked version, including *when* it declines:
+/// both report overflow exactly when some prefix of the lane sums leaves `i64`.
+/// `overflow_free_sum_matches_checked` pins that over random data and over values
+/// chosen to straddle the boundary.
+fn wrapping_sum_i64(dense: &[i64]) -> Option<i64> {
+    const LANES: usize = 4;
+    let mut acc = [0i64; LANES];
+    let mut ovf = [0i64; LANES];
+
+    let mut chunks = dense.chunks_exact(LANES);
+    for c in &mut chunks {
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..LANES {
+            let a = acc[i];
+            let b = c[i];
+            let sum = a.wrapping_add(b);
+            // Same sign in, different sign out.
+            ovf[i] |= (a ^ sum) & (b ^ sum);
+            acc[i] = sum;
+        }
+    }
+
+    let mut total = 0i64;
+    let mut bits = 0i64;
+    for i in 0..LANES {
+        bits |= ovf[i];
+        let sum = total.wrapping_add(acc[i]);
+        bits |= (total ^ sum) & (acc[i] ^ sum);
+        total = sum;
+    }
+    for &v in chunks.remainder() {
+        let sum = total.wrapping_add(v);
+        bits |= (total ^ sum) & (v ^ sum);
+        total = sum;
+    }
+
+    // A negative sign bit anywhere means some addition left the range.
+    if bits < 0 { None } else { Some(total) }
+}
+
 fn checked_sum_i64(dense: &[i64]) -> Option<i64> {
     let mut acc = [0i64; 4];
     let mut chunks = dense.chunks_exact(4);
