@@ -1618,59 +1618,7 @@ impl SumLane for i32 {
 
 #[cfg(test)]
 mod int_sum_kernel {
-    use crate::query::aggregate::{checked_sum_i64, sum_lanes, wrapping_sum_i64};
-
-    /// The branch-free sum must agree with the checked one on every input,
-    /// including *declining* on exactly the same inputs.
-    ///
-    /// A faster sum that answers differently is not a faster sum.
-    #[test]
-    fn overflow_free_sum_matches_checked() {
-        // A cheap deterministic generator; no dev-dependency needed for this.
-        let mut state = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-
-        // Ordinary data, several lengths including ones that do not divide by 4.
-        for len in [0usize, 1, 2, 3, 4, 5, 7, 8, 33, 1000, 4096, 65_536] {
-            let v: Vec<i64> = (0..len).map(|_| (next() as i64) >> 20).collect();
-            assert_eq!(
-                wrapping_sum_i64(&v),
-                checked_sum_i64(&v),
-                "disagreement on ordinary data, len {len}"
-            );
-        }
-
-        // Values chosen to sit against the boundary, where the two must agree on
-        // when to give up.
-        let edges: Vec<Vec<i64>> = vec![
-            vec![i64::MAX, 1],
-            vec![i64::MAX, -1],
-            vec![i64::MIN, -1],
-            vec![i64::MIN, 1],
-            vec![i64::MAX, i64::MIN],
-            vec![i64::MAX / 2, i64::MAX / 2, i64::MAX / 2],
-            vec![i64::MAX, 0, 0, 0, 0],
-            vec![i64::MIN, 0, 0, 0, -1],
-            // Overflows only in the cross-lane reduction, not within a lane.
-            vec![i64::MAX, i64::MAX, i64::MAX, i64::MAX],
-            // Overflows and then comes back: wrapping alone would hide this.
-            vec![i64::MAX, i64::MAX, i64::MIN, i64::MIN],
-            vec![1, 2, 3, 4, 5, 6, 7],
-        ];
-        for v in &edges {
-            assert_eq!(
-                wrapping_sum_i64(v),
-                checked_sum_i64(v),
-                "disagreement on boundary data: {v:?}"
-            );
-        }
-    }
-
+    use crate::query::aggregate::{checked_sum_i64, sum_lanes};
 
     /// Two things could explain the integer sum's cost, and they were tangled:
     /// how overflow is handled, and how many lanes the loop carries. The float
@@ -1840,7 +1788,6 @@ mod int_sum_kernel {
             let mut best_f = std::time::Duration::MAX;
             let mut best_checked = std::time::Duration::MAX;
             let mut best_widened = std::time::Duration::MAX;
-            let mut best_wrapping = std::time::Duration::MAX;
 
             // Alternate all three, so a machine that drifts drifts under each.
             for _ in 0..200 {
@@ -1858,9 +1805,6 @@ mod int_sum_kernel {
                 std::hint::black_box(sum_lanes(&ints));
                 best_widened = best_widened.min(t.elapsed());
 
-                let t = Instant::now();
-                std::hint::black_box(wrapping_sum_i64(&ints));
-                best_wrapping = best_wrapping.min(t.elapsed());
             }
 
             println!("{n} values:");
@@ -1869,15 +1813,11 @@ mod int_sum_kernel {
                 best_checked.as_secs_f64() / best_f.as_secs_f64());
             println!("  i64 through sum_lanes (widened)   {best_widened:>9.2?}   {:.2}x the float kernel",
                 best_widened.as_secs_f64() / best_f.as_secs_f64());
-            println!("  i64 through wrapping_sum_i64      {best_wrapping:>9.2?}   {:.2}x the float kernel, {:.2}x the checked one",
-                best_wrapping.as_secs_f64() / best_f.as_secs_f64(),
-                best_wrapping.as_secs_f64() / best_checked.as_secs_f64());
         }
     }
 }
 
 mod sum_threshold {
-    use crate::query::aggregate::{par_sum_i64, sum_i64};
 
     /// End to end: what does `SUM` over an integer column cost against `SUM`
     /// over a float column of the same shape?
@@ -1945,12 +1885,18 @@ mod sum_threshold {
 
     /// Where does splitting the integer sum across cores actually start paying?
     ///
-    /// `PAR_SUM_THRESHOLD` is 65_536, a number that was chosen rather than
-    /// measured, and the benchmark's shape says it is wrong: `SUM(id)` is 2.8x
-    /// ahead of Polars at 10k rows and 2.2x ahead at 1M, but *behind* at 100k --
-    /// the one size that lands just above the threshold. Losing only in the
-    /// middle is the signature of a switch thrown too early, not of a slow
-    /// kernel.
+    /// This was written to convict `PAR_SUM_THRESHOLD`. `SUM(id)` is 2.8x ahead
+    /// of Polars at 10k rows and 2.2x ahead at 1M but behind at 100k, the one
+    /// size landing just above the threshold, and losing only in the middle looks
+    /// exactly like a switch thrown too early.
+    ///
+    /// It acquitted it. At 100k the parallel sum runs at 0.81x the serial one, so
+    /// the threshold both fires and is right to. The cause was elsewhere: see
+    /// `checked_sum_i64`, where the grid shows overflow checking costs 86% and
+    /// the addition itself is fine.
+    ///
+    /// Kept because a threshold nobody has measured invites the same suspicion
+    /// again, and this answers it in one command.
     ///
     /// Both kernels are called alternately in one process so the comparison is
     /// not spread across two runs of a machine that drifts.
@@ -3099,65 +3045,44 @@ fn sum_i64(dense: &[i64]) -> f64 {
 /// Four lanes, because four `i64` is one AVX2 register and the loop stops
 /// vectorising at eight -- the opposite of what floats want, which is why
 /// `SUM_LANES` cannot serve both.
-/// Sum `i64` exactly, detecting overflow without a branch per element.
+/// Four lanes of `checked_add`, which is the fastest *sound* integer sum measured
+/// here -- three alternatives were tried and all three lost.
 ///
-/// `checked_sum_i64` asks `checked_add` per value, and a checked add is a
-/// conditional, so the loop cannot vectorise. Measured against the `f64` kernel
-/// over the same count -- both read eight bytes per element and do one add -- it
-/// came out 2.19-2.33x, and widening the integers into the float kernel instead
-/// was worse still at 2.44-2.60x, because that pays a conversion per element.
+/// `SUM(id)` over an `Int64` column costs about 2.3x `SUM(score)` over a
+/// `Float64` one at the same row count, and the obvious suspect was this
+/// function: a checked add is a conditional, and conditionals do not vectorise.
+/// That suspicion was half right in a way that mattered.
 ///
-/// Overflow of `a + b` is a property of three sign bits: it happens exactly when
-/// `a` and `b` share a sign and the result differs from it. That is
+/// Varying the overflow strategy and the lane count independently, 65_536 values,
+/// alternated in one process against the `f64` kernel as the reference:
 ///
 /// ```text
-///     (a ^ sum) & (b ^ sum) < 0
+///   strategy                       4 lanes    8 lanes
+///   unchecked (wraps silently)      6.20us    16.70us
+///   checked_add                    11.50us    11.60us
+///   sign-bit overflow detection    19.10us    16.70us
+///   hi/lo 32-bit split             15.00us    24.40us
+///   f64 reference                   5.10us
 /// ```
 ///
-/// which is bitwise arithmetic, not a branch, so it vectorises alongside the
-/// addition. Accumulate those bits across the whole pass and inspect them once at
-/// the end.
+/// What that says:
 ///
-/// The answer is identical to the checked version, including *when* it declines:
-/// both report overflow exactly when some prefix of the lane sums leaves `i64`.
-/// `overflow_free_sum_matches_checked` pins that over random data and over values
-/// chosen to straddle the boundary.
-fn wrapping_sum_i64(dense: &[i64]) -> Option<i64> {
-    const LANES: usize = 4;
-    let mut acc = [0i64; LANES];
-    let mut ovf = [0i64; LANES];
-
-    let mut chunks = dense.chunks_exact(LANES);
-    for c in &mut chunks {
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..LANES {
-            let a = acc[i];
-            let b = c[i];
-            let sum = a.wrapping_add(b);
-            // Same sign in, different sign out.
-            ovf[i] |= (a ^ sum) & (b ^ sum);
-            acc[i] = sum;
-        }
-    }
-
-    let mut total = 0i64;
-    let mut bits = 0i64;
-    for i in 0..LANES {
-        bits |= ovf[i];
-        let sum = total.wrapping_add(acc[i]);
-        bits |= (total ^ sum) & (acc[i] ^ sum);
-        total = sum;
-    }
-    for &v in chunks.remainder() {
-        let sum = total.wrapping_add(v);
-        bits |= (total ^ sum) & (v ^ sum);
-        total = sum;
-    }
-
-    // A negative sign bit anywhere means some addition left the range.
-    if bits < 0 { None } else { Some(total) }
-}
-
+///   - The integer *addition* is fine. Unchecked, it runs at 1.21x the float
+///     kernel, so neither the type nor the lane count is the problem.
+///   - Overflow safety costs 86% (11.50 against 6.20). That is the whole gap, and
+///     it is the price of not wrapping silently, which a database may not do.
+///   - Replacing the branch with branch-free sign-bit arithmetic --
+///     `(a ^ sum) & (b ^ sum) < 0`, correct and vectorisable -- is 1.66x *worse*.
+///     Three extra bitwise operations per element cost more than a conditional
+///     that the predictor never misses, because overflow never actually happens.
+///   - Splitting each value into 32-bit halves, so the inner loop needs no checks
+///     at all and one checked recombination suffices, is 1.30x worse.
+///   - Eight lanes helps nothing and hurts the unchecked form badly.
+///
+/// So this stays. The remaining distance to Polars on `int_sum/100k` is not in
+/// the addition; closing it further would mean giving up exactness, and that is
+/// not a trade to make quietly. `lanes_against_overflow_strategy` reproduces the
+/// grid.
 fn checked_sum_i64(dense: &[i64]) -> Option<i64> {
     let mut acc = [0i64; 4];
     let mut chunks = dense.chunks_exact(4);
