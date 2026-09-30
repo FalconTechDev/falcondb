@@ -1449,6 +1449,7 @@ fn execute_plan(
                     }
                     agg_batches = kept;
                 }
+                agg_batches = drop_having_scratch(agg_batches)?;
                 if let Projection::Columns(cols) = projection {
                     agg_batches = agg_batches.into_iter()
                         .map(|b| project_batch(&b, &cols))
@@ -1609,30 +1610,7 @@ fn execute_plan(
                 }
                 agg_batches = kept;
             }
-            // Drop the aggregates invented for HAVING.
-            //
-            // `HAVING COUNT(*) > 10` with no COUNT(*) in the SELECT list needs the
-            // count computed so the clause has a column to test, but the caller
-            // asked for `dept` and must get `dept`. Without this the result came
-            // back as ["dept", "__having_0"].
-            //
-            // Matched by the prefix `translate_having` generates, which is chosen
-            // to be something no one would write.
-            batches = agg_batches
-                .into_iter()
-                .map(|b| {
-                    let keep: Vec<&str> = b.schema
-                        .column_names()
-                        .into_iter()
-                        .filter(|n| !n.starts_with("__having_"))
-                        .collect();
-                    if keep.len() == b.schema.fields.len() {
-                        Ok(b)
-                    } else {
-                        b.project(&keep)
-                    }
-                })
-                .collect::<FalconResult<Vec<_>>>()?;
+            batches = drop_having_scratch(agg_batches)?;
         }
 
         // Step 2b — Window functions (applied per-batch after GROUP BY).
@@ -1793,6 +1771,32 @@ fn analyse_needed_columns(
 /// join output, which keeps one column so the row count survives — use
 /// [`analyse_needed_columns`] directly.
 #[allow(clippy::too_many_arguments)]
+/// Remove the aggregates invented to make a `HAVING` clause work.
+///
+/// `HAVING COUNT(*) > 10` with no `COUNT(*)` in the SELECT list needs that count
+/// computed so the clause has a column to test, and `translate_having` appends it
+/// under a `__having_` name. The caller asked for `dept` and must get `dept`, so
+/// the scratch column is dropped once the filtering is done.
+///
+/// Called from both places that produce an aggregated result -- the simple
+/// GROUP BY fast path and the general one. Missing the second is how this was
+/// first written, and the leak showed up as `["dept", "__having_0"]` in a test
+/// that checked the column names rather than only the row count.
+fn drop_having_scratch(batches: Vec<RecordBatch>) -> FalconResult<Vec<RecordBatch>> {
+    batches
+        .into_iter()
+        .map(|b| {
+            let keep: Vec<&str> = b
+                .schema
+                .column_names()
+                .into_iter()
+                .filter(|n| !n.starts_with("__having_"))
+                .collect();
+            if keep.len() == b.schema.fields.len() { Ok(b) } else { b.project(&keep) }
+        })
+        .collect()
+}
+
 fn needed_columns(
     projection: &crate::query::select::Projection,
     filter:     Option<&crate::query::expr::Expr>,
