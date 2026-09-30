@@ -2069,32 +2069,29 @@ mod in_list_semantics {
         assert_eq!(n("SELECT a.i FROM ints AS a"), 3);
         assert_eq!(n("SELECT i FROM ints ORDER BY ints.i"), 3);
         assert_eq!(n("SELECT ints.i FROM ints WHERE ints.i IN (1, 2)"), 2);
-    }
 
-    /// The one qualified-name case still broken, pinned so it is not mistaken for
-    /// working: a qualified column in the *select list of a join*.
-    ///
-    /// `SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f` still reports
-    /// "column not found", while the same query selecting plain `i` succeeds and
-    /// the join output schema is `["i", "f"]` -- the column is there. The select
-    /// list of a join is validated against the input tables one at a time, so
-    /// "ints.i" is reduced to "i" and looked for in `floats`, which has no `i`.
-    ///
-    /// Fixing that means giving the join planner a name scope, which is a larger
-    /// change than resolving a name in a schema. Pinned as a limitation rather
-    /// than left to be rediscovered; this test failing is good news.
-    #[test]
-    fn qualified_select_list_on_a_join_is_still_broken() {
-        let db = two_numeric_tables();
-        match db.sql("SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f") {
-            Err(e) => assert!(
-                e.to_string().contains("not found"),
-                "expected a not-found error, got: {e}"
-            ),
-            Ok(_) => panic!(
-                "this now works -- delete this test and fold the case into                  qualified_column_names_resolve"
-            ),
+        // The select list of a join was the last place this did not work: the join
+        // builds only the columns something downstream reads, and matched the
+        // wanted names literally, so "ints.i" pruned away the very column it named.
+        assert_eq!(n("SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f"), 3);
+        assert_eq!(n("SELECT floats.f FROM ints JOIN floats ON ints.i = floats.f"), 3);
+        assert_eq!(
+            n("SELECT ints.i, floats.f FROM ints JOIN floats ON ints.i = floats.f"),
+            3
+        );
+
+        // And the values have to be right, not merely present: a projection bug
+        // that returns the wrong column would pass every row count above.
+        let r = db
+            .sql("SELECT ints.i FROM ints JOIN floats ON ints.i = floats.f ORDER BY ints.i")
+            .unwrap();
+        let mut got: Vec<i64> = Vec::new();
+        for b in &r.batches {
+            for row in 0..b.row_count() {
+                got.push(b.column(0).get(row).unwrap().as_f64().unwrap() as i64);
+            }
         }
+        assert_eq!(got, vec![1, 2, 3], "qualified select returned the wrong values");
     }
 
     fn two_numeric_tables() -> crate::db::Database {
