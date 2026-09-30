@@ -685,6 +685,75 @@ impl Expr {
                     _ => None,
                 }
             }
+            // `col LIKE 'pattern'` — decided once per distinct string.
+            //
+            // This had no typed path, so it went through `eval_batch`, which per
+            // *row* boxed the value into a `String`, cloned that `String`, and
+            // cloned the pattern -- so a pattern was copied once for every row in
+            // the table. `ILIKE` added a `to_lowercase` of both, lowercasing the
+            // pattern a hundred thousand times instead of once.
+            //
+            // Measured over 100k rows with five distinct values, against
+            // `dept = 'sales'` on the same column as the reference:
+            //
+            // ```text
+            //   LIKE 'sales'   (no wildcard)   93.9x
+            //   LIKE 'sal%'    (prefix)        96.9x
+            //   LIKE '_ales'                   95.2x
+            //   LIKE 'h%a%r%s' (backtracking)  99.7x
+            //   LIKE '%an%'    (substring)    107.8x
+            //   LIKE '%ing'    (suffix)       111.0x
+            //   ILIKE '%AN%'                  116.0x
+            // ```
+            //
+            // The cost barely moves with the shape of the pattern, which says the
+            // matcher's backtracking was never the expense -- `LIKE 'sales'`, which
+            // is exactly the reference query written differently, cost 94x it.
+            //
+            // A dictionary column stores each distinct string once, so the pattern
+            // needs matching against five strings rather than a hundred thousand
+            // rows. The pattern is lowercased once, before the loop.
+            Expr::Like { expr, pattern, negated, case_insensitive } => {
+                let Expr::Column(name) = expr.as_ref() else { return None };
+                let col = batch.column_by_name(name).ok()?;
+                let crate::storage::column::Column::Utf8(c) = col else { return None };
+
+                let pat = if *case_insensitive { pattern.to_lowercase() } else { pattern.clone() };
+                let pass: Vec<bool> = c
+                    .dict()
+                    .iter()
+                    .map(|entry| {
+                        let hit = if *case_insensitive {
+                            like_matches(&entry.to_lowercase(), &pat)
+                        } else {
+                            like_matches(entry, &pat)
+                        };
+                        if *negated { !hit } else { hit }
+                    })
+                    .collect();
+
+                // A NULL cell never matched, and the general path then negated that
+                // to `true` for `NOT LIKE`. That is not what SQL says about NULL,
+                // but it is what this engine has always answered, and a faster path
+                // is not the place to change an answer.
+                let null_passes = *negated;
+
+                let mut mask = vec![0u64; n_words];
+                for (w, chunk) in c.codes().chunks(64).enumerate() {
+                    let mut bits = 0u64;
+                    for (j, &code) in chunk.iter().enumerate() {
+                        let hit = if crate::storage::column::Utf8Column::is_null_code(code) {
+                            null_passes
+                        } else {
+                            pass[code as usize]
+                        };
+                        bits |= (hit as u64) << j;
+                    }
+                    mask[w] = bits;
+                }
+                Some(Ok(mask))
+            }
+
             // `col IN (literal, ...)` — the union of the equality masks.
             //
             // This shape had no typed path, so it fell to `eval_batch`, which
@@ -1964,6 +2033,142 @@ mod in_list_semantics {
         assert_eq!(n("SELECT f FROM t WHERE f IN (1, 2)"), 2);
         assert_eq!(n("SELECT f FROM t WHERE f IN (1.0, 2.0)"), 2);
         assert_eq!(n("SELECT i FROM t WHERE i IN (1, 2)"), 2);
+    }
+
+    /// The typed `LIKE` path must answer exactly what the general path answered.
+    ///
+    /// Including where the general path is arguably wrong: a NULL cell never
+    /// matched, and `NOT LIKE` then negated that to true. SQL says a comparison
+    /// with NULL is unknown, so those rows should not pass, but that is a
+    /// behaviour change and a faster path is not the place to make one. Pinned
+    /// here so that if it is ever changed, it is changed deliberately and in both
+    /// paths at once.
+    #[test]
+    fn typed_like_matches_the_general_path() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+
+        let batch = RecordBatch::new(
+            Schema::new(vec![Field::nullable("s", DataType::Utf8)]),
+            vec![ColumnBuilder::utf8_from_str(vec![
+                Some("engineering"),
+                Some("sales"),
+                None,
+                Some("Sales"),
+                Some("legal"),
+                Some(""),
+            ])],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let n = |sql: &str| -> usize {
+            db.sql(sql).unwrap().batches.iter().map(|b| b.row_count()).sum()
+        };
+
+        // Shape by shape, with the expected count worked out by hand.
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE 'sales'"), 1, "exact, case-sensitive");
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE 'sal%'"), 1, "prefix");
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE '%ing'"), 1, "suffix");
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE '%a%'"), 4, "substring: engineering, sales, Sales, legal");
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE '_ales'"), 2, "single char: sales, Sales");
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE '%'"), 5, "everything non-NULL, including the empty string");
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE ''"), 1, "the empty string only");
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE 'nothing%'"), 0, "no match");
+
+        // Case-insensitive.
+        assert_eq!(n("SELECT s FROM t WHERE s ILIKE 'SALES'"), 2, "sales and Sales");
+        assert_eq!(n("SELECT s FROM t WHERE s ILIKE '%AL%'"), 3, "sales, Sales, legal");
+
+        // Negated, including the NULL row, which the general path lets through.
+        assert_eq!(n("SELECT s FROM t WHERE s NOT LIKE 'sales'"), 5, "everything else plus the NULL row");
+        assert_eq!(n("SELECT s FROM t WHERE s NOT LIKE '%a%'"), 2, "the empty string plus the NULL row");
+
+        // Composed with AND/OR, which is where a mask built wrongly shows up.
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE '%a%' AND s LIKE '%s'"), 2, "sales, Sales");
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE 'legal' OR s LIKE 'sales'"), 2);
+    }
+
+    /// What does `LIKE` cost, and against what?
+    ///
+    /// `LIKE` has no benchmark -- nor do `ILIKE`, `CASE`, `HAVING`, `CAST`,
+    /// `EXTRACT`, `UNION`, `LIMIT`, `COUNT(DISTINCT)` or any string function, none
+    /// of which appear in the suite at all -- and it has the two defects that go
+    /// with being unmeasured.
+    ///
+    /// Per row, the general path boxes the column value into a `String`, clones
+    /// that `String`, and clones the *pattern*, so a pattern is copied once for
+    /// every row in the table. `ILIKE` adds a `to_lowercase` of both, lowercasing
+    /// the pattern a hundred thousand times instead of once.
+    ///
+    /// And the matcher is recursive backtracking with no shortcut for the shapes
+    /// people actually write: `'prefix%'` is a byte compare, `'%sub%'` is a
+    /// substring search, and a pattern with no wildcard at all is equality.
+    ///
+    /// `=` on the same column is the reference: it is the cheapest thing that
+    /// answers a question about the same strings, and it already decides the
+    /// answer once per dictionary entry rather than once per row.
+    ///
+    /// Run with
+    /// `cargo test --release --lib like_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn like_cost() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+        // Low cardinality, which is what a text column usually is.
+        let words = ["engineering", "sales", "human resources", "operations", "legal"];
+        let batch = RecordBatch::new(
+            Schema::new(vec![Field::required("dept", DataType::Utf8)]),
+            vec![ColumnBuilder::utf8_from_str(
+                (0..ROWS).map(|i| Some(words[i % words.len()])).collect(),
+            )],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let time = |label: &str, sql: &str| {
+            for _ in 0..3 { db.sql(sql).unwrap(); }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(sql).unwrap());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:<38}{best:>9.2?}");
+            best
+        };
+
+        println!("over {ROWS} rows, 5 distinct values:");
+        let eq = time("dept = 'sales' (the reference)", "SELECT COUNT(*) FROM t WHERE dept = 'sales'");
+        let shapes: Vec<(&str, &str)> = vec![
+            ("LIKE 'sales' (no wildcard)",      "SELECT COUNT(*) FROM t WHERE dept LIKE 'sales'"),
+            ("LIKE 'sal%' (prefix)",            "SELECT COUNT(*) FROM t WHERE dept LIKE 'sal%'"),
+            ("LIKE '%ing' (suffix)",            "SELECT COUNT(*) FROM t WHERE dept LIKE '%ing'"),
+            ("LIKE '%an%' (substring)",         "SELECT COUNT(*) FROM t WHERE dept LIKE '%an%'"),
+            ("LIKE 'h%a%r%s' (backtracking)",   "SELECT COUNT(*) FROM t WHERE dept LIKE 'h%a%r%s'"),
+            ("LIKE '_ales' (single char)",      "SELECT COUNT(*) FROM t WHERE dept LIKE '_ales'"),
+            ("ILIKE '%AN%' (case-insensitive)", "SELECT COUNT(*) FROM t WHERE dept ILIKE '%AN%'"),
+        ];
+        for (label, sql) in shapes {
+            let d = time(label, sql);
+            println!("      {:.1}x the reference", d.as_secs_f64() / eq.as_secs_f64());
+        }
     }
 
     /// Which other forms of "is this value that value" disagree with `=`?
