@@ -674,16 +674,6 @@ fn dense_numeric_function(
 ) -> Option<crate::storage::column::Column> {
     use crate::storage::column::{Column, PrimitiveColumn};
 
-    // A second argument is only meaningful to ROUND, and only as a literal.
-    let digits = match args {
-        [_] => None,
-        [_, Expr::Literal(v)] => Some(v.as_i64()? as i32),
-        _ => return None,
-    };
-    if digits.is_some() && name != "ROUND" {
-        return None;
-    }
-
     // COALESCE(col, <literal>) fills the NULLs and leaves everything else alone.
     //
     // Only when the literal's type matches the column's. With a mismatch the
@@ -706,6 +696,27 @@ fn dense_numeric_function(
                 _ => return None,
             }
         }
+        return None;
+    }
+
+    // A second argument is only meaningful to ROUND, and only as a literal.
+    //
+    // This guard sits *below* the COALESCE block on purpose. It was above it at
+    // first, and since it returns `None` for any two-argument call that is not
+    // ROUND, it rejected COALESCE before the code handling COALESCE could run --
+    // leaving that code unreachable and the function at its old 155ns per row.
+    //
+    // That is the second time in this work a guard written for one function has
+    // silently swallowed another: the argument match above once admitted a second
+    // literal only when it was text, written for CONCAT, which excluded
+    // `ROUND(f, 2)` the same way. Both were caught by measuring each function
+    // separately and noticing that one did not move.
+    let digits = match args {
+        [_] => None,
+        [_, Expr::Literal(v)] => Some(v.as_i64()? as i32),
+        _ => return None,
+    };
+    if digits.is_some() && name != "ROUND" {
         return None;
     }
 
@@ -1069,6 +1080,91 @@ mod dict_functions {
             }
         }
         out
+    }
+
+    /// `CASE` and `COALESCE` on the fast path must answer what the general path
+    /// answered, and the shapes the fast path declines must still work.
+    ///
+    /// The declining cases matter more than the accepted ones here: a fast path
+    /// that quietly handles a shape it models wrongly -- several `WHEN`s, a
+    /// missing `ELSE`, a type mismatch -- is worse than one that never fires.
+    #[test]
+    fn dense_case_and_coalesce_match_the_general_path() {
+        use crate::storage::types::DataType;
+
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::nullable("n", DataType::Int64),
+                Field::nullable("s", DataType::Utf8),
+            ]),
+            vec![
+                ColumnBuilder::int64(vec![Some(10), Some(60), None, Some(100)]),
+                ColumnBuilder::utf8_from_str(vec![Some("a"), Some("b"), None, Some("c")]),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let ints = |sql: &str| -> Vec<Option<i64>> {
+            let r = db.sql(sql).unwrap();
+            let b = &r.batches[0];
+            (0..b.row_count())
+                .map(|i| match b.column(0).get(i).unwrap() {
+                    ScalarValue::Null => None,
+                    v => v.as_i64(),
+                })
+                .collect()
+        };
+        let texts = |sql: &str| -> Vec<Option<String>> {
+            let r = db.sql(sql).unwrap();
+            let b = &r.batches[0];
+            (0..b.row_count())
+                .map(|i| match b.column(0).get(i).unwrap() {
+                    ScalarValue::Utf8(v) => v,
+                    ScalarValue::Null => None,
+                    other => panic!("expected text, got {other:?}"),
+                })
+                .collect()
+        };
+
+        // The shape the fast path takes. The NULL row fails `n > 50`, so it gets
+        // the ELSE arm -- which is what the general path does too.
+        assert_eq!(
+            ints("SELECT CASE WHEN n > 50 THEN 1 ELSE 0 END FROM t"),
+            vec![Some(0), Some(1), Some(0), Some(1)],
+        );
+        assert_eq!(
+            texts("SELECT CASE WHEN n > 50 THEN 'big' ELSE 'small' END FROM t"),
+            vec![Some("small".into()), Some("big".into()), Some("small".into()), Some("big".into())],
+        );
+
+        // COALESCE fills only the NULLs.
+        assert_eq!(ints("SELECT COALESCE(n, 0) FROM t"), vec![Some(10), Some(60), Some(0), Some(100)]);
+        assert_eq!(ints("SELECT COALESCE(n, -1) FROM t"), vec![Some(10), Some(60), Some(-1), Some(100)]);
+
+        // Shapes the fast path declines, which must answer identically.
+        //
+        // No ELSE: unmatched rows are NULL, a different column shape.
+        assert_eq!(
+            ints("SELECT CASE WHEN n > 50 THEN 1 END FROM t"),
+            vec![None, Some(1), None, Some(1)],
+        );
+        // Two WHENs, where first-match matters: 100 satisfies both.
+        assert_eq!(
+            ints("SELECT CASE WHEN n > 50 THEN 1 WHEN n > 5 THEN 2 ELSE 3 END FROM t"),
+            vec![Some(2), Some(1), Some(3), Some(1)],
+        );
+        // A non-literal arm.
+        assert_eq!(
+            ints("SELECT CASE WHEN n > 50 THEN n ELSE 0 END FROM t"),
+            vec![Some(0), Some(60), Some(0), Some(100)],
+        );
+        // COALESCE over two columns rather than a literal.
+        assert_eq!(
+            texts("SELECT COALESCE(s, 'none') FROM t"),
+            vec![Some("a".into()), Some("b".into()), Some("none".into()), Some("c".into())],
+        );
     }
 
     /// The dense numeric path must answer what the per-row path answered, and in
