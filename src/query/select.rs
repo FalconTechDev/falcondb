@@ -1082,6 +1082,110 @@ mod dict_functions {
         out
     }
 
+    /// The shapes the benchmark suite still does not execute.
+    ///
+    /// `LIKE` and the scalar functions came out of this same question and were
+    /// 29x to 400x off. These are what is left: `HAVING`, `EXTRACT`, `UNION`,
+    /// `LIMIT`, `COUNT(DISTINCT)` and `STRING_AGG`, none of which appear in the
+    /// suite.
+    ///
+    /// Each is paired with the closest thing that *is* measured, so a number means
+    /// something. `HAVING` against the same `GROUP BY` without it; `LIMIT` against
+    /// the same `ORDER BY` without it; `COUNT(DISTINCT)` against plain `COUNT`.
+    ///
+    /// Run with
+    /// `cargo test --release --lib unbenchmarked_shapes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn unbenchmarked_shapes() {
+        use crate::storage::types::DataType;
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+        let words = ["engineering", "sales", "human resources", "operations", "legal"];
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("n", DataType::Int64),
+                Field::required("score", DataType::Float64),
+                Field::required("d", DataType::Date32),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS).map(|i| Some(words[i % words.len()])).collect(),
+                ),
+                ColumnBuilder::int64((0..ROWS as i64).map(Some).collect()),
+                ColumnBuilder::float64((0..ROWS).map(|i| Some((i % 1000) as f64)).collect()),
+                ColumnBuilder::date32((0..ROWS).map(|i| Some(19000 + (i % 365) as i32)).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let time = |label: &str, sql: &str| -> Option<std::time::Duration> {
+            for _ in 0..3 {
+                if let Err(e) = db.sql(sql) {
+                    println!("  {label:<40}unsupported: {e}");
+                    return None;
+                }
+            }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(sql).unwrap());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:<40}{best:>9.2?}");
+            Some(best)
+        };
+
+        println!("over {ROWS} rows, 5 distinct departments:
+");
+
+        println!("-- HAVING, against the same GROUP BY without it --");
+        let gb = time("GROUP BY dept", "SELECT dept, COUNT(*) c FROM t GROUP BY dept").unwrap();
+        if let Some(h) = time("... HAVING COUNT(*) > 10", "SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING COUNT(*) > 10") {
+            println!("      {:.2}x the plain GROUP BY", h.as_secs_f64() / gb.as_secs_f64());
+        }
+
+        println!("
+-- LIMIT, against the same ORDER BY without it --");
+        let ob = time("ORDER BY score DESC", "SELECT score FROM t ORDER BY score DESC").unwrap();
+        if let Some(l) = time("... LIMIT 10", "SELECT score FROM t ORDER BY score DESC LIMIT 10") {
+            println!("      {:.2}x the full sort (should be far cheaper)", l.as_secs_f64() / ob.as_secs_f64());
+        }
+
+        println!("
+-- COUNT(DISTINCT), against plain COUNT --");
+        let c = time("COUNT(*)", "SELECT COUNT(*) FROM t").unwrap();
+        for (label, sql) in [
+            ("COUNT(DISTINCT dept)  5 values",  "SELECT COUNT(DISTINCT dept) FROM t"),
+            ("COUNT(DISTINCT n)   100k values", "SELECT COUNT(DISTINCT n) FROM t"),
+        ] {
+            if let Some(d) = time(label, sql) {
+                println!("      {:.0}x COUNT(*)", d.as_secs_f64() / c.as_secs_f64());
+            }
+        }
+
+        println!("
+-- the rest, against reading a column --");
+        let base = time("SELECT n (reference)", "SELECT n FROM t").unwrap();
+        for (label, sql) in [
+            ("EXTRACT(YEAR FROM d)",  "SELECT EXTRACT(YEAR FROM d) FROM t"),
+            ("YEAR(d)",               "SELECT YEAR(d) FROM t"),
+            ("UNION of two halves",   "SELECT n FROM t WHERE n < 50000 UNION SELECT n FROM t WHERE n >= 50000"),
+            ("UNION ALL",             "SELECT n FROM t WHERE n < 50000 UNION ALL SELECT n FROM t WHERE n >= 50000"),
+            ("STRING_AGG(dept)",      "SELECT STRING_AGG(dept, ',') FROM t"),
+        ] {
+            if let Some(d) = time(label, sql) {
+                println!("      {:.0}x the reference, {:.0} ns per row",
+                    d.as_secs_f64() / base.as_secs_f64(),
+                    d.as_nanos() as f64 / ROWS as f64);
+            }
+        }
+    }
+
     /// `CASE` and `COALESCE` on the fast path must answer what the general path
     /// answered, and the shapes the fast path declines must still work.
     ///
