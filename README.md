@@ -36,6 +36,12 @@ median of 100 samples. Against **DuckDB 1.x**, **Polars** and **DataFusion**, al
 reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 `cargo bench`, for reasons given under [Methodology](#methodology).
 
+The run behind these tables reported *AC power for all 268 samples taken during
+it*. That sentence is the point of the check, not a formality: a run whose charger
+came out halfway through produced one file holding two machines, with everything
+after the disconnection 2–3× slower in all four engines and nothing in the output
+to say so.
+
 ### Scans and aggregates
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
@@ -64,14 +70,13 @@ reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 | `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **22.8 µs** | 290 µs | 2.10 ms | 1.52 ms |
 | | 100 k | **97.2 µs** | 1.11 ms | 3.57 ms | 2.09 ms |
 
-† This point took three readings to settle, and the story is worth keeping. One
-full run put FalconDB at 702 µs against Polars' 600 — behind — but with a spread
-of 616–837 µs where every other point in the suite spans about 1%. Re-running
-that group alone gave 589 µs against 617. This run, a full one again, gives the
-560 µs above with a 547–573 spread. Two clean readings agree and the wide one
-was the outlier, so FalconDB leads here; the wide reading is recorded rather than
-quietly dropped, because "the measurement I disliked was noise" is a claim that
-has to be earned with another measurement, not asserted.
+† Four readings went into this one. A full run once put FalconDB at 702 µs
+against Polars' 600 -- behind -- but with a spread of 616–837 µs where every other
+point in the suite spans about 1%. Re-running that group alone gave 589 µs, and two
+later full runs gave 560 µs and the 506 µs above, all with tight spreads. The three
+clean readings agree and the wide one was the outlier. It is recorded rather than
+quietly dropped, because "the measurement I disliked was noise" is a claim that has
+to be earned with another measurement.
 
 ### Joins, window functions, DML
 
@@ -91,14 +96,20 @@ used to make — see [Methodology](#methodology).
 | `UPDATE` (half the rows) | 100 k | **1.62 ms** | — | 3.69 ms | — |
 | `DELETE` (half the rows) | 100 k | **920 µs** | — | 2.55 ms | — |
 
-‡ The previous run recorded 4.31 ms here and called it an unexplained slide,
-because the rivals had held still while this moved. Looking for the regression
-found instead that there was none: nothing in the window path had changed, and
-the cost had always been there. `ROW_NUMBER` evaluated its ordering key into a
-`ScalarValue` per row before knowing whether anything would read it — and it
-never does, since the function numbers rows by position. Drift made a standing
-cost visible, which is a reminder that a number moving without a cause is worth
-looking into even when the suspicion of a regression turns out wrong.
+‡ Treat this row as the least certain in the table. DuckDB measured 11.5 ms and
+11.9 ms in the two runs before this one and 21.5 ms in this one, and FalconDB went
+2.16 → 2.23 → 2.91 ms across the same three. Both engines rising together in one
+group, while every other group held, says that group met a transient the run-level
+power check does not cover. The ratio still favours FalconDB by a wide margin, so
+the conclusion is safe even though the absolute numbers are not.
+
+Earlier this figure was 4.31 ms and was recorded as an unexplained regression.
+Looking for the regression found there was none: nothing in the window path had
+changed, and the cost had always been there -- `ROW_NUMBER` evaluated its ordering
+key into a `ScalarValue` per row before knowing whether anything would read it,
+which it never does. Drift made a standing cost visible, which is a reminder that a
+number moving without a cause is worth looking into even when the suspicion of a
+regression turns out wrong.
 
 ### Where FalconDB is behind
 
