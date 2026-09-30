@@ -1082,6 +1082,52 @@ mod dict_functions {
         out
     }
 
+    /// Which `HAVING` forms work?
+    ///
+    /// `HAVING COUNT(*) > 10` reports "unsupported function arg", which is
+    /// ordinary SQL failing outright. Before fixing it, this maps what does and
+    /// does not work, so the fix is aimed at the real boundary rather than at the
+    /// one example that happened to be tried.
+    #[test]
+    #[ignore]
+    fn having_forms() {
+        use crate::storage::types::DataType;
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("n", DataType::Int64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(
+                    (0..100).map(|i| Some(["a", "b", "c"][i % 3])).collect(),
+                ),
+                ColumnBuilder::int64((0..100).map(Some).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        for sql in [
+            "SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING c > 10",
+            "SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING COUNT(*) > 10",
+            "SELECT dept, COUNT(n) c FROM t GROUP BY dept HAVING COUNT(n) > 10",
+            "SELECT dept, SUM(n) s FROM t GROUP BY dept HAVING SUM(n) > 100",
+            "SELECT dept, AVG(n) a FROM t GROUP BY dept HAVING AVG(n) > 10",
+            "SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING COUNT(*) > 10 AND dept <> 'a'",
+            "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
+        ] {
+            match db.sql(sql) {
+                Ok(r) => {
+                    let rows: usize = r.batches.iter().map(|b| b.row_count()).sum();
+                    println!("  ok   ({rows} rows)  {sql}");
+                }
+                Err(e) => println!("  FAIL  {e}
+        {sql}"),
+            }
+        }
+    }
+
     /// The shapes the benchmark suite still does not execute.
     ///
     /// `LIKE` and the scalar functions came out of this same question and were

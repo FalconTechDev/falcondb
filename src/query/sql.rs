@@ -679,10 +679,28 @@ fn translate_query(query: Query) -> FalconResult<ParsedQuery> {
     }
 
     let filter  = sel.selection.as_ref().map(translate_expr).transpose()?;
-    let having  = sel.having.as_ref().map(translate_expr).transpose()?;
 
-    let (projections, agg_exprs, group_by_exprs, windows) =
+    let (projections, mut agg_exprs, group_by_exprs, windows) =
         classify_projection(&sel.projection, &sel.group_by)?;
+
+    // HAVING is translated after the aggregates are known, because it runs
+    // against the *aggregated* batch, whose columns are the output aliases.
+    //
+    // Translating it like any other expression meant only the alias form worked:
+    //
+    //     HAVING c > 10          ok
+    //     HAVING COUNT(*) > 10   "unsupported function arg"
+    //     HAVING COUNT(n) > 10   "column 'n' not found"
+    //     HAVING SUM(n) > 100    same
+    //
+    // -- so the textbook spelling of the clause failed while an alias, which not
+    // every dialect even allows there, was the only thing that worked. Each
+    // aggregate in the clause now becomes a reference to the column that
+    // aggregate produces, and one the SELECT list does not already compute is
+    // added to the group-by so the reference has something to point at.
+    let having = sel.having.as_ref()
+        .map(|h| translate_having(h, &mut agg_exprs))
+        .transpose()?;
 
     let group_by = if !agg_exprs.is_empty() || !group_by_exprs.is_empty() {
         Some(GroupByExec::new(group_by_exprs, agg_exprs))
@@ -770,6 +788,52 @@ fn expr_alias(e: &SqlExpr, idx: usize) -> String {
 }
 
 // в”Ђв”Ђв”Ђ Aggregate detection в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+
+/// Translate a `HAVING` clause, turning each aggregate into a reference to the
+/// column that aggregate produces.
+///
+/// `HAVING` is evaluated against the aggregated batch, so `COUNT(*)` there cannot
+/// be computed -- the rows it would count are gone. What it can do is name the
+/// column holding the count. When the SELECT list already computes that
+/// aggregate, its alias is used; when it does not, the aggregate is appended with
+/// a generated name so the reference resolves. The generated name is prefixed to
+/// keep it clear of anything a user would write.
+fn translate_having(e: &SqlExpr, aggs: &mut Vec<AggExpr>) -> FalconResult<Expr> {
+    // An aggregate here is replaced wholesale by the column it produces.
+    if let Some(agg) = try_translate_agg(e, "")? {
+        let existing = aggs.iter().find(|a| {
+            format!("{:?}", a.func) == format!("{:?}", agg.func)
+                && a.input.to_string() == agg.input.to_string()
+        });
+        let name = match existing {
+            Some(a) => a.alias.clone(),
+            None => {
+                let name = format!("__having_{}", aggs.len());
+                aggs.push(AggExpr { alias: name.clone(), ..agg });
+                name
+            }
+        };
+        return Ok(Expr::Column(name));
+    }
+
+    // Otherwise recurse through the shapes a HAVING clause is built from, so an
+    // aggregate nested inside a comparison or a conjunction is still found.
+    // Anything else is translated as it always was.
+    Ok(match e {
+        SqlExpr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left:  Box::new(translate_having(left, aggs)?),
+            op:    translate_binary_op(op)?,
+            right: Box::new(translate_having(right, aggs)?),
+        },
+        SqlExpr::Nested(inner) => translate_having(inner, aggs)?,
+        SqlExpr::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr } => {
+            Expr::Not(Box::new(translate_having(expr, aggs)?))
+        }
+        SqlExpr::IsNull(inner)    => Expr::IsNull(Box::new(translate_having(inner, aggs)?)),
+        SqlExpr::IsNotNull(inner) => Expr::IsNotNull(Box::new(translate_having(inner, aggs)?)),
+        other => translate_expr(other)?,
+    })
+}
 
 fn try_translate_agg(e: &SqlExpr, alias: &str) -> FalconResult<Option<AggExpr>> {
     let SqlExpr::Function(func) = e else { return Ok(None); };
@@ -1153,9 +1217,16 @@ fn translate_expr(e: &SqlExpr) -> FalconResult<Expr> {
             let name = func.name.to_string();
             let args = match &func.args {
                 FunctionArguments::List(list) => list.args.iter()
-                    .map(|a| match a {
-                        FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => translate_expr(e),
-                        _ => Err(FalconError::InvalidQuery("unsupported function arg".into())),
+                    .filter_map(|a| match a {
+                        FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                            Some(translate_expr(e))
+                        }
+                        // `COUNT(*)` — the star is not an expression, and rejecting
+                        // it here made `HAVING COUNT(*) > 10` fail outright with
+                        // "unsupported function arg". It carries no information a
+                        // scalar call needs, so it is dropped rather than refused.
+                        FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => None,
+                        _ => Some(Err(FalconError::InvalidQuery("unsupported function arg".into()))),
                     })
                     .collect::<FalconResult<Vec<_>>>()?,
                 _ => vec![],
