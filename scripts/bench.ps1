@@ -73,29 +73,81 @@ if ($battery -and $battery.BatteryStatus -eq 1) {
 #
 # Measures idle time rather than the load counter, which lags, and names the
 # heaviest processes so there is something to act on.
-$idle = (Get-Counter '\Processor(_Total)\% Idle Time' -SampleInterval 1 -MaxSamples 2 -ErrorAction SilentlyContinue |
-    Select-Object -ExpandProperty CounterSamples |
-    Measure-Object -Property CookedValue -Average).Average
-if ($null -ne $idle) {
+#
+# Samples repeatedly instead of deciding on one look. The first version refused on
+# a single two-second sample and tripped straight after a finished run, when
+# Windows was still winding processes down and the only names it could offer were
+# svchost, System and dwm -- nothing anyone can close. Transient busy-ness is
+# exactly what a benchmark should wait out rather than refuse over.
+$busy = 100
+for ($attempt = 1; $attempt -le 6; $attempt++) {
+    $idle = (Get-Counter '\Processor(_Total)\% Idle Time' -SampleInterval 1 -MaxSamples 2 -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty CounterSamples |
+        Measure-Object -Property CookedValue -Average).Average
+    if ($null -eq $idle) { $busy = 0; break }
     $busy = [math]::Round(100 - $idle, 1)
-    if ($busy -gt 10) {
-        $top = Get-Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.Id -ne $PID -and $_.CPU } |
-            Sort-Object CPU -Descending |
-            Select-Object -First 3 |
-            ForEach-Object { "$($_.ProcessName) ($([math]::Round($_.CPU))s CPU, $([math]::Round($_.WorkingSet/1MB))MB)" }
-        $msg = "The machine is $busy% busy before the run has started. " +
-               "Another process competing for cores or memory bandwidth slows every " +
-               "engine at once, which looks like ordinary output and is comparable " +
-               "with nothing.`nHeaviest processes: " + ($top -join ", ")
-        if (-not $AllowBusy) {
-            Write-Error "$msg`nClose what you can, or pass -AllowBusy to measure anyway."
-            exit 1
-        }
-        Write-Warning "$msg`nContinuing because -AllowBusy was passed: treat the absolute numbers as unusable."
+    if ($busy -le 10) { break }
+    if ($attempt -lt 6) {
+        Write-Host "Machine is $busy% busy; waiting for it to settle ($attempt/6)..."
+        Start-Sleep -Seconds 5
     }
 }
+if ($busy -gt 10) {
+    # Ranks by CPU used *during a sample*, not by the process's lifetime total.
+    #
+    # The first version sorted on Process.CPU, which is cumulative since the
+    # process started, and so it blamed whatever had worked hardest at some point
+    # today. On a refused run it named svchost, System and dwm -- 9089s, 6564s and
+    # 6240s of lifetime CPU between them and essentially idle at that moment --
+    # while the process actually taking 21.8% of the machine was Telegram, which
+    # the list did not mention. Naming the wrong process is worse than naming
+    # none, because it sends you to close something harmless and leaves the real
+    # one running.
+    $n = [Environment]::ProcessorCount
+    $before = @{}
+    foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
+        if ($proc.CPU) { $before[$proc.Id] = $proc.CPU }
+    }
+    Start-Sleep -Seconds 3
+    $live = foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
+        $prev = $before[$proc.Id]
+        if ($null -ne $prev -and $proc.CPU) {
+            $used = $proc.CPU - $prev
+            if ($used -gt 0.05) {
+                [PSCustomObject]@{
+                    Name = $proc.ProcessName
+                    Pct  = [math]::Round($used / 3 / $n * 100, 1)
+                    MB   = [math]::Round($proc.WorkingSet / 1MB)
+                }
+            }
+        }
+    }
+    $live = $live | Sort-Object Pct -Descending
 
+    # System processes cannot be closed, so listing them under "close this" is
+    # useless advice; they are reported separately.
+    $system = @('System','Idle','svchost','dwm','csrss','wininit','services','lsass',
+                'Registry','MemCompression','audiodg','taskhostw','explorer')
+    $closable = $live | Where-Object { $_.Name -notin $system } | Select-Object -First 3 |
+        ForEach-Object { "$($_.Name) ($($_.Pct)% now, $($_.MB)MB)" }
+    $heaviest = $live | Select-Object -First 3 |
+        ForEach-Object { "$($_.Name) ($($_.Pct)% now)" }
+
+    $msg = "The machine is still $busy% busy after waiting 30s. " +
+           "Another process competing for cores or memory bandwidth slows every " +
+           "engine at once, which looks like ordinary output and is comparable " +
+           "with nothing.`nUsing CPU right now: " + ($heaviest -join ", ")
+    if ($closable) {
+        $msg += "`nWorth closing: " + ($closable -join ", ")
+    } else {
+        $msg += "`nNothing closable is busy -- this is system activity. Wait and retry."
+    }
+    if (-not $AllowBusy) {
+        Write-Error "$msg`nOr pass -AllowBusy to measure anyway."
+        exit 1
+    }
+    Write-Warning "$msg`nContinuing because -AllowBusy was passed: treat the absolute numbers as unusable."
+}
 
 $env:CARGO_TARGET_DIR = "E:\rust-target"
 $repo = Split-Path -Parent $PSScriptRoot
