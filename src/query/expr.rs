@@ -2076,7 +2076,9 @@ mod in_list_semantics {
         assert_eq!(n("SELECT s FROM t WHERE s LIKE 'sales'"), 1, "exact, case-sensitive");
         assert_eq!(n("SELECT s FROM t WHERE s LIKE 'sal%'"), 1, "prefix");
         assert_eq!(n("SELECT s FROM t WHERE s LIKE '%ing'"), 1, "suffix");
-        assert_eq!(n("SELECT s FROM t WHERE s LIKE '%a%'"), 4, "substring: engineering, sales, Sales, legal");
+        // "engineering" has no 'a' in it, which this test asserted twice before
+        // counting the letters.
+        assert_eq!(n("SELECT s FROM t WHERE s LIKE '%a%'"), 3, "substring: sales, Sales, legal");
         assert_eq!(n("SELECT s FROM t WHERE s LIKE '_ales'"), 2, "single char: sales, Sales");
         assert_eq!(n("SELECT s FROM t WHERE s LIKE '%'"), 5, "everything non-NULL, including the empty string");
         assert_eq!(n("SELECT s FROM t WHERE s LIKE ''"), 1, "the empty string only");
@@ -2088,7 +2090,7 @@ mod in_list_semantics {
 
         // Negated, including the NULL row, which the general path lets through.
         assert_eq!(n("SELECT s FROM t WHERE s NOT LIKE 'sales'"), 5, "everything else plus the NULL row");
-        assert_eq!(n("SELECT s FROM t WHERE s NOT LIKE '%a%'"), 2, "the empty string plus the NULL row");
+        assert_eq!(n("SELECT s FROM t WHERE s NOT LIKE '%a%'"), 3, "engineering, the empty string, and the NULL row");
 
         // Composed with AND/OR, which is where a mask built wrongly shows up.
         assert_eq!(n("SELECT s FROM t WHERE s LIKE '%a%' AND s LIKE '%s'"), 2, "sales, Sales");
