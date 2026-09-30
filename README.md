@@ -36,7 +36,7 @@ median of 100 samples. Against **DuckDB 1.x**, **Polars** and **DataFusion**, al
 reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 `cargo bench`, for reasons given under [Methodology](#methodology).
 
-The run behind these tables reported *AC power for all 268 samples taken during
+The run behind these tables reported *AC power for all 366 samples taken during
 it*. That sentence is the point of the check, not a formality: a run whose charger
 came out halfway through produced one file holding two machines, with everything
 after the disconnection 2–3× slower in all four engines and nothing in the output
@@ -46,37 +46,34 @@ to say so.
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `SUM(score)` | 10 k | **1.44 µs** | 8.22 µs | 198 µs | 1.69 ms |
-| | 100 k | **8.71 µs** | 18.7 µs | 352 µs | 1.93 ms |
-| | 1 M | **60.8 µs** | 159 µs | 489 µs | 2.65 ms |
-| `SUM(id)` (integer) | 10 k | **2.71 µs** | 7.57 µs | 218 µs | 1.78 ms |
-| | 100 k | 20.7 µs | **14.5 µs** | 413 µs | 2.43 ms |
-| | 1 M | **79.1 µs** | 169 µs | 480 µs | 12.5 ms |
-| `WHERE score > 50` | 10 k | **18.3 µs** | 51.8 µs | 591 µs | 1.28 ms |
-| | 100 k | **125 µs** | 168 µs | 3.94 ms | 2.69 ms |
-| | 1 M | **602 µs** | 2.07 ms | 24.5 ms | 17.1 ms |
+| `SUM(score)` | 10 k | **1.46 µs** | 8.32 µs | 227 µs | 1.73 ms |
+| | 100 k | **8.77 µs** | 19.0 µs | 298 µs | 1.94 ms |
+| | 1 M | **61.3 µs** | 178 µs | 501 µs | 2.66 ms |
+| `SUM(id)` (integer) | 10 k | **2.66 µs** | 7.35 µs | 242 µs | 1.92 ms |
+| | 100 k | 20.7 µs | **14.4 µs** | 414 µs | 2.45 ms |
+| | 1 M | **76.4 µs** | 167 µs | 478 µs | 12.7 ms |
+| `WHERE score > 50` | 10 k | **16.5 µs** | 50.9 µs | 600 µs | 1.23 ms |
+| | 100 k | **126 µs** | 173 µs | 4.30 ms | 2.97 ms |
+| | 1 M | **673 µs** † | 2.50 ms | 24.0 ms | 17.3 ms |
 
 ### Grouping, sorting, pipelines
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `GROUP BY` + 3 aggregates | 10 k | **38.5 µs** | 269 µs | 1.95 ms | 1.59 ms |
-| | 100 k | **100 µs** | 1.09 ms | 3.73 ms | 2.22 ms |
-| | 1 M | **579 µs** | 8.37 ms | 6.22 ms | 6.99 ms |
-| `ORDER BY score DESC` | 10 k | **261 µs** | 275 µs | 1.96 ms | 947 µs |
-| | 100 k | 1.59 ms | **1.39 ms** | 15.3 ms | 6.30 ms |
-| `DISTINCT` | 100 k | **506 µs** † | 617 µs | 2.30 ms | 1.30 ms |
-| | 1 M | **2.19 ms** | 5.17 ms | 3.52 ms | 3.98 ms |
-| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **22.8 µs** | 290 µs | 2.10 ms | 1.52 ms |
-| | 100 k | **97.2 µs** | 1.11 ms | 3.57 ms | 2.09 ms |
+| `GROUP BY` + 3 aggregates | 10 k | **39.8 µs** | 255 µs | 1.93 ms | 1.62 ms |
+| | 100 k | **97.0 µs** | 1.11 ms | 3.59 ms | 2.23 ms |
+| | 1 M | **635 µs** | 9.63 ms | 6.67 ms | 6.95 ms |
+| `ORDER BY score DESC` | 10 k | **227 µs** | 269 µs | 1.86 ms | 923 µs |
+| | 100 k | 1.58 ms | **1.37 ms** | 15.6 ms | 6.41 ms |
+| `DISTINCT` | 100 k | **533 µs** ‡ | 619 µs | 2.52 ms | 1.31 ms |
+| | 1 M | **2.19 ms** | 5.44 ms | 3.55 ms | 3.11 ms |
+| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **23.6 µs** | 280 µs | 1.94 ms | 1.55 ms |
+| | 100 k | **90.5 µs** | 1.18 ms | 3.69 ms | 2.07 ms |
 
-† Four readings went into this one. A full run once put FalconDB at 702 µs
-against Polars' 600 -- behind -- but with a spread of 616–837 µs where every other
-point in the suite spans about 1%. Re-running that group alone gave 589 µs, and two
-later full runs gave 560 µs and the 506 µs above, all with tight spreads. The three
-clean readings agree and the wide one was the outlier. It is recorded rather than
-quietly dropped, because "the measurement I disliked was noise" is a claim that has
-to be earned with another measurement.
+‡ `DISTINCT` at 100 k has never settled. Six readings: 702 µs, 589, 560, 506,
+565, 533, against a Polars figure that barely moves. The 702 came with a
+616–837 µs spread where every other point in the suite spans about 1%. FalconDB
+leads on the balance of them, but the point is quoted rather than claimed.
 
 ### Joins, window functions, DML
 
@@ -87,29 +84,29 @@ used to make — see [Methodology](#methodology).
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `INNER JOIN` | 100 k | **310 µs** | 433 µs | 1.82 ms | 3.84 ms |
-| | 1 M | 3.39 ms | **2.63 ms** | 7.88 ms | 16.7 ms |
-| `LEFT JOIN` | 100 k | **667 µs** | — | 2.24 ms | 4.06 ms |
-| `SEMI JOIN` (`EXISTS`) | 100 k | **593 µs** | — | 2.30 ms | 3.99 ms |
-| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **817 µs** | — | 2.45 ms | 4.15 ms |
-| `ROW_NUMBER() OVER` | 100 k | **2.91 ms** ‡ | — | 21.5 ms | 5.79 ms |
-| `UPDATE` (half the rows) | 100 k | **1.62 ms** | — | 3.69 ms | — |
-| `DELETE` (half the rows) | 100 k | **920 µs** | — | 2.55 ms | — |
+| `INNER JOIN` | 100 k | **307 µs** | 425 µs | 1.80 ms | 3.86 ms |
+| | 1 M | 3.41 ms | **2.62 ms** | 8.24 ms | 16.7 ms |
+| `LEFT JOIN` | 100 k | **676 µs** | — | 2.27 ms | 4.12 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **614 µs** | — | 2.55 ms | 4.04 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **873 µs** | — | 2.43 ms | 4.15 ms |
+| `ROW_NUMBER() OVER` | 100 k | **2.20 ms** | — | 11.5 ms | 5.97 ms |
+| `UPDATE` (half the rows) | 100 k | **1.61 ms** | — | 3.59 ms | — |
+| `DELETE` (half the rows) | 100 k | **881 µs** | — | 2.58 ms | — |
 
-‡ Treat this row as the least certain in the table. DuckDB measured 11.5 ms and
-11.9 ms in the two runs before this one and 21.5 ms in this one, and FalconDB went
-2.16 → 2.23 → 2.91 ms across the same three. Both engines rising together in one
-group, while every other group held, says that group met a transient the run-level
-power check does not cover. The ratio still favours FalconDB by a wide margin, so
-the conclusion is safe even though the absolute numbers are not.
+† Read against its own history, not against the run before it. This point has
+measured 672, 606, 602, 639, 659, 641 and 673 µs across seven runs — a ±6% band
+around ~640 that predates every change in this table. The 673 above is the top of
+that band and the 602 in an earlier one was the bottom, and comparing those two
+would have read as a 12% regression that never happened. A moved number is worth
+investigating; a number moved *from a single prior reading* is worth checking
+against the band first.
 
-Earlier this figure was 4.31 ms and was recorded as an unexplained regression.
-Looking for the regression found there was none: nothing in the window path had
-changed, and the cost had always been there -- `ROW_NUMBER` evaluated its ordering
-key into a `ScalarValue` per row before knowing whether anything would read it,
-which it never does. Drift made a standing cost visible, which is a reminder that a
-number moving without a cause is worth looking into even when the suspicion of a
-regression turns out wrong.
+That habit was earned the other way round in the same round of measurements.
+`DISTINCT` at 1 M had read 2.19, 2.17, 2.19, 2.26, 2.15 ms across five runs and
+then 2.58 — outside a tight band, and that one was real: a `#[inline]` added to
+`Schema::column_index` while fixing a different regression. It cost 18% here and
+was removed. Two points moved in the same run, one noise and one a defect, and
+only the history told them apart.
 
 ### Where FalconDB is behind
 
@@ -118,9 +115,9 @@ DataFusion in all 26. The exceptions are all against Polars:
 
 | | FalconDB | Polars | |
 |---|---|---|---|
-| `SUM(id)` 100 k | 20.7 µs | 14.5 µs | 1.4× |
-| `INNER JOIN` 1 M | 3.39 ms | 2.63 ms | 1.3× |
-| `ORDER BY` 100 k | 1.59 ms | 1.39 ms | 1.1× |
+| `SUM(id)` 100 k | 20.7 µs | 14.4 µs | 1.4× |
+| `INNER JOIN` 1 M | 3.41 ms | 2.62 ms | 1.3× |
+| `ORDER BY` 100 k | 1.58 ms | 1.37 ms | 1.2× |
 
 `ORDER BY` narrowed from 1.3× to 1.1×, from sorting a text column by dictionary
 rank rather than by string. The other two are within noise of where they were.
