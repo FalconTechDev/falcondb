@@ -2035,6 +2035,72 @@ mod in_list_semantics {
         assert_eq!(n("SELECT i FROM t WHERE i IN (1, 2)"), 2);
     }
 
+    /// `TRIM`, `SUBSTRING`, `CEIL` and `FLOOR` reach SQL, and answer correctly.
+    ///
+    /// All four were implemented in `eval_function` and unreachable: the parser
+    /// gives them their own AST nodes rather than ordinary function calls, and the
+    /// translator did not know those nodes, so they fell through to "unsupported
+    /// expression". `LTRIM` and `RTRIM` worked while `TRIM` did not; `SUBSTR`
+    /// worked while `SUBSTRING` did not; `ROUND` worked while `CEIL` and `FLOOR`
+    /// did not.
+    ///
+    /// Connecting them is not the same as knowing they work, so this checks the
+    /// answers and not merely that the query parses.
+    #[test]
+    fn trim_substring_ceil_and_floor_reach_sql() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("s", DataType::Utf8),
+                Field::required("f", DataType::Float64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(vec![Some("  padded  "), Some("plain")]),
+                ColumnBuilder::float64(vec![Some(2.3), Some(-2.3)]),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let first_str = |sql: &str| -> String {
+            let r = db.sql(sql).unwrap();
+            match r.batches[0].column(0).get(0).unwrap() {
+                crate::storage::types::ScalarValue::Utf8(Some(v)) => v,
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let nth_f64 = |sql: &str, row: usize| -> f64 {
+            let r = db.sql(sql).unwrap();
+            r.batches[0].column(0).get(row).unwrap().as_f64().unwrap()
+        };
+
+        // TRIM takes both ends; LTRIM and RTRIM already worked and are the control.
+        assert_eq!(first_str("SELECT TRIM(s) FROM t"), "padded");
+        assert_eq!(first_str("SELECT LTRIM(s) FROM t"), "padded  ");
+        assert_eq!(first_str("SELECT RTRIM(s) FROM t"), "  padded");
+
+        // SUBSTRING with FROM/FOR, and the SUBSTR spelling that already worked.
+        assert_eq!(first_str("SELECT SUBSTRING(s FROM 3 FOR 6) FROM t"), "padded");
+        assert_eq!(first_str("SELECT SUBSTR(s, 3, 6) FROM t"), "padded");
+        assert_eq!(first_str("SELECT SUBSTRING(s FROM 3) FROM t"), "padded  ");
+
+        // CEIL and FLOOR on both signs, which is where a wrong one shows up.
+        assert_eq!(nth_f64("SELECT CEIL(f) FROM t", 0), 3.0);
+        assert_eq!(nth_f64("SELECT CEIL(f) FROM t", 1), -2.0);
+        assert_eq!(nth_f64("SELECT FLOOR(f) FROM t", 0), 2.0);
+        assert_eq!(nth_f64("SELECT FLOOR(f) FROM t", 1), -3.0);
+        // CEILING is the same function under its other standard name.
+        assert_eq!(nth_f64("SELECT CEILING(f) FROM t", 0), 3.0);
+    }
+
     /// What do scalar functions, `CAST` and `CASE` cost against reading the column?
     ///
     /// None of them appear in the benchmark suite. Reading the plain column is the

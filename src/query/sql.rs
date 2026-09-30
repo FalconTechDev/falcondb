@@ -1188,6 +1188,39 @@ fn translate_expr(e: &SqlExpr) -> FalconResult<Expr> {
             Ok(Expr::Extract { field: f, expr: Box::new(translate_expr(expr)?) })
         }
 
+        // TRIM, SUBSTRING, CEIL and FLOOR are parsed into their own AST nodes
+        // rather than as ordinary function calls, so they never reached the
+        // `Function` arm above and fell through to the error below. All four are
+        // implemented in `eval_function` and were unreachable from SQL:
+        //
+        //     LTRIM and RTRIM worked, TRIM did not.
+        //     SUBSTR worked, SUBSTRING did not.
+        //     ROUND worked, CEIL and FLOOR did not.
+        //
+        // Translated to the same `Expr::Function` the evaluator already answers,
+        // so nothing new is being implemented here -- only connected.
+        SqlExpr::Trim { expr, .. } => Ok(Expr::Function {
+            name: "TRIM".into(),
+            args: vec![translate_expr(expr)?],
+        }),
+
+        SqlExpr::Substring { expr, substring_from, substring_for, .. } => {
+            let mut args = vec![translate_expr(expr)?];
+            if let Some(from) = substring_from { args.push(translate_expr(from)?); }
+            if let Some(len)  = substring_for  { args.push(translate_expr(len)?); }
+            Ok(Expr::Function { name: "SUBSTR".into(), args })
+        }
+
+        SqlExpr::Ceil { expr, .. } => Ok(Expr::Function {
+            name: "CEIL".into(),
+            args: vec![translate_expr(expr)?],
+        }),
+
+        SqlExpr::Floor { expr, .. } => Ok(Expr::Function {
+            name: "FLOOR".into(),
+            args: vec![translate_expr(expr)?],
+        }),
+
         _ => Err(FalconError::InvalidQuery(
             format!("unsupported expression: {e}")
         )),
