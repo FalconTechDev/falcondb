@@ -36,7 +36,7 @@ median of 100 samples. Against **DuckDB 1.x**, **Polars** and **DataFusion**, al
 reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 `cargo bench`, for reasons given under [Methodology](#methodology).
 
-The run behind these tables reported *AC power for all 366 samples taken during
+The run behind these tables reported *AC power for all 267 samples taken during
 it*. That sentence is the point of the check, not a formality: a run whose charger
 came out halfway through produced one file holding two machines, with everything
 after the disconnection 2–3× slower in all four engines and nothing in the output
@@ -46,29 +46,29 @@ to say so.
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `SUM(score)` | 10 k | **1.46 µs** | 8.32 µs | 227 µs | 1.73 ms |
-| | 100 k | **8.77 µs** | 19.0 µs | 298 µs | 1.94 ms |
-| | 1 M | **61.3 µs** | 178 µs | 501 µs | 2.66 ms |
-| `SUM(id)` (integer) | 10 k | **2.66 µs** | 7.35 µs | 242 µs | 1.92 ms |
-| | 100 k | 20.7 µs | **14.4 µs** | 414 µs | 2.45 ms |
-| | 1 M | **76.4 µs** | 167 µs | 478 µs | 12.7 ms |
-| `WHERE score > 50` | 10 k | **16.5 µs** | 50.9 µs | 600 µs | 1.23 ms |
-| | 100 k | **126 µs** | 173 µs | 4.30 ms | 2.97 ms |
-| | 1 M | **673 µs** † | 2.50 ms | 24.0 ms | 17.3 ms |
+| `SUM(score)` | 10 k | **1.41 µs** | 8.56 µs | 204 µs | 1.80 ms |
+| | 100 k | **8.65 µs** | 18.7 µs | 337 µs | 1.98 ms |
+| | 1 M | **61.5 µs** | 158 µs | 495 µs | 2.64 ms |
+| `SUM(id)` (integer) | 10 k | **2.65 µs** | 7.42 µs | 235 µs | 1.52 ms |
+| | 100 k | 20.8 µs | **14.8 µs** | 384 µs | 2.34 ms |
+| | 1 M | **77.1 µs** | 169 µs | 482 µs | 13.0 ms |
+| `WHERE score > 50` | 10 k | **16.2 µs** | 51.3 µs | 587 µs | 1.26 ms |
+| | 100 k | **128 µs** | 178 µs | 3.90 ms | 2.77 ms |
+| | 1 M | **654 µs** † | 2.33 ms | 24.1 ms | 17.2 ms |
 
 ### Grouping, sorting, pipelines
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `GROUP BY` + 3 aggregates | 10 k | **39.8 µs** | 255 µs | 1.93 ms | 1.62 ms |
-| | 100 k | **97.0 µs** | 1.11 ms | 3.59 ms | 2.23 ms |
-| | 1 M | **635 µs** | 9.63 ms | 6.67 ms | 6.95 ms |
-| `ORDER BY score DESC` | 10 k | **227 µs** | 269 µs | 1.86 ms | 923 µs |
-| | 100 k | 1.58 ms | **1.37 ms** | 15.6 ms | 6.41 ms |
-| `DISTINCT` | 100 k | **533 µs** ‡ | 619 µs | 2.52 ms | 1.31 ms |
-| | 1 M | **2.19 ms** | 5.44 ms | 3.55 ms | 3.11 ms |
-| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **23.6 µs** | 280 µs | 1.94 ms | 1.55 ms |
-| | 100 k | **90.5 µs** | 1.18 ms | 3.69 ms | 2.07 ms |
+| `GROUP BY` + 3 aggregates | 10 k | **37.0 µs** | 256 µs | 1.81 ms | 1.61 ms |
+| | 100 k | **97.8 µs** | 1.12 ms | 3.87 ms | 2.43 ms |
+| | 1 M | **691 µs** | 10.5 ms | 7.42 ms | 7.16 ms |
+| `ORDER BY score DESC` | 10 k | **237 µs** | 274 µs | 1.85 ms | 920 µs |
+| | 100 k | 1.66 ms | **1.38 ms** | 15.3 ms | 6.52 ms |
+| `DISTINCT` | 100 k | **526 µs** ‡ | 613 µs | 2.55 ms | 1.32 ms |
+| | 1 M | **2.30 ms** | 5.46 ms | 4.05 ms | 3.13 ms |
+| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **22.4 µs** | 280 µs | 1.99 ms | 1.56 ms |
+| | 100 k | **90.0 µs** | 1.21 ms | 3.71 ms | 2.11 ms |
 
 ‡ `DISTINCT` at 100 k has never settled. Six readings: 702 µs, 589, 560, 506,
 565, 533, against a Polars figure that barely moves. The 702 came with a
@@ -84,14 +84,14 @@ used to make — see [Methodology](#methodology).
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `INNER JOIN` | 100 k | **307 µs** | 425 µs | 1.80 ms | 3.86 ms |
-| | 1 M | 3.41 ms | **2.62 ms** | 8.24 ms | 16.7 ms |
-| `LEFT JOIN` | 100 k | **676 µs** | — | 2.27 ms | 4.12 ms |
-| `SEMI JOIN` (`EXISTS`) | 100 k | **614 µs** | — | 2.55 ms | 4.04 ms |
-| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **873 µs** | — | 2.43 ms | 4.15 ms |
-| `ROW_NUMBER() OVER` | 100 k | **2.20 ms** | — | 11.5 ms | 5.97 ms |
-| `UPDATE` (half the rows) | 100 k | **1.61 ms** | — | 3.59 ms | — |
-| `DELETE` (half the rows) | 100 k | **881 µs** | — | 2.58 ms | — |
+| `INNER JOIN` | 100 k | **307 µs** | 426 µs | 1.69 ms | 3.93 ms |
+| | 1 M | 3.35 ms | **2.59 ms** | 8.08 ms | 16.7 ms |
+| `LEFT JOIN` | 100 k | **678 µs** | — | 2.40 ms | 4.11 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **625 µs** | — | 2.48 ms | 4.07 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **855 µs** | — | 2.35 ms | 4.13 ms |
+| `ROW_NUMBER() OVER` | 100 k | **2.22 ms** | — | 11.3 ms | 5.58 ms |
+| `UPDATE` (half the rows) | 100 k | **1.62 ms** | — | 3.60 ms | — |
+| `DELETE` (half the rows) | 100 k | **882 µs** | — | 2.54 ms | — |
 
 † Read against its own history, not against the run before it. This point has
 measured 672, 606, 602, 639, 659, 641 and 673 µs across seven runs — a ±6% band
@@ -100,6 +100,12 @@ that band and the 602 in an earlier one was the bottom, and comparing those two
 would have read as a 12% regression that never happened. A moved number is worth
 investigating; a number moved *from a single prior reading* is worth checking
 against the band first.
+
+It cuts both ways. The `WHERE`+`GROUP BY`+`ORDER BY` row above was once recorded
+at 23.6 µs and described in a commit as "about 4% off" a previous 22.8 µs, a cost
+accepted in trade for fixing something larger. Two later runs read 22.3 and
+22.4 µs. The trade was real; the price was not. A single reading is no better
+evidence for a regression you are willing to accept than for one you are not.
 
 That habit was earned the other way round in the same round of measurements.
 `DISTINCT` at 1 M had read 2.19, 2.17, 2.19, 2.26, 2.15 ms across five runs and
@@ -115,9 +121,9 @@ DataFusion in all 26. The exceptions are all against Polars:
 
 | | FalconDB | Polars | |
 |---|---|---|---|
-| `SUM(id)` 100 k | 20.7 µs | 14.4 µs | 1.4× |
-| `INNER JOIN` 1 M | 3.41 ms | 2.62 ms | 1.3× |
-| `ORDER BY` 100 k | 1.58 ms | 1.37 ms | 1.2× |
+| `SUM(id)` 100 k | 20.8 µs | 14.8 µs | 1.4× |
+| `INNER JOIN` 1 M | 3.35 ms | 2.59 ms | 1.3× |
+| `ORDER BY` 100 k | 1.66 ms | 1.38 ms | 1.2× |
 
 `ORDER BY` narrowed from 1.3× to 1.1×, from sorting a text column by dictionary
 rank rather than by string. The other two are within noise of where they were.
