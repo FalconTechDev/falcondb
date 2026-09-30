@@ -519,6 +519,12 @@ fn dict_mapped_function(
 
     // The column argument, and any literal that goes with it.
     enum Shape<'a> { One, ConcatAfter(&'a str), ConcatBefore(&'a str) }
+    // The shapes worth a fast path: one column, or one column and one literal.
+    //
+    // The second arm once required the literal to be text, which was written for
+    // CONCAT and silently excluded `ROUND(f, 2)` -- the numeric arms below never
+    // saw it, and ROUND stayed at 183ns per row while ABS dropped to 7ns. The
+    // literal's type is the callee's business, not this match's.
     let (col_name, shape) = match args.as_slice() {
         [Expr::Column(c)] => (c, Shape::One),
         [Expr::Column(c), Expr::Literal(ScalarValue::Utf8(Some(lit)))] => {
@@ -527,6 +533,7 @@ fn dict_mapped_function(
         [Expr::Literal(ScalarValue::Utf8(Some(lit))), Expr::Column(c)] => {
             (c, Shape::ConcatBefore(lit.as_str()))
         }
+        [Expr::Column(c), Expr::Literal(_)] => (c, Shape::One),
         _ => return None,
     };
 
@@ -553,7 +560,13 @@ fn dict_mapped_function(
     if !is_concat && !matches!(shape, Shape::One) {
         return None;
     }
-    if is_concat && matches!(shape, Shape::One) {
+    // A single-argument CONCAT, or one whose literal is not text, is not a shape
+    // this path models. `Shape::One` now also covers `f(col, <non-text literal>)`,
+    // which reaches here only when the numeric arms above declined it.
+    if is_concat && (matches!(shape, Shape::One) || args.len() != 2) {
+        return None;
+    }
+    if !is_concat && args.len() != 1 {
         return None;
     }
 
