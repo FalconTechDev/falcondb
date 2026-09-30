@@ -2035,6 +2035,137 @@ mod in_list_semantics {
         assert_eq!(n("SELECT i FROM t WHERE i IN (1, 2)"), 2);
     }
 
+    /// What do scalar functions, `CAST` and `CASE` cost against reading the column?
+    ///
+    /// None of them appear in the benchmark suite. Reading the plain column is the
+    /// reference: the same rows, the same output size, no function.
+    ///
+    /// `Expr::Function`'s batch path allocates a `Vec` of argument references per
+    /// row and calls `eval_function`, whose first act is `name.to_uppercase()` --
+    /// a `String` allocated per row to choose a match arm. On a dictionary column
+    /// the transform is applied to every row rather than to each distinct value,
+    /// which for five departments over 100k rows is 20,000 times more work than
+    /// the answer needs.
+    ///
+    /// Measuring several at once so the worst one is chosen by the numbers rather
+    /// than by which defect reads worst in the source.
+    ///
+    /// Run with
+    /// `cargo test --release --lib scalar_function_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn scalar_function_cost() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+        use std::time::Instant;
+
+        const ROWS: usize = 100_000;
+        let words = ["engineering", "sales", "human resources", "operations", "legal"];
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("n", DataType::Int64),
+                Field::required("f", DataType::Float64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(
+                    (0..ROWS).map(|i| Some(words[i % words.len()])).collect(),
+                ),
+                ColumnBuilder::int64((0..ROWS as i64).map(Some).collect()),
+                ColumnBuilder::float64((0..ROWS).map(|i| Some(i as f64 / 7.0)).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        // Tolerant: an unsupported shape reports itself instead of aborting the
+        // rest of the grid. SUBSTRING did exactly that -- it is in `eval_function`
+        // and the SQL translator rejects it -- and taking the whole measurement
+        // down with it hid every number after it.
+        let time = |label: &str, sql: &str| -> Option<std::time::Duration> {
+            for _ in 0..3 {
+                if let Err(e) = db.sql(sql) {
+                    println!("  {label:<34}unsupported: {e}");
+                    return None;
+                }
+            }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                std::hint::black_box(db.sql(sql).unwrap());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:<34}{best:>9.2?}");
+            Some(best)
+        };
+
+        println!("over {ROWS} rows, 5 distinct department strings:");
+        // Both references return the column unchanged, so they measure the
+        // machinery around a projection and not the work of producing a column.
+        // A ratio against them overstates what any fix can win; they are here to
+        // show that the machinery is not the expense.
+        let base_s = time("SELECT dept (the reference)", "SELECT dept FROM t").unwrap();
+        let base_n = time("SELECT n (numeric reference)", "SELECT n FROM t").unwrap();
+
+        let text_shapes: Vec<(&str, &str)> = vec![
+            ("UPPER(dept)",        "SELECT UPPER(dept) FROM t"),
+            ("LOWER(dept)",        "SELECT LOWER(dept) FROM t"),
+            ("LENGTH(dept)",       "SELECT LENGTH(dept) FROM t"),
+            ("TRIM(dept)",         "SELECT TRIM(dept) FROM t"),
+            ("CONCAT(dept,'x')",   "SELECT CONCAT(dept, 'x') FROM t"),
+        ];
+        println!("
+  -- against SELECT dept --");
+        for (label, sql) in text_shapes {
+            if let Some(d) = time(label, sql) {
+                println!("      {:>9.0} ns per row", d.as_nanos() as f64 / ROWS as f64);
+                println!("      {:.0}x the reference", d.as_secs_f64() / base_s.as_secs_f64());
+            }
+        }
+
+        let num_shapes: Vec<(&str, &str)> = vec![
+            ("ABS(n)",             "SELECT ABS(n) FROM t"),
+            ("ROUND(f, 2)",        "SELECT ROUND(f, 2) FROM t"),
+            ("CAST(n AS FLOAT)",   "SELECT CAST(n AS DOUBLE) FROM t"),
+            ("CASE WHEN n > 50",   "SELECT CASE WHEN n > 50 THEN 1 ELSE 0 END FROM t"),
+            ("COALESCE(n, 0)",     "SELECT COALESCE(n, 0) FROM t"),
+        ];
+        // Which of the names `eval_function` knows can be reached from SQL at all?
+        // TRIM and SUBSTRING are both in that match and both rejected by the
+        // translator, so this asks about every one of them rather than finding
+        // them one crash at a time.
+        println!("
+  -- reachable from SQL? --");
+        let mut rejected = Vec::new();
+        for f in ["UPPER(dept)", "LOWER(dept)", "LENGTH(dept)", "LEN(dept)",
+                  "TRIM(dept)", "LTRIM(dept)", "RTRIM(dept)", "CONCAT(dept,'x')",
+                  "SUBSTR(dept,1,3)", "SUBSTRING(dept,1,3)", "ABS(n)", "SIGN(n)",
+                  "CEIL(f)", "FLOOR(f)", "ROUND(f,2)", "SQRT(f)", "POW(f,2)",
+                  "COALESCE(n,0)", "NULLIF(n,0)", "IF(n>1,1,0)"] {
+            let sql = format!("SELECT {f} FROM t LIMIT 1");
+            match db.sql(&sql) {
+                Ok(_) => println!("      {f:<22} ok"),
+                Err(_) => { println!("      {f:<22} REJECTED by the SQL translator"); rejected.push(f); }
+            }
+        }
+        println!("      {} of 20 unreachable: {:?}", rejected.len(), rejected);
+
+        println!("
+  -- against SELECT n --");
+        for (label, sql) in num_shapes {
+            if let Some(d) = time(label, sql) {
+                println!("      {:>9.0} ns per row", d.as_nanos() as f64 / ROWS as f64);
+                println!("      {:.0}x the reference", d.as_secs_f64() / base_n.as_secs_f64());
+            }
+        }
+    }
+
     /// The typed `LIKE` path must answer exactly what the general path answered.
     ///
     /// Including where the general path is arguably wrong: a NULL cell never
