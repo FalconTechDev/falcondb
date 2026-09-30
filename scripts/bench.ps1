@@ -172,7 +172,52 @@ $cmd = "cargo bench --bench query_bench -- " + ($criterionArgs -join " ")
 # Redirect inside cmd, not in PowerShell. `native 2>&1` in PS 5.1 wraps every
 # stderr line in an ErrorRecord, and with ErrorActionPreference=Stop cargo's
 # ordinary "Compiling ..." progress then kills the run.
+# Watch the machine *during* the run, not only before it.
+#
+# Both guards above are pre-flight, and three runs in one session were lost to
+# conditions that changed after the checks had passed:
+#
+#   - the charger came out mid-run. Everything measured before it was clean and
+#     everything after was 2-3x slower, in every engine: FalconDB int_sum/100k
+#     22.4us -> 55.2us, Polars 14.8 -> 47.2, DuckDB 439 -> 1005, DataFusion
+#     2.72ms -> 5.65ms. The output carried no sign of it.
+#   - a Telegram process woke up and took 22% of the machine.
+#
+# A benchmark that cannot say whether the machine held still for its duration is
+# reporting numbers it has no basis for. This samples every three seconds and
+# reports afterwards; it deliberately does not abort, because a partial run still
+# tells you which groups ran before the machine moved.
+$watchFile = [System.IO.Path]::GetTempFileName()
+$watcher = Start-Job -ArgumentList $watchFile -ScriptBlock {
+    param($out)
+    Add-Type -AssemblyName System.Windows.Forms
+    while ($true) {
+        $power = [System.Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus
+        $clock = (Get-CimInstance Win32_Processor).CurrentClockSpeed
+        "$(Get-Date -Format o)`t$power`t$clock" | Add-Content -Path $out
+        Start-Sleep -Seconds 3
+    }
+}
+
 cmd /c "(start /affinity $affinity /high /b /wait $cmd) > `"$Out`" 2>&1"
 if ($LASTEXITCODE -ne 0) { Write-Host "bench exited $LASTEXITCODE - see $Out" }
+
+Stop-Job $watcher -ErrorAction SilentlyContinue
+Remove-Job $watcher -Force -ErrorAction SilentlyContinue
+
+$samples = @(Get-Content $watchFile -ErrorAction SilentlyContinue |
+    ForEach-Object { $_ -split "`t" } | Where-Object { $_ -eq 'Offline' })
+$total = @(Get-Content $watchFile -ErrorAction SilentlyContinue).Count
+Remove-Item $watchFile -Force -ErrorAction SilentlyContinue
+
+if ($samples.Count -gt 0) {
+    Write-Warning ("The machine was on BATTERY for $($samples.Count) of $total samples " +
+        "during this run. On battery this CPU holds its 2.4 GHz base clock and every " +
+        "engine measures roughly twice as slow, so the groups measured after that " +
+        "point are not comparable with anything -- including the groups measured " +
+        "before it, in this same file.`nCheck the charger and run again.")
+} elseif ($total -gt 0) {
+    Write-Host "Machine stayed on AC power for all $total samples during the run."
+}
 
 Write-Host "Results: $Out"
