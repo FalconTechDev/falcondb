@@ -62,11 +62,25 @@ impl Schema {
     /// keeps unqualified names has no way to tell one table's `i` from another's,
     /// and this reports that as ambiguous rather than silently picking the first.
     /// Guessing there would give wrong rows, which is worse than an error message.
+    ///
+    /// Split in two so the common case stays small enough to inline. Folding the
+    /// qualified-name handling into one function made it large, and the loss
+    /// showed up where a query looks columns up most often: the
+    /// `WHERE`+`GROUP BY`+`ORDER BY` benchmark at 10k rows went 22.8us -> 26.1us,
+    /// confirmed by two runs while the rival engines held still. A structural
+    /// argument that a few enum checks could not cost that was wrong; the cost was
+    /// not in the new code running, it was in the old code no longer inlining.
+    #[inline]
     pub fn column_index(&self, name: &str) -> FalconResult<usize> {
         if let Some(i) = self.fields.iter().position(|f| f.name.eq_ignore_ascii_case(name)) {
             return Ok(i);
         }
+        self.column_index_qualified(name)
+    }
 
+    /// The `table.column` case, which only runs once the exact match has failed.
+    #[cold]
+    fn column_index_qualified(&self, name: &str) -> FalconResult<usize> {
         if let Some((qualifier, bare)) = name.rsplit_once('.') {
             // A field carrying the same qualifier is the unambiguous answer.
             if let Some(i) = self
