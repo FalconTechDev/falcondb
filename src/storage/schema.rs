@@ -70,7 +70,14 @@ impl Schema {
     /// confirmed by two runs while the rival engines held still. A structural
     /// argument that a few enum checks could not cost that was wrong; the cost was
     /// not in the new code running, it was in the old code no longer inlining.
-    #[inline]
+    ///
+    /// Deliberately *not* annotated `#[inline]`. The first attempt at this split
+    /// forced it, which restored the pipeline benchmark but cost `DISTINCT` --
+    /// 2.19ms -> 2.58ms at 1M rows, and 506us -> 565us at 100k, while the rival
+    /// engines got faster in the same run. Before the qualified-name handling
+    /// existed the function carried no annotation and was inlined on the
+    /// compiler's own judgement; restoring that shape is the point, not overriding
+    /// it in the other direction.
     pub fn column_index(&self, name: &str) -> FalconResult<usize> {
         if let Some(i) = self.fields.iter().position(|f| f.name.eq_ignore_ascii_case(name)) {
             return Ok(i);
