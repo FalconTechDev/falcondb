@@ -1609,7 +1609,30 @@ fn execute_plan(
                 }
                 agg_batches = kept;
             }
-            batches = agg_batches;
+            // Drop the aggregates invented for HAVING.
+            //
+            // `HAVING COUNT(*) > 10` with no COUNT(*) in the SELECT list needs the
+            // count computed so the clause has a column to test, but the caller
+            // asked for `dept` and must get `dept`. Without this the result came
+            // back as ["dept", "__having_0"].
+            //
+            // Matched by the prefix `translate_having` generates, which is chosen
+            // to be something no one would write.
+            batches = agg_batches
+                .into_iter()
+                .map(|b| {
+                    let keep: Vec<&str> = b.schema
+                        .column_names()
+                        .into_iter()
+                        .filter(|n| !n.starts_with("__having_"))
+                        .collect();
+                    if keep.len() == b.schema.fields.len() {
+                        Ok(b)
+                    } else {
+                        b.project(&keep)
+                    }
+                })
+                .collect::<FalconResult<Vec<_>>>()?;
         }
 
         // Step 2b — Window functions (applied per-batch after GROUP BY).

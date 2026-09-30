@@ -1082,6 +1082,92 @@ mod dict_functions {
         out
     }
 
+    /// `HAVING` over an aggregate expression, not just over its alias.
+    ///
+    /// Only the alias form used to work: `HAVING COUNT(*) > 10` reported
+    /// "unsupported function arg" and `HAVING SUM(n) > 100` reported
+    /// "column 'n' not found". The clause runs against the aggregated batch, so
+    /// the aggregate has to become a reference to the column it produces.
+    ///
+    /// Row counts alone would not catch the two ways this can go wrong: filtering
+    /// on the wrong group, and leaking the generated column into the output. Both
+    /// are asserted.
+    #[test]
+    fn having_accepts_aggregate_expressions() {
+        use crate::storage::types::DataType;
+
+        // Deliberately uneven: 'a' x50, 'b' x30, 'c' x20, so a threshold can
+        // separate them and a wrong grouping shows up as a wrong count.
+        let mut depts = Vec::new();
+        depts.extend(std::iter::repeat(Some("a")).take(50));
+        depts.extend(std::iter::repeat(Some("b")).take(30));
+        depts.extend(std::iter::repeat(Some("c")).take(20));
+        let batch = RecordBatch::new(
+            Schema::new(vec![
+                Field::required("dept", DataType::Utf8),
+                Field::required("n", DataType::Int64),
+            ]),
+            vec![
+                ColumnBuilder::utf8_from_str(depts),
+                ColumnBuilder::int64((0..100).map(|i| Some(i as i64 % 10)).collect()),
+            ],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+
+        let groups = |sql: &str| -> Vec<String> {
+            let r = db.sql(sql).unwrap();
+            let mut out = Vec::new();
+            for b in &r.batches {
+                for i in 0..b.row_count() {
+                    if let ScalarValue::Utf8(Some(v)) = b.column(0).get(i).unwrap() {
+                        out.push(v);
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+
+        // The aggregate form must select the same groups as the alias form.
+        assert_eq!(
+            groups("SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING COUNT(*) > 25"),
+            vec!["a".to_string(), "b".to_string()],
+            "COUNT(*) > 25 keeps a (50) and b (30), drops c (20)",
+        );
+        assert_eq!(
+            groups("SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING c > 25"),
+            groups("SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING COUNT(*) > 25"),
+            "the two spellings must agree",
+        );
+        assert_eq!(
+            groups("SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING COUNT(*) > 45"),
+            vec!["a".to_string()],
+        );
+
+        // An aggregate the SELECT list does not compute.
+        assert_eq!(
+            groups("SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 25"),
+            vec!["a".to_string(), "b".to_string()],
+        );
+
+        // ...and the column invented for it must not appear in the result.
+        let r = db.sql("SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 25").unwrap();
+        let names: Vec<&str> = r.batches[0].schema.column_names();
+        assert_eq!(names, vec!["dept"], "the generated aggregate must not leak into the output");
+
+        // Other aggregates, and a compound condition.
+        assert_eq!(
+            groups("SELECT dept, SUM(n) s FROM t GROUP BY dept HAVING SUM(n) > 150"),
+            vec!["a".to_string()],
+        );
+        assert_eq!(
+            groups("SELECT dept, COUNT(*) c FROM t GROUP BY dept HAVING COUNT(*) > 15 AND dept <> 'a'"),
+            vec!["b".to_string(), "c".to_string()],
+        );
+    }
+
     /// Which `HAVING` forms work?
     ///
     /// `HAVING COUNT(*) > 10` reports "unsupported function arg", which is
