@@ -40,29 +40,29 @@ reading the same Parquet file. Run them with `scripts/bench.ps1` — not a bare
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `SUM(score)` | 10 k | **1.41 µs** | 8.23 µs | 219 µs | 1.74 ms |
-| | 100 k | **8.64 µs** | 18.6 µs | 347 µs | 1.34 ms |
-| | 1 M | **61.3 µs** | 179 µs | 495 µs | 2.65 ms |
-| `SUM(id)` (integer) | 10 k | **2.66 µs** | 7.53 µs | 243 µs | 1.58 ms |
-| | 100 k | 20.8 µs | **14.9 µs** | 408 µs | 2.39 ms |
-| | 1 M | **76.7 µs** | 168 µs | 484 µs | 13.2 ms |
-| `WHERE score > 50` | 10 k | **16.9 µs** | 51.2 µs | 615 µs | 1.19 ms |
-| | 100 k | **126 µs** | 174 µs | 3.98 ms | 2.75 ms |
-| | 1 M | **672 µs** | 2.44 ms | 23.9 ms | 17.3 ms |
+| `SUM(score)` | 10 k | **1.44 µs** | 8.22 µs | 198 µs | 1.69 ms |
+| | 100 k | **8.71 µs** | 18.7 µs | 352 µs | 1.93 ms |
+| | 1 M | **60.8 µs** | 159 µs | 489 µs | 2.65 ms |
+| `SUM(id)` (integer) | 10 k | **2.71 µs** | 7.57 µs | 218 µs | 1.78 ms |
+| | 100 k | 20.7 µs | **14.5 µs** | 413 µs | 2.43 ms |
+| | 1 M | **79.1 µs** | 169 µs | 480 µs | 12.5 ms |
+| `WHERE score > 50` | 10 k | **18.3 µs** | 51.8 µs | 591 µs | 1.28 ms |
+| | 100 k | **125 µs** | 168 µs | 3.94 ms | 2.69 ms |
+| | 1 M | **602 µs** | 2.07 ms | 24.5 ms | 17.1 ms |
 
 ### Grouping, sorting, pipelines
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `GROUP BY` + 3 aggregates | 10 k | **38.7 µs** | 253 µs | 1.82 ms | 1.70 ms |
-| | 100 k | **96.3 µs** | 1.09 ms | 3.85 ms | 2.20 ms |
-| | 1 M | **574 µs** | 10.1 ms | 6.59 ms | 7.14 ms |
-| `ORDER BY score DESC` | 10 k | **244 µs** | 272 µs | 1.87 ms | 953 µs |
-| | 100 k | 1.57 ms | **1.37 ms** | 15.6 ms | 6.54 ms |
-| `DISTINCT` | 100 k | **560 µs** † | 618 µs | 2.25 ms | 1.32 ms |
-| | 1 M | **2.19 ms** | 5.18 ms | 3.86 ms | 3.11 ms |
-| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **23.3 µs** | 271 µs | 1.77 ms | 1.55 ms |
-| | 100 k | **90.1 µs** | 1.18 ms | 3.67 ms | 2.10 ms |
+| `GROUP BY` + 3 aggregates | 10 k | **38.5 µs** | 269 µs | 1.95 ms | 1.59 ms |
+| | 100 k | **100 µs** | 1.09 ms | 3.73 ms | 2.22 ms |
+| | 1 M | **579 µs** | 8.37 ms | 6.22 ms | 6.99 ms |
+| `ORDER BY score DESC` | 10 k | **261 µs** | 275 µs | 1.96 ms | 947 µs |
+| | 100 k | 1.59 ms | **1.39 ms** | 15.3 ms | 6.30 ms |
+| `DISTINCT` | 100 k | **506 µs** † | 617 µs | 2.30 ms | 1.30 ms |
+| | 1 M | **2.19 ms** | 5.17 ms | 3.52 ms | 3.98 ms |
+| `WHERE`+`GROUP BY`+`ORDER BY` | 10 k | **22.8 µs** | 290 µs | 2.10 ms | 1.52 ms |
+| | 100 k | **97.2 µs** | 1.11 ms | 3.57 ms | 2.09 ms |
 
 † This point took three readings to settle, and the story is worth keeping. One
 full run put FalconDB at 702 µs against Polars' 600 — behind — but with a spread
@@ -82,14 +82,14 @@ used to make — see [Methodology](#methodology).
 
 | | rows | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|---|
-| `INNER JOIN` | 100 k | **300 µs** | 424 µs | 1.69 ms | 3.93 ms |
-| | 1 M | 3.40 ms | **2.61 ms** | 8.04 ms | 16.9 ms |
-| `LEFT JOIN` | 100 k | **668 µs** | — | 2.25 ms | 4.19 ms |
-| `SEMI JOIN` (`EXISTS`) | 100 k | **601 µs** | — | 2.46 ms | 4.04 ms |
-| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **845 µs** | — | 2.55 ms | 4.17 ms |
-| `ROW_NUMBER() OVER` | 100 k | **2.16 ms** ‡ | — | 11.5 ms | 5.60 ms |
-| `UPDATE` (half the rows) | 100 k | **1.65 ms** | — | 3.64 ms | — |
-| `DELETE` (half the rows) | 100 k | **908 µs** | — | 2.64 ms | — |
+| `INNER JOIN` | 100 k | **310 µs** | 433 µs | 1.82 ms | 3.84 ms |
+| | 1 M | 3.39 ms | **2.63 ms** | 7.88 ms | 16.7 ms |
+| `LEFT JOIN` | 100 k | **667 µs** | — | 2.24 ms | 4.06 ms |
+| `SEMI JOIN` (`EXISTS`) | 100 k | **593 µs** | — | 2.30 ms | 3.99 ms |
+| `ANTI JOIN` (`NOT EXISTS`) | 100 k | **817 µs** | — | 2.45 ms | 4.15 ms |
+| `ROW_NUMBER() OVER` | 100 k | **2.91 ms** ‡ | — | 21.5 ms | 5.79 ms |
+| `UPDATE` (half the rows) | 100 k | **1.62 ms** | — | 3.69 ms | — |
+| `DELETE` (half the rows) | 100 k | **920 µs** | — | 2.55 ms | — |
 
 ‡ The previous run recorded 4.31 ms here and called it an unexplained slide,
 because the rivals had held still while this moved. Looking for the regression
@@ -107,9 +107,9 @@ DataFusion in all 26. The exceptions are all against Polars:
 
 | | FalconDB | Polars | |
 |---|---|---|---|
-| `SUM(id)` 100 k | 20.8 µs | 14.9 µs | 1.4× |
-| `INNER JOIN` 1 M | 3.40 ms | 2.61 ms | 1.3× |
-| `ORDER BY` 100 k | 1.57 ms | 1.37 ms | 1.1× |
+| `SUM(id)` 100 k | 20.7 µs | 14.5 µs | 1.4× |
+| `INNER JOIN` 1 M | 3.39 ms | 2.63 ms | 1.3× |
+| `ORDER BY` 100 k | 1.59 ms | 1.39 ms | 1.1× |
 
 `ORDER BY` narrowed from 1.3× to 1.1×, from sorting a text column by dictionary
 rank rather than by string. The other two are within noise of where they were.
