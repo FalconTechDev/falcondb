@@ -958,7 +958,11 @@ fn build_output(
 /// A `HashMap<String, _>` can be looked up by `&str`, so for the single-text-key
 /// case none of that is needed. Measured on a 100k-row build against 1M probe
 /// rows, an INNER JOIN on a text key took 95.86ms against 6.22ms for the same
-/// join on an integer key.
+/// join on an integer key; it is 49.5ms now.
+///
+/// That remaining gap is a property of the data rather than of this function:
+/// with 1000 distinct keys instead of a million, the same text join costs 1.2x
+/// the integer one. `join_by_key_type` measures both.
 ///
 /// `None` means either "not this shape" or "this row's key is NULL"; both send
 /// the caller down the general path, and a NULL key matches nothing anyway.
@@ -2552,13 +2556,30 @@ mod tests {
 
     /// What does a join on a text key cost against the same join on an integer?
     ///
-    /// `int_keys_usable` gates the typed path on integer keys. A text key falls
-    /// to `row_key`, which builds a `String` per probe row before the hash table
-    /// is consulted -- the Bloom filter exists precisely to skip that allocation
-    /// for rows that cannot match, which is an admission of how expensive it is.
+    /// `int_keys_usable` gates the typed path on integer keys, so a text key falls
+    /// to the string map. Joining on a string column is ordinary SQL and the
+    /// benchmark suite joins on `id`, an integer, so this shape has no benchmark.
     ///
-    /// Joining on a string column is ordinary SQL and the benchmark suite joins
-    /// on `id`, an integer, so this is unmeasured.
+    /// The answer depends entirely on how many distinct keys there are, and that
+    /// turned out to matter more than the type:
+    ///
+    /// ```text
+    ///   every key distinct      text 49.5ms against integer  6.5ms    7.6x
+    ///   1000 keys over 1M rows  text  3.5ms against integer  3.0ms    1.2x
+    /// ```
+    ///
+    /// This measurement existed to justify translating both sides to dictionary
+    /// codes and reusing `IntHashTable`, and it argues against doing that. The
+    /// translation only pays when the dictionary is small next to the rows -- and
+    /// where it is, the text join is already within 20% of the integer one, so
+    /// there is little left to win. Where the gap is large, every key is distinct,
+    /// the dictionary *is* the data, and translating it costs what hashing the
+    /// strings costs.
+    ///
+    /// So the 7.6x is a worst case rather than a standing defect, and the obvious
+    /// fix is useless in exactly the case that motivates it. Both cardinalities
+    /// stay measured here, because the first number alone reads as an open problem
+    /// and would send the next person after a fix that cannot work.
     ///
     /// Run with
     /// `cargo test --release --lib join_by_key_type -- --ignored --nocapture`.
@@ -2616,9 +2637,71 @@ mod tests {
         };
 
         println!("INNER JOIN, {BUILD} build rows against {PROBE} probe rows:");
+        println!("every key distinct -- the dictionary is as large as the data:");
         let i = time("integer key", &left_i, &right_i);
         let s = time("text key", &left_s, &right_s);
         println!("  the text key costs {:.1}x the integer one", s.as_secs_f64() / i.as_secs_f64());
+
+        // The same question where the keys repeat.
+        //
+        // The case above is the worst one for a text key, and specifically the
+        // worst one for the fix that suggests itself: translating both sides to
+        // dictionary codes and reusing the integer table. That only pays when the
+        // dictionary is small next to the rows -- five departments over a hundred
+        // thousand rows -- and here every key is distinct, so the dictionary *is*
+        // the data and translating it costs what hashing the strings costs.
+        //
+        // Most real text join keys repeat: a status, a country, a category. If the
+        // gap closes on its own when they do, the 8x above is a worst case rather
+        // than a standing defect, and the dictionary join is worth building only
+        // for the case that is already cheapest. Measured rather than assumed.
+        const KEYS: usize = 1_000;
+        let right_few = text_batch(
+            "rk",
+            (0..KEYS).map(|i| format!("k{:08}", i * 10)).collect(),
+        );
+        // A tenth of the probe rows match, as above, so the output is the same
+        // size and only the key cardinality differs.
+        let left_few = text_batch(
+            "k",
+            (0..PROBE).map(|i| format!("k{:08}", (i % (KEYS * 10)))).collect(),
+        );
+        let right_few_i = int_batch("rk", (0..KEYS as i64).map(|i| i * 10).collect());
+        let left_few_i = int_batch("k", (0..PROBE).map(|i| (i % (KEYS * 10)) as i64).collect());
+
+        let time_free = |label: &str, left: &RecordBatch, right: &RecordBatch| {
+            let run = || {
+                execute_hash_join(
+                    std::slice::from_ref(left),
+                    std::slice::from_ref(right),
+                    &["k"],
+                    &["rk"],
+                    JoinType::Inner,
+                )
+                .unwrap()
+            };
+            let rows = run().row_count();
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..5 {
+                let t = Instant::now();
+                std::hint::black_box(run());
+                best = best.min(t.elapsed());
+            }
+            println!("  {label:>28}: {best:>9.2?}  ({rows} rows out)");
+            best
+        };
+
+        println!("
+{KEYS} distinct keys over {PROBE} probe rows -- dictionary far smaller than the data:");
+        let i2 = time_free("integer key", &left_few_i, &right_few_i);
+        let s2 = time_free("text key", &left_few, &right_few);
+        println!("  the text key costs {:.1}x the integer one", s2.as_secs_f64() / i2.as_secs_f64());
+        println!(
+            "
+  text-key penalty: {:.1}x when every key is distinct, {:.1}x when they repeat",
+            s.as_secs_f64() / i.as_secs_f64(),
+            s2.as_secs_f64() / i2.as_secs_f64(),
+        );
     }
 
     /// How many buckets per row should the join table have?
