@@ -589,11 +589,40 @@ fn dict_mapped_function(
         remap.push(code);
     }
 
+    // What a NULL row becomes depends on the function, and the two answers differ.
+    //
+    // UPPER, LOWER and the TRIMs return NULL for a NULL input. CONCAT does not: it
+    // skips NULL arguments and always returns a string, so `CONCAT(NULL, '!')` is
+    // `"!"`. Keeping NULL for those rows was the first version of this function and
+    // it silently disagreed with the path it replaced -- caught by the test that
+    // runs a shape this fast path declines and compares.
+    //
+    // `transform("")` is exactly the answer for a row whose string contributes
+    // nothing, which is what CONCAT does with a NULL.
+    let null_code = if is_concat {
+        let out = transform("")?;
+        Some(match seen.get(&out) {
+            Some(&code) => code,
+            None => {
+                let code = new_dict.len() as u32;
+                seen.insert(out.clone(), code);
+                new_dict.push(out);
+                code
+            }
+        })
+    } else {
+        None
+    };
+
     let codes: Vec<u32> = c
         .codes()
         .iter()
         .map(|&code| {
-            if Utf8Column::is_null_code(code) { code } else { remap[code as usize] }
+            if Utf8Column::is_null_code(code) {
+                null_code.unwrap_or(code)
+            } else {
+                remap[code as usize]
+            }
         })
         .collect();
 
@@ -870,7 +899,9 @@ mod dict_functions {
         );
         assert_eq!(
             strings(&db, "SELECT CONCAT(s, '!') FROM t"),
-            vec![Some("  Padded  !".into()), Some("sales!".into()), None, Some("SALES!".into()), Some("!".into())],
+            // CONCAT skips a NULL argument rather than propagating it, so the NULL
+            // row is "!" and not NULL. That is this engine's existing answer.
+            vec![Some("  Padded  !".into()), Some("sales!".into()), Some("!".into()), Some("SALES!".into()), Some("!".into())],
         );
 
         // LENGTH answers with numbers, so it leaves the dictionary behind.
@@ -915,7 +946,7 @@ mod dict_functions {
         // Two columns, a nested call, and a numeric function: none are the
         // single-text-column shape, and all must still answer.
         assert_eq!(strings(&db, "SELECT UPPER(LOWER(s)) FROM t"), vec![Some("SALES".into()), None]);
-        assert_eq!(strings(&db, "SELECT CONCAT(s, s) FROM t"), vec![Some("salessales".into()), None]);
+        assert_eq!(strings(&db, "SELECT CONCAT(s, s) FROM t"), vec![Some("salessales".into()), Some("".into())]);
     }
 }
 
