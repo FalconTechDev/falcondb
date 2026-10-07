@@ -85,20 +85,28 @@ fn having_column_survives() {
 }
 
 #[test]
-fn having_on_an_unselected_aggregate_errors_rather_than_returning_nothing() {
-    // FalconDB resolves HAVING against the aggregated batch, so an aggregate that
-    // is not in the SELECT list has no column to match. That used to be swallowed
-    // and reported as zero rows; it must be an error instead.
+fn having_on_an_unselected_aggregate_now_answers() {
+    // This case has had three behaviours. It once returned zero rows silently;
+    // that was replaced by an error, which this test used to pin; and it now
+    // answers, because `translate_having` adds the aggregate the clause needs and
+    // the executor drops that scratch column before the result is returned.
+    //
+    // Rewritten rather than deleted: both earlier behaviours were wrong for the
+    // same query, and the progression is the thing worth recording.
     let mut f = NamedTempFile::new().unwrap();
-    write!(f, "g,v\na,1\nb,10\n").unwrap();
+    write!(f, "g,v
+a,1
+b,10
+").unwrap();
     f.flush().unwrap();
     let db = Database::in_memory();
     db.load_csv(f.path(), "t").unwrap();
 
-    assert!(
-        db.sql("SELECT g FROM t GROUP BY g HAVING SUM(v) > 5").is_err(),
-        "an unresolvable HAVING must not be reported as an empty result"
-    );
+    let got = rows(&db, "SELECT g FROM t GROUP BY g HAVING SUM(v) > 5");
+    assert_eq!(got.len(), 1, "only b has SUM(v) > 5");
+    assert_eq!(got[0][0], "b");
+    // The aggregate was computed for the clause, not for the caller.
+    assert_eq!(got[0].len(), 1, "the scratch aggregate must not reach the result");
 }
 
 #[test]
