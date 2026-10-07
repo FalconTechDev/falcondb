@@ -117,13 +117,17 @@ if ($busy -gt 10) {
                 [PSCustomObject]@{
                     Name = $proc.ProcessName
                     Pct  = [math]::Round($used / 3 / $n * 100, 1)
-                    MB   = [math]::Round($proc.WorkingSet / 1MB)
+                    MB   = [math]::Round($proc.WorkingSet64 / 1MB)
                 }
             }
         }
     }
     $live = $live | Sort-Object Pct -Descending
 
+    # WorkingSet64, not WorkingSet: the latter is a 32-bit property and wraps on
+    # a process holding more than 2 GB. The guard reported "javaw (-1148MB)",
+    # which is a diagnostic lying about the thing it exists to diagnose.
+    #
     # System processes cannot be closed, so listing them under "close this" is
     # useless advice; they are reported separately.
     $system = @('System','Idle','svchost','dwm','csrss','wininit','services','lsass',
