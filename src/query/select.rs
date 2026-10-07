@@ -1285,7 +1285,10 @@ mod dict_functions {
 -- LIMIT, against the same ORDER BY without it --");
         let ob = time("ORDER BY score DESC", "SELECT score FROM t ORDER BY score DESC").unwrap();
         if let Some(l) = time("... LIMIT 10", "SELECT score FROM t ORDER BY score DESC LIMIT 10") {
-            println!("      {:.2}x the full sort (should be far cheaper)", l.as_secs_f64() / ob.as_secs_f64());
+            // 0.27x, not 0.01x: the sort is now nearly free for ten rows, but
+            // the scan and the key extraction are O(n) whatever the limit, and
+            // they are the floor this sits on.
+            println!("      {:.2}x the full sort", l.as_secs_f64() / ob.as_secs_f64());
         }
 
         println!("
