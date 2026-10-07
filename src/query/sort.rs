@@ -229,7 +229,7 @@ fn try_typed_sort(
                     (if desc { !key } else { key }, i as u32)
                 }));
             }
-            sort_pairs_ord(&mut pairs);
+            sort_pairs_ord_limited(&mut pairs, limit, nulls.len(), s.nulls_last);
             Some(assemble(pairs, nulls, s.nulls_last, limit))
         }};
     }
@@ -291,7 +291,7 @@ fn try_typed_sort(
                     }),
                 );
             }
-            sort_pairs_ord(&mut pairs);
+            sort_pairs_ord_limited(&mut pairs, limit, nulls.len(), s.nulls_last);
             Some(assemble(pairs, nulls, s.nulls_last, limit))
         }
         // Utf8 keys would mean cloning or borrowing strings per row; Decimal128
@@ -387,6 +387,53 @@ fn par_sort_min_rows() -> usize {
 /// was beaten. On already-ordered input it is 18x slower, because pdqsort detects
 /// sortedness and a radix sort makes all eight passes regardless; ordered and
 /// nearly-ordered columns are ordinary in analytical data, not a corner case.
+/// Sort `(key, row)` pairs, keeping only as many as the `LIMIT` can use.
+///
+/// `ORDER BY ... LIMIT 10` used to sort every row and then throw away all but
+/// ten: `assemble` truncated the finished list. Over 100k rows that measured
+/// 1.70ms against 2.33ms for the same sort with no limit -- 0.73x, where the
+/// work is `k` rows out of `n` and the ratio should be nowhere near one.
+///
+/// `select_nth_unstable` partitions in O(n) so the smallest `k` sit at the front,
+/// and then only those `k` are sorted. Everything past them is never ordered at
+/// all.
+///
+/// How many pairs the limit can use depends on where the NULLs go, because
+/// `assemble` emits them before or after the keyed rows: with NULLs first they
+/// consume part of the limit, with NULLs last they cannot.
+///
+/// Only applied when `k` is a small fraction of `n`. Partitioning and then
+/// sorting is two passes, so for a limit close to the row count it is slower than
+/// sorting once.
+///
+/// Ties at the boundary: which of several equal keys lands in the top `k` is
+/// arbitrary here, as it already was -- these sorts are unstable, so the engine
+/// has never promised a particular tied row. The *set* can differ from what a
+/// full sort would have truncated to, which is why this is said out loud rather
+/// than left for someone to discover.
+fn sort_pairs_ord_limited<T: Ord + Copy + Send>(
+    pairs:      &mut Vec<(T, u32)>,
+    limit:      Option<usize>,
+    nulls:      usize,
+    nulls_last: bool,
+) {
+    if let Some(k) = limit {
+        let needed = if nulls_last { k } else { k.saturating_sub(nulls) };
+        if needed == 0 {
+            pairs.clear();
+            return;
+        }
+        // 8x is a guess at where two passes stop being cheaper than one, not a
+        // measured crossover; it is well clear of the shapes that matter
+        // (ten rows out of a hundred thousand).
+        if needed < pairs.len() && needed.saturating_mul(8) <= pairs.len() {
+            pairs.select_nth_unstable(needed - 1);
+            pairs.truncate(needed);
+        }
+    }
+    sort_pairs_ord(pairs);
+}
+
 fn sort_pairs_ord<T: Ord + Copy + Send>(pairs: &mut [(T, u32)]) {
     if pairs.len() >= par_sort_min_rows() {
         pairs.par_sort_unstable();
@@ -541,6 +588,105 @@ fn compare_scalar(a: &ScalarValue, b: &ScalarValue, nulls_last: bool) -> std::cm
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod top_n {
+    use crate::db::Database;
+    use crate::storage::{
+        column::ColumnBuilder,
+        schema::{Field, Schema},
+        table::RecordBatch,
+        types::{DataType, ScalarValue},
+    };
+
+    fn db_with(ints: Vec<Option<i64>>) -> Database {
+        let batch = RecordBatch::new(
+            Schema::new(vec![Field::nullable("n", DataType::Int64)]),
+            vec![ColumnBuilder::int64(ints)],
+        )
+        .unwrap();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", vec![batch]).unwrap();
+        db
+    }
+
+    fn vals(db: &Database, sql: &str) -> Vec<Option<i64>> {
+        let r = db.sql(sql).unwrap();
+        let mut out = Vec::new();
+        for b in &r.batches {
+            for i in 0..b.row_count() {
+                out.push(match b.column(0).get(i).unwrap() {
+                    ScalarValue::Null => None,
+                    v => v.as_i64(),
+                });
+            }
+        }
+        out
+    }
+
+    /// `ORDER BY ... LIMIT k` must return the same rows the full sort would, now
+    /// that only `k` of them are sorted.
+    ///
+    /// Partitioning before sorting is the part that could go wrong: take the wrong
+    /// `k`, mishandle the boundary, or lose the NULL placement.
+    #[test]
+    fn limited_sort_matches_the_full_sort() {
+        // Deliberately not in order, and large enough that the partition path
+        // engages rather than being skipped as too small a saving.
+        let n = 10_000i64;
+        let db = db_with((0..n).map(|i| Some((i * 7919) % n)).collect());
+
+        for k in [1usize, 2, 10, 100, 1000] {
+            let got = vals(&db, &format!("SELECT n FROM t ORDER BY n LIMIT {k}"));
+            let want: Vec<Option<i64>> = (0..k as i64).map(Some).collect();
+            assert_eq!(got, want, "ascending, LIMIT {k}");
+
+            let got = vals(&db, &format!("SELECT n FROM t ORDER BY n DESC LIMIT {k}"));
+            let want: Vec<Option<i64>> = (0..k as i64).map(|i| Some(n - 1 - i)).collect();
+            assert_eq!(got, want, "descending, LIMIT {k}");
+        }
+
+        // A limit at and past the row count must not lose rows.
+        assert_eq!(vals(&db, "SELECT n FROM t ORDER BY n LIMIT 10000").len(), 10_000);
+        assert_eq!(vals(&db, "SELECT n FROM t ORDER BY n LIMIT 20000").len(), 10_000);
+        assert_eq!(vals(&db, "SELECT n FROM t ORDER BY n LIMIT 0").len(), 0);
+    }
+
+    /// NULLs are emitted before or after the keyed rows, so they consume part of
+    /// the limit in one case and not the other. Getting that backwards would
+    /// return too few rows, or the wrong ones.
+    #[test]
+    fn limited_sort_places_nulls_correctly() {
+        let mut v: Vec<Option<i64>> = (0..200).map(|i| Some(200 - i)).collect();
+        for i in (0..v.len()).step_by(20) {
+            v[i] = None;
+        }
+        let nulls = v.iter().filter(|x| x.is_none()).count();
+        let db = db_with(v);
+
+        // Default placement, whichever it is, must agree with the unlimited sort.
+        for k in [1usize, 5, 12, 50] {
+            let limited = vals(&db, &format!("SELECT n FROM t ORDER BY n LIMIT {k}"));
+            let full: Vec<Option<i64>> = vals(&db, "SELECT n FROM t ORDER BY n")
+                .into_iter()
+                .take(k)
+                .collect();
+            assert_eq!(limited, full, "LIMIT {k} must be a prefix of the full sort");
+        }
+        assert!(nulls > 0, "the fixture must actually contain NULLs");
+    }
+
+    /// With every key equal, the top `k` is arbitrary but must still be `k` rows
+    /// of the right value -- the case where a partition could drop rows.
+    #[test]
+    fn limited_sort_handles_all_ties() {
+        let db = db_with(vec![Some(42); 5_000]);
+        for k in [1usize, 3, 100, 4999, 5000] {
+            let got = vals(&db, &format!("SELECT n FROM t ORDER BY n LIMIT {k}"));
+            assert_eq!(got.len(), k, "LIMIT {k} over all-equal keys");
+            assert!(got.iter().all(|v| *v == Some(42)));
+        }
+    }
+}
+
 mod utf8_sort {
     use super::*;
     use crate::storage::{
