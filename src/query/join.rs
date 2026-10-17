@@ -2593,6 +2593,71 @@ mod tests {
         );
     }
 
+    /// A NULL join key matches nothing, including another NULL.
+    ///
+    /// `row_key` rendered NULL through `to_string()`, so every NULL produced the
+    /// same key and they all matched each other: a self join on a column holding
+    /// `1, NULL, 3, NULL` answered 6 rows where 2 are correct.
+    ///
+    /// The join types are checked separately because the fix must not go too far
+    /// the other way. A NULL-keyed row still *exists*: LEFT must emit it with
+    /// NULLs on the right, and ANTI must emit it precisely because it matched
+    /// nothing. Dropping the row instead of failing its lookup would break both.
+    #[test]
+    fn a_null_join_key_matches_nothing() {
+        use crate::storage::{column::ColumnBuilder, schema::Field, types::DataType};
+
+        let side = |name: &str, vals: Vec<Option<i64>>| {
+            RecordBatch::new(
+                Schema::new(vec![Field::nullable(name, DataType::Int64)]),
+                vec![ColumnBuilder::int64(vals)],
+            )
+            .unwrap()
+        };
+        // Left: 1, NULL, 3, NULL.  Right: 1, NULL, 4.
+        let left = side("k", vec![Some(1), None, Some(3), None]);
+        let right = side("rk", vec![Some(1), None, Some(4)]);
+
+        let run = |jt: JoinType| -> usize {
+            execute_hash_join(
+                std::slice::from_ref(&left),
+                std::slice::from_ref(&right),
+                &["k"],
+                &["rk"],
+                jt,
+            )
+            .unwrap()
+            .row_count()
+        };
+
+        // Only 1 matches 1. The NULLs on either side match nothing at all.
+        assert_eq!(run(JoinType::Inner), 1, "INNER: only the 1=1 pair");
+        // LEFT keeps all four left rows: one matched, three unmatched.
+        assert_eq!(run(JoinType::Left), 4, "LEFT keeps every left row");
+        // SEMI keeps left rows that matched: just the 1.
+        assert_eq!(run(JoinType::Semi), 1, "SEMI: only the 1");
+        // ANTI keeps left rows that did not match: NULL, 3, NULL.
+        assert_eq!(run(JoinType::Anti), 3, "ANTI: the two NULLs and the 3");
+
+        // The shape from the probe that found this, as a regression guard.
+        let sl = side("k", vec![Some(1), None, Some(3), None]);
+        let sr = side("rk", vec![Some(1), None, Some(3), None]);
+        assert_eq!(
+            execute_hash_join(
+                std::slice::from_ref(&sl),
+                std::slice::from_ref(&sr),
+                &["k"],
+                &["rk"],
+                JoinType::Inner,
+            )
+            .unwrap()
+            .row_count(),
+            2,
+            "a self join over 1, NULL, 3, NULL has two matching pairs, not six",
+        );
+    }
+
+
     /// What does a join on a text key cost against the same join on an integer?
     ///
     /// `int_keys_usable` gates the typed path on integer keys, so a text key falls
