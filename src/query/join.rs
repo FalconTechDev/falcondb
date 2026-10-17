@@ -103,7 +103,10 @@ pub fn execute_hash_semi_anti_join(
             JoinKeyMap::Str(t) => match single_text_key(&left_key_cols, l_row) {
                 Some(key) => t.contains_key(key),
                 None if matches!(left_key_cols.as_slice(), [Column::Utf8(_)]) => false,
-                None => t.contains_key(&row_key(&left_key_cols, l_row)?),
+                None => match row_key_or_null(&left_key_cols, l_row)? {
+                    Some(key) => t.contains_key(&key),
+                    None => false, // NULL key: matches nothing
+                },
             },
         };
         Ok(if anti { !matched } else { matched })
@@ -630,7 +633,8 @@ fn build_hash_table(
 
     let mut table: FastMap<String, SmallVec<[usize; 1]>> = FastMap::default();
     for row in 0..n {
-        let key = row_key(&key_cols, row)?;
+        // A NULL key joins to nothing, so it is never a candidate to be found.
+        let Some(key) = row_key_or_null(&key_cols, row)? else { continue };
         table.entry(key).or_default().push(row);
         if let Some(f) = bloom.as_mut() {
             f.insert(row_key_hash(&key_cols, row));
@@ -687,7 +691,10 @@ fn probe_one(
             let found = match single_text_key(left_key_cols, l_row) {
                 Some(key) => t.get(key),
                 None if matches!(left_key_cols, [Column::Utf8(_)]) => None, // NULL key
-                None => t.get(&row_key(left_key_cols, l_row)?),
+                None => match row_key_or_null(left_key_cols, l_row)? {
+                    Some(key) => t.get(&key),
+                    None => None, // NULL key: matches nothing
+                },
             };
             if let Some(rows) = found {
                 scratch.extend_from_slice(rows);
@@ -977,6 +984,38 @@ fn row_key(key_cols: &[&Column], row: usize) -> FalconResult<String> {
         .map(|col| col.get(row).map(|v| v.to_string()))
         .collect();
     Ok(parts?.join("\x00"))
+}
+
+/// The key of one row, or `None` when any part of it is NULL.
+///
+/// A NULL key matches nothing in SQL -- not even another NULL. `row_key` renders
+/// it with `to_string()`, so every NULL produced the *same* string and they all
+/// matched each other:
+///
+/// ```sql
+///   -- a column holding 1, NULL, 3, NULL
+///   SELECT COUNT(*) FROM n JOIN n AS m ON n.a = m.a   -- answered 6, not 2
+/// ```
+///
+/// The four extra rows are the two NULLs matching each other both ways. A string
+/// column containing the literal text "NULL" would have matched them too.
+///
+/// The typed integer path was never affected: `int_keys_usable` refuses a column
+/// with any NULL in it, which is why this only showed up on the general path and
+/// only for a nullable key.
+///
+/// Callers treat `None` as "this row joins to nothing" rather than skipping the
+/// row, so that LEFT and ANTI still emit it.
+fn row_key_or_null(key_cols: &[&Column], row: usize) -> FalconResult<Option<String>> {
+    let mut parts = Vec::with_capacity(key_cols.len());
+    for col in key_cols {
+        let v = col.get(row)?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        parts.push(v.to_string());
+    }
+    Ok(Some(parts.join("\x00")))
 }
 
 // ─── Typed integer keys ───────────────────────────────────────────────────────

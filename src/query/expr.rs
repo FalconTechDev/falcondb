@@ -2035,6 +2035,127 @@ mod in_list_semantics {
         assert_eq!(n("SELECT i FROM t WHERE i IN (1, 2)"), 2);
     }
 
+    /// A probe, not an assertion: report what several suspect shapes answer.
+    ///
+    /// Written to find bugs rather than to pin behaviour, so it prints and does
+    /// not fail. Anything it turns up gets its own test and an entry in
+    /// FINDINGS.md; this exists so one compile covers many questions.
+    ///
+    /// Run with
+    /// `cargo test --release --lib semantics_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn semantics_probe() {
+        use crate::db::Database;
+        use crate::storage::{
+            column::ColumnBuilder,
+            schema::{Field, Schema},
+            table::RecordBatch,
+            types::DataType,
+        };
+
+        let db = Database::in_memory();
+
+        // Large integers, where f64 cannot hold every value.
+        let big = RecordBatch::new(
+            Schema::new(vec![Field::required("n", DataType::Int64)]),
+            vec![ColumnBuilder::int64(vec![
+                Some(9_007_199_254_740_993),   // 2^53 + 1, not representable in f64
+                Some(9_223_372_036_854_775_807), // i64::MAX
+                Some(1),
+            ])],
+        )
+        .unwrap();
+        db.create_table_from_batches("big", vec![big]).unwrap();
+
+        // NULLs in every position that might matter.
+        let nulls = RecordBatch::new(
+            Schema::new(vec![
+                Field::nullable("a", DataType::Int64),
+                Field::nullable("s", DataType::Utf8),
+            ]),
+            vec![
+                ColumnBuilder::int64(vec![Some(1), None, Some(3), None]),
+                ColumnBuilder::utf8_from_str(vec![Some("x"), None, Some("x"), None]),
+            ],
+        )
+        .unwrap();
+        db.create_table_from_batches("n", vec![nulls]).unwrap();
+
+        let empty = RecordBatch::new(
+            Schema::new(vec![Field::nullable("a", DataType::Int64)]),
+            vec![ColumnBuilder::int64(vec![])],
+        )
+        .unwrap();
+        db.create_table_from_batches("e", vec![empty]).unwrap();
+
+        let show = |label: &str, sql: &str| {
+            match db.sql(sql) {
+                Ok(r) => {
+                    let mut cells = Vec::new();
+                    for b in &r.batches {
+                        for i in 0..b.row_count() {
+                            let row: Vec<String> = (0..b.column_count())
+                                .map(|c| format!("{:?}", b.column(c).get(i).unwrap()))
+                                .collect();
+                            cells.push(row.join("|"));
+                        }
+                    }
+                    println!("  {label:<34} {}", if cells.is_empty() { "<no rows>".into() } else { cells.join("  ") });
+                }
+                Err(e) => println!("  {label:<34} ERROR: {e}"),
+            }
+        };
+
+        println!("
+-- integer precision: does arithmetic widen to f64? --");
+        println!("     2^53+1 is 9007199254740993; f64 rounds it to ...992");
+        show("n (as stored)",            "SELECT n FROM big WHERE n > 9007199254740000 AND n < 9007199254741000");
+        show("n + 1",                    "SELECT n + 1 FROM big WHERE n < 9223372036854775807 AND n > 1");
+        show("n * 1",                    "SELECT n * 1 FROM big WHERE n < 9223372036854775807 AND n > 1");
+        show("n - 1",                    "SELECT n - 1 FROM big WHERE n < 9223372036854775807 AND n > 1");
+        show("SUM(n) of i64::MAX and 1", "SELECT SUM(n) FROM big WHERE n = 9223372036854775807 OR n = 1");
+        show("MAX(n)",                   "SELECT MAX(n) FROM big");
+
+        println!("
+-- NULL through aggregates --");
+        show("COUNT(*)",          "SELECT COUNT(*) FROM n");
+        show("COUNT(a)",          "SELECT COUNT(a) FROM n");
+        show("SUM(a)",            "SELECT SUM(a) FROM n");
+        show("AVG(a)",            "SELECT AVG(a) FROM n");
+        show("MIN(a), MAX(a)",    "SELECT MIN(a), MAX(a) FROM n");
+        show("COUNT(DISTINCT a)", "SELECT COUNT(DISTINCT a) FROM n");
+
+        println!("
+-- NULL through grouping and dedup --");
+        show("GROUP BY a",         "SELECT a, COUNT(*) FROM n GROUP BY a");
+        show("DISTINCT a",         "SELECT DISTINCT a FROM n");
+        show("DISTINCT s",         "SELECT DISTINCT s FROM n");
+
+        println!("
+-- NULL join keys (SQL: a NULL key matches nothing) --");
+        show("self join on a",     "SELECT COUNT(*) FROM n JOIN n AS m ON n.a = m.a");
+
+        println!("
+-- empty table --");
+        show("COUNT(*)",      "SELECT COUNT(*) FROM e");
+        show("SUM(a)",        "SELECT SUM(a) FROM e");
+        show("AVG(a)",        "SELECT AVG(a) FROM e");
+        show("MIN(a)",        "SELECT MIN(a) FROM e");
+        show("GROUP BY a",    "SELECT a, COUNT(*) FROM e GROUP BY a");
+
+        println!("
+-- LIMIT and OFFSET --");
+        show("LIMIT 2",             "SELECT a FROM n ORDER BY a LIMIT 2");
+        show("LIMIT 2 OFFSET 1",    "SELECT a FROM n ORDER BY a LIMIT 2 OFFSET 1");
+        show("OFFSET past the end", "SELECT a FROM n ORDER BY a LIMIT 2 OFFSET 99");
+
+        println!("
+-- division --");
+        show("1/0 integer",   "SELECT a / 0 FROM n WHERE a = 1");
+        show("1.0/0.0 float", "SELECT 1.0 / 0.0 FROM n WHERE a = 1");
+    }
+
     /// `TRIM`, `SUBSTRING`, `CEIL` and `FLOOR` reach SQL, and answer correctly.
     ///
     /// All four were implemented in `eval_function` and unreachable: the parser
