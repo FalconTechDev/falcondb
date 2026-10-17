@@ -2634,10 +2634,28 @@ mod tests {
         assert_eq!(run(JoinType::Inner), 1, "INNER: only the 1=1 pair");
         // LEFT keeps all four left rows: one matched, three unmatched.
         assert_eq!(run(JoinType::Left), 4, "LEFT keeps every left row");
+
+        // SEMI and ANTI have their own entry point, which takes a bool rather
+        // than a JoinType. Passing JoinType::Semi to `execute_hash_join` does not
+        // produce a semi join -- it runs the ordinary path and returns joined
+        // rows, which for this fixture happens to be the same count. The first
+        // version of this test did that and read as passing.
+        let semi_anti = |anti: bool| -> usize {
+            execute_hash_semi_anti_join(
+                std::slice::from_ref(&left),
+                std::slice::from_ref(&right),
+                &["k"],
+                &["rk"],
+                anti,
+            )
+            .unwrap()
+            .row_count()
+        };
         // SEMI keeps left rows that matched: just the 1.
-        assert_eq!(run(JoinType::Semi), 1, "SEMI: only the 1");
-        // ANTI keeps left rows that did not match: NULL, 3, NULL.
-        assert_eq!(run(JoinType::Anti), 3, "ANTI: the two NULLs and the 3");
+        assert_eq!(semi_anti(false), 1, "SEMI: only the 1");
+        // ANTI keeps left rows that did not match: NULL, 3, NULL. The NULLs belong
+        // here precisely because they matched nothing.
+        assert_eq!(semi_anti(true), 3, "ANTI: the two NULLs and the 3");
 
         // The shape from the probe that found this, as a regression guard.
         let sl = side("k", vec![Some(1), None, Some(3), None]);
