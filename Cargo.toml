@@ -2,9 +2,13 @@
 name = "falcondb"
 version = "0.1.0"
 edition = "2021"
-authors = ["falcondb contributors"]
+authors = ["FalconTech <falcontechdevoloper@gmail.com>"]
 description = "A high-performance columnar analytical database engine"
 license = "MIT"
+repository = "https://github.com/FalconTechDev/falcondb"
+readme = "README.md"
+keywords = ["database", "analytics", "columnar", "sql", "olap"]
+categories = ["database-implementations"]
 
 [lib]
 name = "falcondb"

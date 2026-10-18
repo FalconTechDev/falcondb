@@ -1,1 +1,23 @@
+# Build output
 /target
+
+# Vendored DuckDB, used only by the comparison benchmark.
+#
+# `lib/duckdb/duckdb.dll` is about 29 MB and belongs to DuckDB, not here. It was
+# committed once and made every clone carry it; it is fetched instead. See
+# "Running the benchmarks" in README.md.
+/lib
+
+# Raw benchmark output. The numbers that matter live in README.md, where they
+# carry the conditions they were taken under; the dumps are session scratch.
+/bench-results
+*.bundle
+
+# Cached Parquet used by the 10M/100M harnesses.
+/bench-data
+
+# Python bindings build (maturin)
+/.venv
+*.so
+*.pyd
+__pycache__/
