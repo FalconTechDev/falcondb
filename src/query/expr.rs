@@ -1802,6 +1802,38 @@ fn apply_binary_op(
         _ => {}
     }
 
+    // Integer arithmetic stays integer.
+    //
+    // Everything below went through `as_f64`, so `n * 1` on an `Int64` column
+    // returned a `Float64` -- and above 2^53 an `f64` cannot hold consecutive
+    // integers, so it returned a different number: 9007199254740993 * 1 came back
+    // as 9007199254740992. A query that multiplies by one is not supposed to be
+    // a lossy operation, and the result type is not supposed to change either.
+    //
+    // `+`, `-` and `*` are closed over the integers and stay here. `/` does not:
+    // it is left on the float path, which is what DuckDB and SQLite do with `/`
+    // on integers, and what this engine has always returned. Comparisons also
+    // stay below, so `n = 9007199254740993` is still answered in `f64` and can
+    // still be wrong at that magnitude -- a separate defect, recorded rather than
+    // half-fixed here.
+    //
+    // Overflow is an error rather than a wrap: a wrapped product is a wrong
+    // answer that looks like an answer.
+    if let (Some(l), Some(r)) = (int_operand(left), int_operand(right)) {
+        let checked = match op {
+            BinaryOp::Add => Some(l.checked_add(r)),
+            BinaryOp::Sub => Some(l.checked_sub(r)),
+            BinaryOp::Mul => Some(l.checked_mul(r)),
+            _             => None,
+        };
+        if let Some(result) = checked {
+            return match result {
+                Some(v) => Ok(ScalarValue::Int64(Some(v))),
+                None    => Err(FalconError::Overflow),
+            };
+        }
+    }
+
     // Numeric operations.
     if let (Some(l), Some(r)) = (left.as_f64(), right.as_f64()) {
         return match op {
@@ -1844,6 +1876,20 @@ fn apply_binary_op(
         expected: left.data_type(),
         got:      right.data_type(),
     })
+}
+
+/// The integer behind a scalar, when it is one exactly.
+///
+/// `Date32` and `Timestamp` are deliberately excluded although they hold an
+/// `i32`/`i64`: date arithmetic is handled above this and means days or
+/// microseconds, not a bare number. `Decimal128` is excluded because its value
+/// depends on a scale this would discard.
+fn int_operand(v: &ScalarValue) -> Option<i64> {
+    match v {
+        ScalarValue::Int64(Some(n)) => Some(*n),
+        ScalarValue::Int32(Some(n)) => Some(*n as i64),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
