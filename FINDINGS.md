@@ -308,3 +308,20 @@ was the larger of the two (400ms -> 146ms at 100M).
 Left deliberately: the integer sort arms do not normalise their key to an
 unsigned ordering key, so `ORDER BY id LIMIT 10` still builds every pair. Same
 fix, a separate change.
+
+### Integer `ORDER BY ... LIMIT`, and a trap worth keeping (2026-10-18)
+
+`ORDER BY id DESC LIMIT 10` on an ascending column, one run each: 1.74s ->
+364ms at 100M, 167ms -> 35.0ms at 10M. Still 3.8x the same query on a repeating
+column (95.3ms at 100M), and that remainder is real: on ascending data every row
+belongs in the kept set when it arrives, so the appends cannot be avoided.
+
+**The trap.** A bounded max-heap is the textbook top-k and was 14x slower than
+the buffer on exactly this shape, because sorted input makes every row beat the
+kept set and the heap sifts on all of them. It looked fine when measured on
+`score`, whose hundred repeating values make the threshold reject almost
+everything. One column shape hid it completely. Ordered columns are ordinary in
+analytical data.
+
+Second part of the same trap: the buffer was `2k` at first, so `LIMIT 10` reduced
+every ten rows -- 925ms instead of 364ms. The floor is 1024 now.
