@@ -325,3 +325,24 @@ analytical data.
 
 Second part of the same trap: the buffer was `2k` at first, so `LIMIT 10` reduced
 every ten rows -- 925ms instead of 364ms. The floor is 1024 now.
+
+### Parquet load: what is measurable at 100M and what is not (2026-10-18)
+
+Phase split of a 100M load: `read_parquet` about 1.9s, zone maps 2.56s serial
+against 119ms in parallel (21x, measured as the two paths side by side in one
+process). The zone maps are now parallel.
+
+Per column within one process: text 851ms vs float 268ms before the borrowed-str
+dictionary, 550ms vs 342ms after -- 3.2x the numeric column down to 1.6x.
+
+**Whole-load time at 100M has a band of 2.49s to 4.97s** across isolated runs.
+Nothing smaller than that is provable from it, so load numbers quoted to two
+decimal places in earlier notes -- including "3.35-3.44s before, 2.81s after" --
+should be read as within that band. Phase and per-column comparisons taken side
+by side in one process remain usable; subtractions between whole-load totals do
+not.
+
+Two contaminations worth naming, both of which produced plausible wrong answers:
+running the 10M and 100M harnesses in one process (100M load 2.81s -> 3.69s), and
+running three multi-GB profiling tests in one process (`id`, untouched, 484ms ->
+1.69s, which read as "the change made everything worse").
