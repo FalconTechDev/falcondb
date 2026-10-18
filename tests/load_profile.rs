@@ -87,12 +87,23 @@ fn load_phases_100m() {
     let schema = batches[0].schema.clone();
     let mut table = Table::new("bench", schema);
     let t = Instant::now();
-    table.append_batches(batches).unwrap();
+    table.append_batches(batches.clone()).unwrap();
     let append = t.elapsed();
+
+    // The loop this replaced, measured against it in the same process on the same
+    // batches, because the whole-load timing is too noisy to attribute half a
+    // second to one of its phases.
+    let mut one_at_a_time = Table::new("bench", table.schema.clone());
+    let t = Instant::now();
+    for b in batches {
+        one_at_a_time.append_batch(b).unwrap();
+    }
+    let serial = t.elapsed();
 
     println!("
 === 100M load phases ===");
     println!("  read_parquet      {read:>10.2?}");
     println!("  append_batches    {append:>10.2?}");
+    println!("  append_batch loop {serial:>10.2?}");
     println!("  {n_batches} batches, {rows} rows");
 }
