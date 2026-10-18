@@ -1,49 +1,73 @@
-//! One single run of each query at 10M and 100M rows, FalconDB against DuckDB.
+//! One single run of each query at 10M and 100M rows, FalconDB only.
 //!
-//! Deliberately *not* Criterion. The suite in `benches/` takes the median of 100
-//! samples because at 10k-1M rows a single reading is dominated by noise. At these
-//! sizes one run is the realistic measure: nobody runs a hundred-million-row query
-//! a hundred times, and the first run is the one a user actually waits for.
+//! This is the iteration harness for the two shapes that do not scale past 1M.
+//! It is deliberately *not* Criterion and deliberately does not run the rival
+//! engines:
 //!
-//! What that buys and costs:
-//!   - No warm-up, no repetition, no median. Each number is one wall-clock reading.
-//!   - A single reading cannot separate the query from whatever the machine was
-//!     doing that second. Treat differences under about 20% as unresolved.
-//!   - The FalconDB-against-DuckDB comparison within one run is the sound part:
-//!     both read the same Parquet file in the same process moments apart.
-//!
-//! Loading is timed separately and excluded from the query times, as the benchmark
-//! suite does, because loading is a different question from querying.
+//!   - **One run, no median.** At these sizes a single reading is the realistic
+//!     measure: nobody runs a hundred-million-row query a hundred times, and the
+//!     run a user waits for is the first. The cost is that one reading cannot
+//!     separate the query from whatever the machine was doing that second, so a
+//!     difference under about 20% is not resolved by it.
+//!   - **FalconDB only.** When the question is "did my change help", the rivals
+//!     add minutes per iteration and answer nothing. Use
+//!     `tests/one_shot_vs_rivals.rs` when the question is "where do we stand".
+//!   - **The data file is cached.** Writing the 100M-row Parquet took 32 s, which
+//!     dominated everything else. It is written once to `FALCON_BENCH_DATA` (or a
+//!     default beside the target directory) and reused, so a second run starts
+//!     measuring immediately. Delete the file to regenerate it.
 //!
 //! Run with:
 //!   cargo test --release --test one_shot_large -- --ignored --nocapture
 //!
-//! 100M rows needs roughly 6-8 GB of RAM across the two engines and about a
-//! minute of Parquet writing before anything is measured.
+//! 100M rows needs about 3 GB resident and a 414 MB file on disk.
 
-use duckdb::Connection;
 use falcondb::db::Database;
 use falcondb::storage::column::ColumnBuilder;
 use falcondb::storage::schema::{Field, Schema};
 use falcondb::storage::table::{RecordBatch, Table};
 use falcondb::storage::types::DataType;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const DEPTS: [&str; 5] = ["engineering", "sales", "hr", "ops", "legal"];
 
-/// The five queries, in the spelling both engines accept.
-const QUERIES: [(&str, &str); 5] = [
-    ("SUM(score)",            "SELECT SUM(score) FROM bench"),
-    ("WHERE score > 50",      "SELECT COUNT(*) FROM bench WHERE score > 50"),
-    ("GROUP BY dept",         "SELECT dept, COUNT(*), AVG(score) FROM bench GROUP BY dept"),
-    ("ORDER BY score LIMIT 10", "SELECT score FROM bench ORDER BY score DESC LIMIT 10"),
-    ("COUNT(DISTINCT dept)",  "SELECT COUNT(DISTINCT dept) FROM bench"),
+/// The queries. Each is run once.
+///
+/// The first two are the shapes that do not scale; the rest are here so a change
+/// that helps one and hurts another cannot hide.
+const QUERIES: [(&str, &str); 6] = [
+    ("COUNT(*) WHERE score > 50",  "SELECT COUNT(*) FROM bench WHERE score > 50"),
+    ("ORDER BY score LIMIT 10",    "SELECT score FROM bench ORDER BY score DESC LIMIT 10"),
+    ("SUM(score)",                 "SELECT SUM(score) FROM bench"),
+    ("SUM(id) integer",            "SELECT SUM(id) FROM bench"),
+    ("GROUP BY dept",              "SELECT dept, COUNT(*), AVG(score) FROM bench GROUP BY dept"),
+    ("COUNT(DISTINCT dept)",       "SELECT COUNT(DISTINCT dept) FROM bench"),
 ];
 
-/// Build the Parquet file in chunks so the whole table never exists twice in
-/// memory at once. At 100M rows a single batch would be about 2 GB of `Vec`s
-/// before the writer sees any of it.
-fn write_parquet(rows: usize, path: &std::path::Path) -> Duration {
+/// Where the cached Parquet files live.
+fn data_dir() -> PathBuf {
+    std::env::var("FALCON_BENCH_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("CARGO_TARGET_DIR")
+                .map(|t| PathBuf::from(t).join("bench-data"))
+                .unwrap_or_else(|_| PathBuf::from("target/bench-data"))
+        })
+}
+
+/// Build the file if it is not already there.
+///
+/// Written in chunks so the whole table never exists twice in memory: at 100M
+/// rows a single batch is about 2 GB of `Vec`s before the writer sees any of it.
+fn ensure_data(rows: usize) -> (PathBuf, Option<Duration>) {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join(format!("bench_{rows}.parquet"));
+    if path.exists() {
+        return (path, None);
+    }
+
     const CHUNK: usize = 2_000_000;
     let schema = Schema::new(vec![
         Field::required("id", DataType::Int64),
@@ -67,92 +91,47 @@ fn write_parquet(rows: usize, path: &std::path::Path) -> Duration {
         table.append_batch(batch).unwrap();
         start = end;
     }
-    falcondb::storage::parquet_io::write_parquet(&table.batches, path).unwrap();
-    t.elapsed()
+    falcondb::storage::parquet_io::write_parquet(&table.batches, &path).unwrap();
+    (path, Some(t.elapsed()))
 }
 
-fn run_size(rows: usize, dir: &tempfile::TempDir) {
-    let human = if rows >= 1_000_000 {
-        format!("{}M", rows / 1_000_000)
-    } else {
-        format!("{rows}")
-    };
-    println!("\n=== {human} rows ===");
+fn run_size(rows: usize) {
+    let human = format!("{}M", rows / 1_000_000);
+    println!("\n=== {human} rows, FalconDB only, one run each ===");
 
-    let path = dir.path().join(format!("bench_{rows}.parquet"));
-    let write = write_parquet(rows, &path);
-    let size_mb = std::fs::metadata(&path).map(|m| m.len() / 1_048_576).unwrap_or(0);
-    println!("  parquet written in {write:.2?} ({size_mb} MB on disk)");
-
-    // Loading, timed but reported separately: a different question from querying.
-    let t = Instant::now();
-    let fdb = Database::in_memory();
-    fdb.load_parquet(&path, "bench").unwrap();
-    let fdb_load = t.elapsed();
+    let (path, written) = ensure_data(rows);
+    match written {
+        Some(d) => println!("  data generated in {d:.2?} (cached for next time)"),
+        None => println!("  data reused from cache"),
+    }
 
     let t = Instant::now();
-    let duck = Connection::open_in_memory().unwrap();
-    duck.execute_batch(&format!(
-        "CREATE TABLE bench AS SELECT * FROM read_parquet('{}')",
-        path.display().to_string().replace('\\', "/")
-    ))
-    .unwrap();
-    let duck_load = t.elapsed();
-
-    println!("  load:  FalconDB {fdb_load:>10.2?}   DuckDB {duck_load:>10.2?}");
+    let db = Database::in_memory();
+    db.load_parquet(&path, "bench").unwrap();
+    println!("  load: {:.2?}", t.elapsed());
     println!();
-    println!("  {:<26}{:>12}{:>12}{:>10}", "query", "FalconDB", "DuckDB", "ratio");
 
     for (label, sql) in QUERIES {
-        // FalconDB: one run.
         let t = Instant::now();
-        let r = fdb.sql(sql);
-        let f_time = t.elapsed();
-        let f_ok = r.is_ok();
-
-        // DuckDB: one run. `query_row` forces the result to be produced rather
-        // than left as a lazily-evaluated statement.
-        let t = Instant::now();
-        let d_ok = duck
-            .prepare(sql)
-            .and_then(|mut stmt| {
-                let mut n = 0usize;
-                let mut rows_iter = stmt.query([])?;
-                while rows_iter.next()?.is_some() {
-                    n += 1;
-                }
-                Ok(n)
-            })
-            .is_ok();
-        let d_time = t.elapsed();
-
-        let ratio = d_time.as_secs_f64() / f_time.as_secs_f64();
-        let note = if !f_ok {
-            "  FalconDB errored"
-        } else if !d_ok {
-            "  DuckDB errored"
-        } else {
-            ""
-        };
-        println!(
-            "  {label:<26}{f_time:>12.2?}{d_time:>12.2?}{ratio:>9.1}x{note}",
-        );
+        let r = db.sql(sql);
+        let elapsed = t.elapsed();
+        match r {
+            Ok(_) => println!("  {label:<28}{elapsed:>12.2?}"),
+            Err(e) => println!("  {label:<28}{:>12}  ERROR: {e}", "-"),
+        }
     }
 }
 
-/// 10M rows.
 #[test]
 #[ignore]
 fn one_shot_10m() {
-    let dir = tempfile::tempdir().unwrap();
-    run_size(10_000_000, &dir);
+    run_size(10_000_000);
 }
 
-/// 100M rows. Separate test so 10M can be run on its own, and so a failure at
-/// 100M does not cost the 10M numbers.
+/// Separate test so 10M can be run alone, and so a failure at 100M does not cost
+/// the 10M numbers.
 #[test]
 #[ignore]
 fn one_shot_100m() {
-    let dir = tempfile::tempdir().unwrap();
-    run_size(100_000_000, &dir);
+    run_size(100_000_000);
 }

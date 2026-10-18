@@ -134,6 +134,18 @@ Recorded so the same ground is not covered twice.
 
 ## Correctness: not yet investigated
 
+### The `%` operator is not supported
+
+```sql
+SELECT COUNT(*) FROM t WHERE n % 2 = 0   -- "unsupported operator: %"
+```
+
+Modulo is ordinary SQL and the engine rejects it. Found by writing it into a test
+without thinking, which is roughly how a user would find it. Not investigated
+beyond confirming the message; `MOD(a, b)` was not tried.
+
+
+
 ### `__having_` prefix can collide
 
 `translate_having` appends aggregates under `__having_N` and `drop_having_scratch`
