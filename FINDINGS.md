@@ -144,6 +144,60 @@ recognised by name.
 
 ---
 
+## Speed: two shapes do not scale past 1M rows
+
+The benchmark suite stops at 1M. One single run of each query at 10M and 100M
+against DuckDB -- `tests/one_shot_large.rs`, one wall-clock reading each, no
+median -- found two shapes where FalconDB is ahead at 1M and behind at 100M.
+
+Measured on battery, so the absolute numbers are roughly twice what mains power
+would give. Both engines are slowed equally, so the ratios hold; that is the part
+being claimed.
+
+| query | 10M Falcon | 10M Duck | 100M Falcon | 100M Duck |
+|---|---|---|---|---|
+| `COUNT(DISTINCT dept)` | 1.83 ms | 34.4 ms | 13.1 ms | 288 ms |
+| `GROUP BY dept` | 5.92 ms | 45.7 ms | 30.2 ms | 279 ms |
+| `SUM(score)` | 3.15 ms | 6.85 ms | 18.9 ms | 87.4 ms |
+| `WHERE score > 50` | 12.6 ms | 11.8 ms | **164 ms** | 50.6 ms |
+| `ORDER BY score LIMIT 10` | 108 ms | 24.2 ms | **1.20 s** | 140 ms |
+| load from Parquet | 448 ms | 306 ms | 3.67 s | 2.20 s |
+
+### `COUNT(*)` with a `WHERE` crosses over between 10M and 100M
+
+Ahead at 100k (1.4x), level at 10M (0.9x), **3.3x behind at 100M**.
+
+Scaling tells the story. Ten times the rows cost us 13x; they cost DuckDB 4.3x.
+Ours is superlinear where theirs is sublinear -- DuckDB gets *more* efficient with
+scale, which is what good parallelism looks like, and we get less.
+
+Hypothesis, not yet verified: the query is `SELECT COUNT(*) ... WHERE score > 50`,
+and the filter produces a bitmask which is then used to build a filtered batch
+that gets counted. At 100M rows with half of them matching, that materialises
+50M rows in order to return one number. A popcount over the mask would answer it
+without building anything. Worth checking before anything else here.
+
+### `ORDER BY ... LIMIT` degrades with scale
+
+4.5x behind at 10M, **8.6x behind at 100M**. Ten times the rows cost us 11x and
+DuckDB 5.8x.
+
+This one is already understood. Top-N selection landed recently and made the
+*sort* nearly free for a small limit -- 1.70 ms to 583 us at 100k. What remains is
+the pair materialisation: a `(key, row)` pair is built for every row whatever the
+limit says, so at 100M that is 1.2 GB of allocation to return ten rows. The commit
+that added top-N said removing it was "a different change"; these numbers are the
+argument for making it. The fix is to find the top k by scanning the column
+directly, never building the pairs.
+
+### Loading is slower than DuckDB at both sizes
+
+448 ms against 306 ms at 10M, 3.67 s against 2.20 s at 100M -- about 1.5x, stable
+with scale, so no scaling defect, just a gap. Never measured before because the
+suite loads outside the timed region on purpose.
+
+---
+
 ## Speed: measured, not acted on
 
 Per-row costs, 100k rows, five distinct strings where text is involved. The
