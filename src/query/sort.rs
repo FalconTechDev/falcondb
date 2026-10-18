@@ -232,9 +232,43 @@ fn try_typed_sort(
 
     // Build (key, row) pairs for the non-NULL rows, and collect NULL rows apart.
     macro_rules! typed {
-        ($c:expr, $ty:ty) => {{
+        ($c:expr, $ty:ty, $uint:ty) => {{
             let c = $c;
             let dense = c.dense();
+            // A small LIMIT: the bounded scan the float and dictionary arms take.
+            //
+            // It needs a key on which ascending is always the wanted order, which
+            // these arms otherwise do without -- they sort the raw value and pass
+            // `desc` to the comparator. Flipping the sign bit of the two's
+            // complement gives that key for a signed integer, and then inverting
+            // it reverses the order, exactly as the float arms do with theirs.
+            if let Some(k) = top_k_limit(limit, dense.len()) {
+                let sign = 1 as $uint << (<$uint>::BITS - 1);
+                let ord = |v: $ty| {
+                    let key = (v as $uint) ^ sign;
+                    if desc { !key } else { key }
+                };
+                let mut sink = NullSink::new(k);
+                let pairs = if c.has_nulls() {
+                    top_k_ascending(
+                        (0..c.len()).filter_map(|i| {
+                            if c.is_valid(i) {
+                                Some((ord(dense[i]), i as u32))
+                            } else {
+                                sink.push(i);
+                                None
+                            }
+                        }),
+                        k,
+                    )
+                } else {
+                    top_k_ascending(
+                        dense.iter().enumerate().map(|(i, &v)| (ord(v), i as u32)),
+                        k,
+                    )
+                };
+                Some(assemble(pairs, sink.rows, s.nulls_last, limit))
+            } else {
             let mut pairs: Vec<($ty, u32)> = Vec::with_capacity(dense.len());
             let mut nulls: Vec<usize> = Vec::new();
             // A column with no NULLs asks `is_valid` nothing: the branch is the
@@ -254,6 +288,7 @@ fn try_typed_sort(
             }
             sort_pairs(&mut pairs, desc);
             Some(assemble(pairs, nulls, s.nulls_last, limit))
+            }
         }};
     }
 
@@ -317,12 +352,12 @@ fn try_typed_sort(
     }
 
     let out = match col {
-        Column::Int64(c)     => typed!(c, i64),
-        Column::Int32(c)     => typed!(c, i32),
+        Column::Int64(c)     => typed!(c, i64, u64),
+        Column::Int32(c)     => typed!(c, i32, u32),
         Column::Float64(c)   => float_typed!(c, f64, u64, f64_ord_key),
         Column::Float32(c)   => float_typed!(c, f32, u32, f32_ord_key),
-        Column::Date32(c)    => typed!(c, i32),
-        Column::Timestamp(c) => typed!(c, i64),
+        Column::Date32(c)    => typed!(c, i32, u32),
+        Column::Timestamp(c) => typed!(c, i64, u64),
 
         // A dictionary column sorts by rank, not by string.
         //

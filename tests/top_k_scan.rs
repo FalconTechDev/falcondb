@@ -189,4 +189,55 @@ fn a_limited_sort_over_many_batches_agrees_too() {
     }
 }
 
+
+/// Integers, where the key had to be normalised before the scan could be used.
+///
+/// Negatives and the extremes are the point: the ordering key flips the sign bit
+/// of the two's complement, so a mistake there sorts the negatives above the
+/// positives and `i64::MIN` above everything. Spread over several batches as
+/// well, so the per-batch reduction sees it too.
+#[test]
+fn a_limited_sort_on_integers_agrees_including_negatives() {
+    let values: Vec<Option<i64>> = (0..ROWS)
+        .map(|i| match i {
+            0 => Some(i64::MIN),
+            1 => Some(i64::MAX),
+            2 => Some(0),
+            _ if i % 101 == 0 => None,
+            // Scattered and straddling zero.
+            _ => Some(((i * 7919) % ROWS) as i64 - (ROWS / 2) as i64),
+        })
+        .collect();
+
+    for batch_rows in [ROWS, 50] {
+        let batches: Vec<_> = values
+            .chunks(batch_rows)
+            .map(|chunk| {
+                RecordBatch::new(
+                    Schema::new(vec![Field::nullable("n", DataType::Int64)]),
+                    vec![ColumnBuilder::int64(chunk.to_vec())],
+                )
+                .unwrap()
+            })
+            .collect();
+        let db = Database::in_memory();
+        db.create_table_from_batches("t", batches).unwrap();
+
+        for order in ["ASC", "DESC"] {
+            for nulls in ["", " NULLS FIRST", " NULLS LAST"] {
+                for k in [1usize, 3, 10] {
+                    let tail = format!("ORDER BY n {order}{nulls}");
+                    let limited = column(&db, &format!("SELECT n FROM t {tail} LIMIT {k}"));
+                    let full = column(&db, &format!("SELECT n FROM t {tail}"));
+                    assert_eq!(
+                        limited,
+                        full[..k.min(full.len())].to_vec(),
+                        "{tail} LIMIT {k}, {batch_rows} rows per batch",
+                    );
+                }
+            }
+        }
+    }
+}
+
 const WORDS: [&str; 7] = ["delta", "alpha", "echo", "bravo", "golf", "charlie", "foxtrot"];
