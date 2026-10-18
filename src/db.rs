@@ -1417,6 +1417,64 @@ fn execute_plan(
 
         let SelectQuery { filter, limit, offset, projection, distinct, scan_columns: _ } = select;
 
+        // `COUNT(*)` with a WHERE counts the mask, it does not build the rows.
+        //
+        // The fast path below requires no filter, so with one the query fell to the
+        // general route: scan, apply the filter into a fresh set of batches, then
+        // sum their row counts. For `SELECT COUNT(*) FROM t WHERE score > 50` over
+        // 100M rows with half of them matching, that materialises 50M rows in order
+        // to return one number.
+        //
+        // Measured one run each against DuckDB: we were ahead at 100k (1.4x), level
+        // at 10M, and 3.3x behind at 100M -- 164ms against 50.6ms. Ten times the
+        // rows cost us 13x and DuckDB 4.3x, so ours grew faster than linearly where
+        // theirs grew slower. That shape is what a materialisation nobody needs
+        // looks like.
+        //
+        // `eval_mask_bits` already returns a packed bitmask -- the one WHERE uses --
+        // so the answer is its population count. Bits past the last row are zero in
+        // every path that builds a mask, which `count_ones` relies on;
+        // `count_star_with_filter_matches_the_general_path` pins that against row
+        // counts that are not multiples of 64.
+        if let Some(gb) = group_by.as_ref() {
+            if gb.group_by.is_empty()
+                && !gb.aggs.is_empty()
+                && gb.aggs.iter().all(crate::query::aggregate::is_count_star)
+                && correlated_filter.is_none()
+                && joins.is_empty()
+                && windows.is_empty()
+                && sort.is_empty()
+                && limit.is_none()
+                && offset == 0
+                && !distinct
+                && set_ops.is_empty()
+                && having.is_none()
+            {
+                if let Some(f) = filter.as_ref() {
+                    let mut total = 0i64;
+                    for b in &table.batches {
+                        let mask = f.eval_mask_bits(b)?;
+                        total += mask.iter().map(|w| w.count_ones() as i64).sum::<i64>();
+                    }
+                    let mut fields = Vec::with_capacity(gb.aggs.len());
+                    let mut columns = Vec::with_capacity(gb.aggs.len());
+                    for agg in &gb.aggs {
+                        fields.push(crate::storage::schema::Field::nullable(
+                            agg.alias.as_str(),
+                            crate::storage::types::DataType::Int64,
+                        ));
+                        columns.push(crate::storage::column::Column::Int64(
+                            crate::storage::column::PrimitiveColumn::new(vec![Some(total)]),
+                        ));
+                    }
+                    return Ok(vec![RecordBatch::new(
+                        crate::storage::schema::Schema::new(fields),
+                        columns,
+                    )?]);
+                }
+            }
+        }
+
         // Aggregate-only fast path: when there is no WHERE, JOIN, WINDOW, ORDER BY,
         // LIMIT, or DISTINCT, skip execute_select entirely and run the aggregate
         // directly on the raw table batches. Eliminates one full parallel Rayon scan

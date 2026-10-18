@@ -23,7 +23,7 @@ fn rows_of(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.row_count()).sum()
 }
 
-fn is_count_star(agg: &AggExpr) -> bool {
+pub(crate) fn is_count_star(agg: &AggExpr) -> bool {
     matches!(agg.func, AggFunc::Count) && matches!(agg.input, Expr::Literal(_))
 }
 
