@@ -1304,6 +1304,47 @@ impl Utf8Column {
         Self { dict: Arc::new(dict_vec), codes, has_nulls }
     }
 
+    /// Build from borrowed strings, allocating one `String` per distinct value
+    /// rather than one per row.
+    ///
+    /// [`Utf8Column::new`] takes owned `String`s, so a caller holding borrowed
+    /// text has to allocate for every row before the dictionary has even been
+    /// consulted -- and the dictionary's whole point is that a column of a hundred
+    /// million rows may hold five distinct values. Loading Parquet was doing
+    /// exactly that: the text column cost 851ms of a 1.93s read where the
+    /// `Float64` column beside it cost 268ms.
+    ///
+    /// The map is keyed on `&str`, so a repeated value is answered by a hash of
+    /// the borrowed bytes and nothing is allocated. The `String` is created only
+    /// when the value is new, which is also the only time the dictionary grows.
+    pub fn from_strs(values: Vec<Option<&str>>) -> Self {
+        let mut dict_vec:  Vec<String> = Vec::new();
+        let mut codes:     Vec<u32>    = Vec::with_capacity(values.len());
+        let mut seen:      std::collections::HashMap<&str, u32> =
+            std::collections::HashMap::new();
+        let mut has_nulls: bool        = false;
+
+        for v in values {
+            match v {
+                None => { codes.push(NULL_CODE); has_nulls = true; }
+                Some(s) => {
+                    let code = match seen.get(s) {
+                        Some(&c) => c,
+                        None => {
+                            let c = dict_vec.len() as u32;
+                            dict_vec.push(s.to_string());
+                            seen.insert(s, c);
+                            c
+                        }
+                    };
+                    codes.push(code);
+                }
+            }
+        }
+
+        Self { dict: Arc::new(dict_vec), codes, has_nulls }
+    }
+
     /// Build directly from an existing Arc-shared dictionary. The caller guarantees every
     /// code is either `NULL_CODE` or a valid index into `dict`.
     /// Gather rows by `u32` index, where `u32::MAX` means "emit a NULL here".
@@ -1602,9 +1643,7 @@ impl ColumnBuilder {
     }
 
     pub fn utf8_from_str(values: Vec<Option<&str>>) -> Column {
-        Column::Utf8(Utf8Column::new(
-            values.into_iter().map(|v| v.map(|s| s.to_string())).collect(),
-        ))
+        Column::Utf8(Utf8Column::from_strs(values))
     }
 
     pub fn date32(values: Vec<Option<i32>>) -> Column {

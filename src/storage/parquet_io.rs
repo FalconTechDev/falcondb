@@ -193,14 +193,17 @@ fn arrow_array_to_falcon(arr: &dyn Array, dt: &DataType) -> FalconResult<Column>
         }
         DataType::Utf8 => {
             use arrow::array::LargeStringArray;
-            let vals: Vec<Option<String>> = if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-                (0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i).to_string()) }).collect()
+            // Borrowed, not owned: the dictionary allocates once per distinct
+            // value, and a `to_string()` here would allocate once per row before
+            // the dictionary was even consulted. See `Utf8Column::from_strs`.
+            let vals: Vec<Option<&str>> = if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                (0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i)) }).collect()
             } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
-                (0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i).to_string()) }).collect()
+                (0..len).map(|i| if arr.is_null(i) { None } else { Some(a.value(i)) }).collect()
             } else {
                 return Err(FalconError::InvalidQuery("expected StringArray".into()));
             };
-            ColumnBuilder::utf8(vals)
+            ColumnBuilder::utf8_from_str(vals)
         }
         DataType::Date32 => {
             let a = arr.as_any().downcast_ref::<Date32Array>()
