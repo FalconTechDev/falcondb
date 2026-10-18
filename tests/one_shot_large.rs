@@ -129,7 +129,13 @@ fn run_size(rows: usize) {
     println!("\n=== {human} rows, FalconDB only, one run each ===");
     let state = machine_state();
     println!("  machine: {state}");
-    if state.starts_with("Offline") || state.contains(" 1") && state.contains("% ") {
+    // Parsed rather than matched on substrings: the first version of this looked
+    // for " 1" and "% " and so warned on "Online 100%".
+    let charge = state
+        .split_whitespace()
+        .find_map(|w| w.strip_suffix('%'))
+        .and_then(|n| n.parse::<u32>().ok());
+    if state.starts_with("Offline") || charge.is_some_and(|c| c < 30) {
         println!("  WARNING: battery or low charge. Numbers below are not comparable");
         println!("           with any other run -- see the comment on machine_state.");
     }
