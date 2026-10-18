@@ -1,3 +1,5 @@
+use std::collections::BinaryHeap;
+
 use rayon::prelude::*;
 
 use crate::storage::{
@@ -209,6 +211,33 @@ fn try_typed_sort(
         ($c:expr, $float:ty, $uint:ty, $key_fn:expr) => {{
             let c = $c;
             let dense = c.dense();
+            // A small LIMIT never needs a pair per row. See `top_k_ascending`.
+            if let Some(k) = top_k_limit(limit, dense.len()) {
+                let mut sink = NullSink::new(k);
+                let pairs = if c.has_nulls() {
+                    top_k_ascending(
+                        (0..c.len()).filter_map(|i| {
+                            if c.is_valid(i) {
+                                let key = $key_fn(dense[i]);
+                                Some((if desc { !key } else { key }, i as u32))
+                            } else {
+                                sink.push(i);
+                                None
+                            }
+                        }),
+                        k,
+                    )
+                } else {
+                    top_k_ascending(
+                        dense.iter().enumerate().map(|(i, &v)| {
+                            let key = $key_fn(v);
+                            (if desc { !key } else { key }, i as u32)
+                        }),
+                        k,
+                    )
+                };
+                Some(assemble(pairs, sink.rows, s.nulls_last, limit))
+            } else {
             let mut pairs: Vec<($uint, u32)> = Vec::with_capacity(dense.len());
             let mut nulls: Vec<usize> = Vec::new();
             // See the note in `typed!`: no NULLs means the validity branch is
@@ -231,6 +260,7 @@ fn try_typed_sort(
             }
             sort_pairs_ord_limited(&mut pairs, limit, nulls.len(), s.nulls_last);
             Some(assemble(pairs, nulls, s.nulls_last, limit))
+            }
         }};
     }
 
@@ -271,6 +301,33 @@ fn try_typed_sort(
             }
 
             let codes = c.codes();
+            // As in the float arms: a small LIMIT is answered by a bounded heap
+            // over the codes, with no pair materialised for the rows it rejects.
+            if let Some(k) = top_k_limit(limit, codes.len()) {
+                let mut sink = NullSink::new(k);
+                let key = |r: u32| if desc { !r } else { r };
+                let pairs = if c.has_nulls() {
+                    top_k_ascending(
+                        codes.iter().enumerate().filter_map(|(row, &code)| {
+                            if Utf8Column::is_null_code(code) {
+                                sink.push(row);
+                                None
+                            } else {
+                                Some((key(rank[code as usize]), row as u32))
+                            }
+                        }),
+                        k,
+                    )
+                } else {
+                    top_k_ascending(
+                        codes.iter().enumerate().map(|(row, &code)| {
+                            (key(rank[code as usize]), row as u32)
+                        }),
+                        k,
+                    )
+                };
+                Some(assemble(pairs, sink.rows, s.nulls_last, limit))
+            } else {
             let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(codes.len());
             let mut nulls: Vec<usize> = Vec::new();
             // Flip the rank's bits for DESC so the sort is always ascending,
@@ -293,6 +350,7 @@ fn try_typed_sort(
             }
             sort_pairs_ord_limited(&mut pairs, limit, nulls.len(), s.nulls_last);
             Some(assemble(pairs, nulls, s.nulls_last, limit))
+            }
         }
         // Utf8 keys would mean cloning or borrowing strings per row; Decimal128
         // and Boolean are rare enough as sort keys not to be worth a second path.
@@ -387,6 +445,93 @@ fn par_sort_min_rows() -> usize {
 /// was beaten. On already-ordered input it is 18x slower, because pdqsort detects
 /// sortedness and a radix sort makes all eight passes regardless; ordered and
 /// nearly-ordered columns are ordinary in analytical data, not a corner case.
+
+/// The `k` smallest `(key, row)` pairs, in order, taken without building a pair
+/// per row.
+///
+/// [`sort_pairs_ord_limited`] already refuses to *sort* more than the limit
+/// needs, but it operates on a vector that was built with one entry per row.
+/// That is the cost which survived it: at 100M rows a `(u64, u32)` pair is
+/// sixteen bytes, so `ORDER BY score DESC LIMIT 10` allocated and wrote 1.6 GB
+/// in order to return ten rows. The commit that added top-N selection called
+/// removing that "a different change"; this is it.
+///
+/// A bounded max-heap keeps `k` pairs and touches every row exactly once. Its
+/// root is the worst of the `k` kept so far, so a row is rejected by a single
+/// comparison -- and for ten rows out of a hundred million that comparison fails
+/// almost every time, which is why this is close to the cost of a bare scan.
+///
+/// Keys arrive already normalised so that *ascending* is always what is wanted:
+/// the float and dictionary arms flip the bits of their ordering key for DESC,
+/// exactly as they do before handing pairs to the radix sort.
+///
+/// Ties at the boundary are arbitrary, as they already were -- these sorts are
+/// unstable and the engine has never promised a particular tied row.
+fn top_k_ascending<T, I>(rows: I, k: usize) -> Vec<(T, u32)>
+where
+    T: Ord + Copy,
+    I: Iterator<Item = (T, u32)>,
+{
+    let mut heap: BinaryHeap<(T, u32)> = BinaryHeap::with_capacity(k + 1);
+    for pair in rows {
+        if heap.len() < k {
+            heap.push(pair);
+        } else if let Some(worst) = heap.peek() {
+            if pair < *worst {
+                heap.pop();
+                heap.push(pair);
+            }
+        }
+    }
+    let mut out = heap.into_vec();
+    out.sort_unstable();
+    out
+}
+
+/// Whether the bounded scan is worth taking instead of building every pair.
+///
+/// Two conditions, both guesses rather than measured crossovers, and said so
+/// here so nobody reads them as findings:
+///
+///   - `k` small in absolute terms. A heap of a hundred thousand entries is no
+///     longer a cache-resident structure, and the comparison that rejects a row
+///     stops being free.
+///   - `k` a small fraction of `n`. When the limit approaches the row count the
+///     heap does the whole sort through its slowest possible interface.
+///
+/// The shapes that matter -- ten rows out of ten or a hundred million -- are
+/// clear of both by several orders of magnitude.
+fn top_k_limit(limit: Option<usize>, rows: usize) -> Option<usize> {
+    let k = limit?;
+    if k == 0 || k > 4096 || k.saturating_mul(64) > rows {
+        return None;
+    }
+    Some(k)
+}
+
+/// Collect at most `cap` NULL row numbers.
+///
+/// Only `cap` of them can ever be emitted: `assemble` places the NULL rows
+/// before or after the keyed ones and then truncates to the limit, so a NULL
+/// beyond the `k`th is unreachable whichever way `NULLS FIRST` falls.
+struct NullSink {
+    rows: Vec<usize>,
+    cap:  usize,
+}
+
+impl NullSink {
+    fn new(cap: usize) -> Self {
+        Self { rows: Vec::new(), cap }
+    }
+
+    #[inline]
+    fn push(&mut self, row: usize) {
+        if self.rows.len() < self.cap {
+            self.rows.push(row);
+        }
+    }
+}
+
 /// Sort `(key, row)` pairs, keeping only as many as the `LIMIT` can use.
 ///
 /// `ORDER BY ... LIMIT 10` used to sort every row and then throw away all but
