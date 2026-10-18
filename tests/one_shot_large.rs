@@ -95,9 +95,43 @@ fn ensure_data(rows: usize) -> (PathBuf, Option<Duration>) {
     (path, Some(t.elapsed()))
 }
 
+/// Print what the machine was doing, because this harness has no rival engine to
+/// serve as a reference.
+///
+/// The four-engine suite can tell a slow machine from slow code: if Polars moved
+/// with us, the machine moved. Running FalconDB alone iterates far faster and
+/// gives that up -- and the first run after doing so proved why. Every query,
+/// including the ones whose code was untouched, read 2-3.5x slower than the run
+/// before: GROUP BY 5.92ms -> 20.4ms, COUNT(DISTINCT) 1.83ms -> 6.03ms, load
+/// 448ms -> 1.01s. The battery had reached 14% and Windows was throttling.
+/// Without this line the obvious reading was that the change under test had made
+/// everything worse.
+fn machine_state() -> String {
+    // PowerShell rather than a crate: this is a diagnostic, not a dependency.
+    let script = "Add-Type -AssemblyName System.Windows.Forms; \
+                  $p=[System.Windows.Forms.SystemInformation]::PowerStatus; \
+                  $c=(Get-CimInstance Win32_Processor).CurrentClockSpeed; \
+                  Write-Output (\"{0} {1}% {2}MHz\" -f $p.PowerLineStatus, \
+                  [math]::Round($p.BatteryLifePercent*100), $c)";
+    match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+
 fn run_size(rows: usize) {
     let human = format!("{}M", rows / 1_000_000);
     println!("\n=== {human} rows, FalconDB only, one run each ===");
+    let state = machine_state();
+    println!("  machine: {state}");
+    if state.starts_with("Offline") || state.contains(" 1") && state.contains("% ") {
+        println!("  WARNING: battery or low charge. Numbers below are not comparable");
+        println!("           with any other run -- see the comment on machine_state.");
+    }
 
     let (path, written) = ensure_data(rows);
     match written {
