@@ -60,3 +60,39 @@ fn load_profile_10m() {
 fn load_profile_100m() {
     profile(100_000_000);
 }
+
+/// The phases of a load, timed separately.
+///
+/// The by-column numbers above add up to much less than what `Database::load_parquet`
+/// reports, so something after the read costs as much as the read. This splits
+/// the two instead of guessing: reading the file into batches, then handing those
+/// batches to a table.
+#[test]
+#[ignore]
+fn load_phases_100m() {
+    use falcondb::storage::table::Table;
+
+    let path = data_dir().join("bench_100000000.parquet");
+    if !path.exists() {
+        println!("no cached file -- run one_shot_large first");
+        return;
+    }
+
+    let t = Instant::now();
+    let batches = falcondb::storage::parquet_io::read_parquet(&path, "bench").unwrap();
+    let read = t.elapsed();
+    let n_batches = batches.len();
+    let rows: usize = batches.iter().map(|b| b.row_count()).sum();
+
+    let schema = batches[0].schema.clone();
+    let mut table = Table::new("bench", schema);
+    let t = Instant::now();
+    table.append_batches(batches).unwrap();
+    let append = t.elapsed();
+
+    println!("
+=== 100M load phases ===");
+    println!("  read_parquet      {read:>10.2?}");
+    println!("  append_batches    {append:>10.2?}");
+    println!("  {n_batches} batches, {rows} rows");
+}
