@@ -36,9 +36,10 @@ const DEPTS: [&str; 5] = ["engineering", "sales", "hr", "ops", "legal"];
 ///
 /// The first two are the shapes that do not scale; the rest are here so a change
 /// that helps one and hurts another cannot hide.
-const QUERIES: [(&str, &str); 6] = [
+const QUERIES: [(&str, &str); 7] = [
     ("COUNT(*) WHERE score > 50",  "SELECT COUNT(*) FROM bench WHERE score > 50"),
     ("ORDER BY score LIMIT 10",    "SELECT score FROM bench ORDER BY score DESC LIMIT 10"),
+    ("ORDER BY id LIMIT 10",       "SELECT id FROM bench ORDER BY id DESC LIMIT 10"),
     ("SUM(score)",                 "SELECT SUM(score) FROM bench"),
     ("SUM(id) integer",            "SELECT SUM(id) FROM bench"),
     ("GROUP BY dept",              "SELECT dept, COUNT(*), AVG(score) FROM bench GROUP BY dept"),

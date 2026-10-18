@@ -1,5 +1,3 @@
-use std::collections::BinaryHeap;
-
 use rayon::prelude::*;
 
 use crate::storage::{
@@ -543,14 +541,23 @@ fn par_sort_min_rows() -> usize {
 /// in order to return ten rows. The commit that added top-N selection called
 /// removing that "a different change"; this is it.
 ///
-/// A bounded max-heap keeps `k` pairs and touches every row exactly once. Its
-/// root is the worst of the `k` kept so far, so a row is rejected by a single
-/// comparison -- and for ten rows out of a hundred million that comparison fails
-/// almost every time, which is why this is close to the cost of a bare scan.
+/// A row is rejected by one comparison against the worst key currently kept, and
+/// for ten rows out of a hundred million almost every row is rejected. Rows that
+/// are *not* rejected go into a buffer of `2k`, which is halved back to the best
+/// `k` by `select_nth_unstable` whenever it fills; the threshold is then the
+/// worst of those, which `select_nth_unstable` has already placed at `k - 1`.
+///
+/// The first attempt here was a bounded max-heap, which is the textbook answer
+/// and was 14x slower on the shape that matters most. `ORDER BY id DESC LIMIT
+/// 10` over an ascending `id` read 1.74s against 133ms for the same query on a
+/// repeating `score` column: on sorted input every row beats the kept set, so a
+/// heap sifts on all 100M of them. This buffer pays an append instead, and
+/// reduces once every `k` rows. Worth remembering as the general trap -- a
+/// bounded heap's good case is random input, and ordered columns are ordinary in
+/// analytical data, not a corner case.
 ///
 /// Keys arrive already normalised so that *ascending* is always what is wanted:
-/// the float and dictionary arms flip the bits of their ordering key for DESC,
-/// exactly as they do before handing pairs to the radix sort.
+/// every arm flips the bits of its ordering key for DESC.
 ///
 /// Ties at the boundary are arbitrary, as they already were -- these sorts are
 /// unstable and the engine has never promised a particular tied row.
@@ -559,20 +566,29 @@ where
     T: Ord + Copy,
     I: Iterator<Item = (T, u32)>,
 {
-    let mut heap: BinaryHeap<(T, u32)> = BinaryHeap::with_capacity(k + 1);
+    let mut buf: Vec<(T, u32)> = Vec::with_capacity(2 * k);
+    // `None` until the buffer has filled once, so nothing is rejected before
+    // there are `k` rows to be worse than.
+    let mut worst_kept: Option<T> = None;
     for pair in rows {
-        if heap.len() < k {
-            heap.push(pair);
-        } else if let Some(worst) = heap.peek() {
-            if pair < *worst {
-                heap.pop();
-                heap.push(pair);
+        if let Some(limit_key) = worst_kept {
+            if pair.0 > limit_key {
+                continue;
             }
         }
+        buf.push(pair);
+        if buf.len() == 2 * k {
+            buf.select_nth_unstable(k - 1);
+            worst_kept = Some(buf[k - 1].0);
+            buf.truncate(k);
+        }
     }
-    let mut out = heap.into_vec();
-    out.sort_unstable();
-    out
+    if buf.len() > k {
+        buf.select_nth_unstable(k - 1);
+        buf.truncate(k);
+    }
+    buf.sort_unstable();
+    buf
 }
 
 /// Whether the bounded scan is worth taking instead of building every pair.
