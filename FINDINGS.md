@@ -288,3 +288,23 @@ pay again.
   handling to `Schema::column_index` made the function too large to inline, which
   cost 15% on a benchmark that never executes the new code. Forcing `#[inline]` to
   fix that cost 18% on `DISTINCT`. Neither was visible in reasoning.
+
+## Both scaling defects at 10M/100M are fixed (2026-10-18)
+
+Measured one run each, FalconDB only, mains power, 2400MHz.
+
+| query | before | after | DuckDB |
+|---|---|---|---|
+| `COUNT(*) WHERE score > 50` 10M | 12.60ms | 4.95ms | 11.8ms |
+| `COUNT(*) WHERE score > 50` 100M | 164ms | 43.5ms | 50.6ms |
+| `ORDER BY score DESC LIMIT 10` 10M | 96.6ms | 12.5ms | 24.2ms |
+| `ORDER BY score DESC LIMIT 10` 100M | 1.05s | 146ms | 140ms |
+
+`COUNT(*)` now counts the filter mask (`db.rs`); growth is 8.8x for 10x rows
+instead of 13x. `ORDER BY ... LIMIT` lost two separate costs: the `(key, row)`
+pair per row, and the concatenation of every batch before the sort -- the second
+was the larger of the two (400ms -> 146ms at 100M).
+
+Left deliberately: the integer sort arms do not normalise their key to an
+unsigned ordering key, so `ORDER BY id LIMIT 10` still builds every pair. Same
+fix, a separate change.
