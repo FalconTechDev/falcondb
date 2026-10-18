@@ -212,7 +212,7 @@ impl Database {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let tbl = Arc::get_mut(o.get_mut())
                     .ok_or_else(|| FalconError::InvalidQuery("table is borrowed".into()))?;
-                for b in batches { tbl.append_batch(b)?; }
+                tbl.append_batches(batches)?;
             }
             std::collections::hash_map::Entry::Vacant(v) => {
                 // The schema comes from the first batch, but every batch has to be
@@ -224,10 +224,10 @@ impl Database {
                     .ok_or_else(|| FalconError::InvalidQuery("empty parquet file".into()))?;
                 let schema = first.schema.clone();
                 let mut tbl = crate::storage::table::Table::new(table_name, schema);
-                tbl.append_batch(first)?;
-                for b in it {
-                    tbl.append_batch(b)?;
-                }
+                let mut rest: Vec<_> = Vec::with_capacity(1);
+                rest.push(first);
+                rest.extend(it);
+                tbl.append_batches(rest)?;
                 v.insert(Arc::new(tbl));
             }
         }

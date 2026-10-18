@@ -375,6 +375,34 @@ impl Table {
         Ok(())
     }
 
+    /// Append many batches, computing their zone maps in parallel.
+    ///
+    /// `append_batch` computes `BatchStats` for one batch, which is a pass over
+    /// every column of it. Loading a Parquet file called that once per batch in a
+    /// loop, so at 100M rows the zone maps for about fifteen hundred batches were
+    /// built one after another on a single core -- after the file had already been
+    /// read in parallel. That was roughly half the measured load time, and none of
+    /// it was reading.
+    ///
+    /// The batches are independent, so the statistics are a `par_iter` and the
+    /// order of the results is preserved by rayon's collect. Schemas are checked
+    /// before anything is computed, so a mismatched batch cannot leave the table
+    /// holding statistics for rows it never took.
+    pub fn append_batches(&mut self, batches: Vec<RecordBatch>) -> FalconResult<()> {
+        if batches.iter().any(|b| b.schema != self.schema) {
+            return Err(FalconError::InvalidQuery(
+                "batch schema does not match table schema".to_string(),
+            ));
+        }
+        let stats: Vec<super::stats::BatchStats> = batches
+            .par_iter()
+            .map(super::stats::BatchStats::compute)
+            .collect();
+        self.stats.extend(stats);
+        self.batches.extend(batches);
+        Ok(())
+    }
+
     pub fn row_count(&self) -> usize {
         self.batches.iter().map(|b| b.row_count()).sum()
     }
