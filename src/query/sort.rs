@@ -566,7 +566,14 @@ where
     T: Ord + Copy,
     I: Iterator<Item = (T, u32)>,
 {
-    let mut buf: Vec<(T, u32)> = Vec::with_capacity(2 * k);
+    // The buffer has a floor, not just `2k`. With `LIMIT 10` a buffer of twenty
+    // fills every ten accepted rows, and on an ascending column every row is
+    // accepted: that measured 925ms at 100M, where the same query on a column
+    // whose values repeat took 116ms. A thousand-row buffer reduces once per
+    // thousand accepted rows instead, which is roughly one extra operation per
+    // row, and it is still a few tens of kilobytes however large the table is.
+    let cap = (2 * k).max(1024);
+    let mut buf: Vec<(T, u32)> = Vec::with_capacity(cap);
     // `None` until the buffer has filled once, so nothing is rejected before
     // there are `k` rows to be worse than.
     let mut worst_kept: Option<T> = None;
@@ -577,7 +584,7 @@ where
             }
         }
         buf.push(pair);
-        if buf.len() == 2 * k {
+        if buf.len() == cap {
             buf.select_nth_unstable(k - 1);
             worst_kept = Some(buf[k - 1].0);
             buf.truncate(k);
