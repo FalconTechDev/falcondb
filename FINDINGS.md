@@ -57,7 +57,7 @@ query. Pinned by `dense_numeric_functions_match_the_general_path`.
 
 Three bugs, all demonstrable in one query each. Severity order, worst first.
 
-### A NULL join key matches another NULL key
+### ~~A NULL join key matches another NULL key~~ — FIXED
 
 ```sql
 SELECT COUNT(*) FROM n JOIN n AS m ON n.a = m.a
@@ -67,9 +67,19 @@ Over a column holding `1, NULL, 3, NULL` this answers **6**. The correct answer 
 2: `1` matches `1`, `3` matches `3`, and a NULL key matches nothing -- not even
 another NULL. The extra 4 is the two NULLs matching each other both ways.
 
-This returns rows that should not exist, which is the worst kind of wrong: no
-error, no warning, just a bigger result. Every `JOIN` on a nullable column is
+This returned rows that should not exist, which is the worst kind of wrong: no
+error, no warning, just a bigger result. Every `JOIN` on a nullable column was
 affected.
+
+Fixed: `row_key_or_null` returns `None` for a NULL key, such keys are never
+inserted into the hash table, and a probe with one finds nothing. The row itself
+is still processed, so LEFT and ANTI continue to emit it -- for ANTI it belongs in
+the output precisely because it matched nothing. Pinned by
+`a_null_join_key_matches_nothing`, which checks all four join types.
+
+The typed integer path was never affected: `int_keys_usable` refuses a column with
+any NULL in it. Only the general string path was wrong, and only for nullable
+keys.
 
 ### Integer arithmetic widens to `f64`, so it loses precision and changes type
 
@@ -168,6 +178,26 @@ clearly wrong.
 - **Is the `ORDER BY` 100k gap against Polars real or structural?** It has read
   1.15x, 1.40x, 1.14x and 1.20x across runs. The 1.40x was an outlier; the rest
   cluster near 1.15x. Worth one investigation, not four.
+
+---
+
+## Traps in the code itself
+
+### `execute_hash_join` accepts `JoinType::Semi` and does not do a semi join
+
+SEMI and ANTI have their own entry point, `execute_hash_semi_anti_join`, which
+takes `anti: bool`. Passing `JoinType::Semi` or `JoinType::Anti` to the general
+`execute_hash_join` is accepted and runs the ordinary join, returning joined rows
+rather than filtered left rows.
+
+Found by walking into it: the first version of
+`a_null_join_key_matches_nothing` tested SEMI and ANTI through the general
+function, and **read as passing** because on that fixture the row counts happened
+to coincide. It only showed up because the test checked all four join types, and
+one of the four disagreed.
+
+Either the general function should reject those variants, or the two entry points
+should be one. As it stands the signature invites a silent wrong answer.
 
 ---
 
