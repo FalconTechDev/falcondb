@@ -126,4 +126,67 @@ fn a_limited_sort_can_be_all_nulls() {
     assert_eq!(got, vec![None, None, None, None, None]);
 }
 
+
+/// The same agreement, with the rows spread over many batches.
+///
+/// This is the path that reduces each batch to `k` rows before splicing, so that
+/// the whole table is never copied into one contiguous batch. A single-batch
+/// test never reaches it, and the mistake it exists to catch is a batch whose
+/// own best rows are discarded because the reduction looked only at the first
+/// one.
+#[test]
+fn a_limited_sort_over_many_batches_agrees_too() {
+    // The best rows are put in the *last* batch, where a reduction that stopped
+    // early would not see them.
+    let per_batch = 100usize;
+    let batches: Vec<_> = (0..20)
+        .map(|b| {
+            RecordBatch::new(
+                Schema::new(vec![
+                    Field::nullable("score", DataType::Float64),
+                    Field::nullable("name", DataType::Utf8),
+                ]),
+                vec![
+                    ColumnBuilder::float64(
+                        (0..per_batch)
+                            .map(|i| {
+                                if (b * per_batch + i) % 97 == 0 {
+                                    None
+                                } else {
+                                    Some((b * per_batch + i) as f64)
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ColumnBuilder::utf8_from_str(
+                        (0..per_batch)
+                            .map(|i| Some(WORDS[(b + i) % WORDS.len()]))
+                            .collect(),
+                    ),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let db = Database::in_memory();
+    db.create_table_from_batches("t", batches).unwrap();
+
+    for col in ["score", "name"] {
+        for order in ["ASC", "DESC"] {
+            for nulls in ["", " NULLS FIRST", " NULLS LAST"] {
+                for k in [1usize, 3, 10] {
+                    let tail = format!("ORDER BY {col} {order}{nulls}");
+                    let limited = column(&db, &format!("SELECT {col} FROM t {tail} LIMIT {k}"));
+                    let full = column(&db, &format!("SELECT {col} FROM t {tail}"));
+                    assert_eq!(
+                        limited,
+                        full[..k.min(full.len())].to_vec(),
+                        "{tail} LIMIT {k}, 20 batches",
+                    );
+                }
+            }
+        }
+    }
+}
+
 const WORDS: [&str; 7] = ["delta", "alpha", "echo", "bravo", "golf", "charlie", "foxtrot"];

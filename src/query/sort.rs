@@ -69,7 +69,59 @@ pub fn execute_sort_limit(
         ));
     }
 
-    let merged = merge_batches(batches)?;
+    // A small LIMIT does not need the batches concatenated at all.
+    //
+    // `merge_batches` copies every column of every batch into one contiguous
+    // batch before a single key is compared. For `SELECT score FROM bench ORDER
+    // BY score DESC LIMIT 10` over 100M rows that is about 1.7 GB copied --
+    // including the columns the query never orders by -- to return ten rows, and
+    // it dominated what was left after the pairs went away.
+    //
+    // The k best rows overall are each among the k best of their own batch, so
+    // each batch can be reduced to k rows on its own and only those spliced
+    // together. What gets copied is then k x batches rows instead of all of
+    // them.
+    //
+    // Taken only when every batch can answer through the typed path: one that
+    // declines would have to be merged anyway, and a half-reduced set is not
+    // something the fallback can use.
+    if let Some(k) = limit {
+        let rows: usize = batches.iter().map(|b| b.row_count()).sum();
+        // `k * batches` has to be a real reduction, and each batch has to be
+        // large enough for the bounded scan to be the right shape for it.
+        if batches.len() > 1 && top_k_limit(Some(k), rows).is_some() {
+            let mut parts: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+            let mut all_typed = true;
+            for b in batches {
+                if b.row_count() == 0 {
+                    continue;
+                }
+                match try_typed_sort(b, sort_exprs, Some(k))? {
+                    Some(indices) => parts.push(gather_narrow(b, &indices)?),
+                    None => {
+                        all_typed = false;
+                        break;
+                    }
+                }
+            }
+            if all_typed && !parts.is_empty() {
+                // Deliberately not recursive: the reduced set has the same batch
+                // count, so a second pass through this branch would reduce
+                // nothing and call itself forever.
+                return sort_merged(merge_batches(&parts)?, sort_exprs, limit);
+            }
+        }
+    }
+
+    sort_merged(merge_batches(batches)?, sort_exprs, limit)
+}
+
+/// Sort one contiguous batch, keeping `limit` rows.
+fn sort_merged(
+    merged:     RecordBatch,
+    sort_exprs: &[SortExpr],
+    limit:      Option<usize>,
+) -> FalconResult<RecordBatch> {
     let n = merged.row_count();
     if n == 0 {
         return Ok(merged);
