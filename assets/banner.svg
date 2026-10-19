@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="FalconDB">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="55%" stop-color="#111c33"/>
+      <stop offset="100%" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f97316"/>
+      <stop offset="100%" stop-color="#fb923c"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="300" fill="url(#bg)"/>
+
+  <!-- column stripes: the storage layout, as decoration -->
+  <g opacity="0.14">
+    <rect x="980"  y="60"  width="26" height="180" rx="4" fill="#38bdf8"/>
+    <rect x="1016" y="92"  width="26" height="148" rx="4" fill="#38bdf8"/>
+    <rect x="1052" y="40"  width="26" height="200" rx="4" fill="#38bdf8"/>
+    <rect x="1088" y="112" width="26" height="128" rx="4" fill="#38bdf8"/>
+    <rect x="1124" y="76"  width="26" height="164" rx="4" fill="#38bdf8"/>
+  </g>
+
+  <!-- falcon mark: a stooping bird reduced to two swept wings -->
+  <g transform="translate(78 150)">
+    <path d="M 0 -52 L 44 14 L 12 14 L 30 52 L -8 10 L 22 10 Z" fill="url(#accent)"/>
+    <path d="M 0 -52 L -44 14 L -12 14 L -30 52 L 8 10 L -22 10 Z" fill="url(#accent)" opacity="0.55"/>
+  </g>
+
+  <text x="168" y="138" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="76" font-weight="700" fill="#f8fafc">Falcon<tspan fill="#fb923c">DB</tspan></text>
+  <text x="172" y="182" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="25" fill="#94a3b8">A columnar analytical database engine, written from scratch in Rust</text>
+
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="18" fill="#64748b">
+    <text x="172" y="232">100M rows</text>
+    <text x="300" y="232" fill="#334155">|</text>
+    <text x="324" y="232">GROUP BY in 31 ms</text>
+    <text x="520" y="232" fill="#334155">|</text>
+    <text x="544" y="232">SUM in 20 ms</text>
+    <text x="690" y="232" fill="#334155">|</text>
+    <text x="714" y="232">single run, mains power</text>
+  </g>
+</svg>

@@ -1,6 +1,7 @@
 <div align="center">
 
-# FalconDB
+<img src="assets/banner.svg" alt="FalconDB" width="100%">
+
 
 **A columnar analytical database engine, written from scratch in Rust.**
 
@@ -57,6 +58,8 @@ print!("{}", result.display());
 Four engines, one process, the same Parquet file. **FalconDB, [Polars](https://pola.rs), [DuckDB](https://duckdb.org), [DataFusion](https://datafusion.apache.org)**, Criterion, median of 100 samples, Intel i7-13700H on mains power with threads pinned to the P-cores.
 
 ### At one million rows
+
+<img src="assets/benchmark-1m.svg" alt="FalconDB against Polars, DuckDB and DataFusion at one million rows" width="100%">
 
 | Query | FalconDB | Polars | DuckDB | DataFusion |
 |---|---|---|---|---|

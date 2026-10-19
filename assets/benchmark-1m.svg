@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="764" viewBox="0 0 1120 764" role="img" aria-label="Benchmark: FalconDB against Polars, DuckDB and DataFusion at one million rows">
+<rect width="1120" height="764" fill="#0d1117"/>
+<text x="40" y="44" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="23" font-weight="600" fill="#e6edf3">One million rows &#8212; median of 100 samples, lower is better</text>
+<rect x="40" y="60" width="13" height="13" rx="3" fill="#fb923c"/>
+<text x="60" y="71" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" fill="#8b949e">FalconDB</text>
+<rect x="136" y="60" width="13" height="13" rx="3" fill="#38bdf8"/>
+<text x="156" y="71" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" fill="#8b949e">Polars</text>
+<rect x="216" y="60" width="13" height="13" rx="3" fill="#a78bfa"/>
+<text x="236" y="71" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" fill="#8b949e">DuckDB</text>
+<rect x="296" y="60" width="13" height="13" rx="3" fill="#64748b"/>
+<text x="316" y="71" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" fill="#8b949e">DataFusion</text>
+<text x="1050" y="71" text-anchor="end" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13" fill="#6e7681">logarithmic scale</text>
+<line x1="303.7" y1="82" x2="303.7" y2="724" stroke="#21262d" stroke-width="1"/>
+<text x="303.7" y="742" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#6e7681">100 µs</text>
+<line x1="614.9" y1="82" x2="614.9" y2="724" stroke="#21262d" stroke-width="1"/>
+<text x="614.9" y="742" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#6e7681">1.00 ms</text>
+<line x1="926.1" y1="82" x2="926.1" y2="724" stroke="#21262d" stroke-width="1"/>
+<text x="926.1" y="742" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#6e7681">10.00 ms</text>
+<text x="192" y="136" text-anchor="end" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#c9d1d9">SUM(score)</text>
+<rect x="210" y="94" width="28.0" height="17" rx="3" fill="#fb923c"/>
+<text x="247.0" y="107" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">62 µs</text>
+<rect x="210" y="116" width="155.5" height="17" rx="3" fill="#38bdf8"/>
+<text x="374.5" y="129" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">158 µs</text>
+<rect x="210" y="138" width="309.9" height="17" rx="3" fill="#a78bfa"/>
+<text x="528.9" y="151" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">495 µs</text>
+<rect x="210" y="160" width="536.1" height="17" rx="3" fill="#64748b"/>
+<text x="755.1" y="173" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">2.64 ms</text>
+<text x="192" y="240" text-anchor="end" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#c9d1d9">SUM(id) integer</text>
+<rect x="210" y="198" width="58.5" height="17" rx="3" fill="#fb923c"/>
+<text x="277.5" y="211" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">77 µs</text>
+<rect x="210" y="220" width="164.6" height="17" rx="3" fill="#38bdf8"/>
+<text x="383.6" y="233" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">169 µs</text>
+<rect x="210" y="242" width="306.3" height="17" rx="3" fill="#a78bfa"/>
+<text x="525.3" y="255" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">482 µs</text>
+<rect x="210" y="264" width="751.6" height="17" rx="3" fill="#64748b"/>
+<text x="970.6" y="277" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">13.00 ms</text>
+<text x="192" y="344" text-anchor="end" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#c9d1d9">WHERE score > 50</text>
+<rect x="210" y="302" width="347.5" height="17" rx="3" fill="#fb923c"/>
+<text x="566.5" y="315" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">654 µs</text>
+<rect x="210" y="324" width="519.3" height="17" rx="3" fill="#38bdf8"/>
+<text x="738.3" y="337" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">2.33 ms</text>
+<rect x="210" y="346" width="835.0" height="17" rx="3" fill="#a78bfa"/>
+<text x="1054.0" y="359" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">24.10 ms</text>
+<rect x="210" y="368" width="789.5" height="17" rx="3" fill="#64748b"/>
+<text x="1008.5" y="381" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">17.20 ms</text>
+<text x="192" y="448" text-anchor="end" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#c9d1d9">GROUP BY + 3 aggs</text>
+<rect x="210" y="406" width="355.0" height="17" rx="3" fill="#fb923c"/>
+<text x="574.0" y="419" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">691 µs</text>
+<rect x="210" y="428" width="722.7" height="17" rx="3" fill="#38bdf8"/>
+<text x="941.7" y="441" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">10.50 ms</text>
+<rect x="210" y="450" width="675.8" height="17" rx="3" fill="#a78bfa"/>
+<text x="894.8" y="463" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">7.42 ms</text>
+<rect x="210" y="472" width="671.0" height="17" rx="3" fill="#64748b"/>
+<text x="890.0" y="485" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">7.16 ms</text>
+<text x="192" y="552" text-anchor="end" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#c9d1d9">DISTINCT</text>
+<rect x="210" y="510" width="517.5" height="17" rx="3" fill="#fb923c"/>
+<text x="736.5" y="523" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">2.30 ms</text>
+<rect x="210" y="532" width="634.4" height="17" rx="3" fill="#38bdf8"/>
+<text x="853.4" y="545" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">5.46 ms</text>
+<rect x="210" y="554" width="594.0" height="17" rx="3" fill="#a78bfa"/>
+<text x="813.0" y="567" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">4.05 ms</text>
+<rect x="210" y="576" width="559.1" height="17" rx="3" fill="#64748b"/>
+<text x="778.1" y="589" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">3.13 ms</text>
+<text x="192" y="656" text-anchor="end" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="15" fill="#c9d1d9">INNER JOIN</text>
+<rect x="210" y="614" width="568.3" height="17" rx="3" fill="#fb923c"/>
+<text x="787.3" y="627" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">3.35 ms</text>
+<rect x="210" y="636" width="533.6" height="17" rx="3" fill="#38bdf8"/>
+<text x="752.6" y="649" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">2.59 ms</text>
+<rect x="210" y="658" width="687.3" height="17" rx="3" fill="#a78bfa"/>
+<text x="906.3" y="671" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">8.08 ms</text>
+<rect x="210" y="680" width="785.5" height="17" rx="3" fill="#64748b"/>
+<text x="1004.5" y="693" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">16.70 ms</text>
+</svg>
