@@ -16,6 +16,8 @@ crate-type = ["rlib"]
 
 [features]
 default  = []
+# Compare against Polars, DuckDB and DataFusion: `cargo bench --features rivals`.
+rivals   = ["dep:polars", "dep:duckdb", "dep:datafusion", "dep:mimalloc"]
 python   = ["pyo3"]
 postgres = []
 
@@ -38,14 +40,23 @@ smallvec           = { version = "1", features = ["union"] }
 
 actix-web  = "4"
 
+# The engines FalconDB is benchmarked against. Optional, and pulled in only by
+# the `rivals` feature, because nothing but `benches/query_bench.rs` uses them.
+#
+# They were dev-dependencies, which meant every `cargo test` compiled Polars,
+# DataFusion and DuckDB -- the slowest part of the whole build -- for tests that
+# never touch them, and that DuckDB had to be linkable on every machine that ran
+# the test suite. CI failed on exactly that once the vendored library left the
+# repository.
+polars     = { version = "0.46", features = ["lazy", "csv", "parquet", "dtype-full"], optional = true }
+duckdb     = { version = "1", optional = true }
+datafusion = { version = "43", optional = true }
+mimalloc   = { version = "0.1.52", default-features = false, optional = true }
+
 [dev-dependencies]
 criterion          = { version = "0.5", features = ["html_reports"] }
 pretty_assertions  = "1.4"
 tempfile           = "3"
-polars             = { version = "0.46", features = ["lazy", "csv", "parquet", "dtype-full"] }
-duckdb             = "1"
-datafusion         = "43"
-mimalloc = { version = "0.1.52", default-features = false }
 
 
 [profile.release]
@@ -55,8 +66,9 @@ codegen-units = 1
 panic         = "abort"
 
 [[bench]]
-name    = "query_bench"
-harness = false
+name              = "query_bench"
+harness           = false
+required-features = ["rivals"]
 
 [profile.bench]
 opt-level     = 3

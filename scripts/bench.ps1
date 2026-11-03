@@ -171,7 +171,7 @@ if ($Baseline) { $criterionArgs += "--baseline", $Baseline }
 # Quoted: the filter is a regex and an unquoted "a|b" is a pipe to cmd.
 if ($Filter)   { $criterionArgs += ('"' + $Filter + '"') }
 
-$cmd = "cargo bench --bench query_bench -- " + ($criterionArgs -join " ")
+$cmd = "cargo bench --features rivals --bench query_bench -- " + ($criterionArgs -join " ")
 
 # Redirect inside cmd, not in PowerShell. `native 2>&1` in PS 5.1 wraps every
 # stderr line in an ErrorRecord, and with ErrorActionPreference=Stop cargo's
