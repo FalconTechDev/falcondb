@@ -1,16 +1,13 @@
 <div align="center">
 
-<img src="assets/banner.svg" alt="FalconDB" width="100%">
+<img src="assets/banner.png" alt="FalconDB - a columnar analytical database, written from scratch in Rust" width="100%">
 
-
-**A columnar analytical database engine, written from scratch in Rust.**
+<br>
 
 Faster than DuckDB and DataFusion on every workload measured here, and ahead of Polars on most of them.
 
 [![CI](https://github.com/FalconTechDev/falcondb/actions/workflows/ci.yml/badge.svg)](https://github.com/FalconTechDev/falcondb/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-314%20unit%20%2B%20integration-brightgreen.svg)](#testing)
+[![License: MIT](https://img.shields.io/badge/license-MIT-6ae2eb?style=flat-square&labelColor=161b22)](LICENSE)
 
 </div>
 
@@ -257,7 +254,7 @@ scripts/bench.ps1
 
 Not a bare `cargo bench`: the script checks for mains power, warns about processes competing for cores, pins threads, and samples the power state during the run. The reasons are under [How these numbers were taken](#how-these-numbers-were-taken).
 
-The comparison benchmark links DuckDB through `libduckdb-sys`, which needs the library next to the tree. It is not committed — 29 MB of someone else's binary in every clone — so fetch it once:
+The comparison engines are behind a feature, so a plain `cargo test` never compiles Polars, DataFusion or DuckDB: `cargo bench --features rivals` (which `scripts/bench.ps1` passes for you). The DuckDB comparison links `libduckdb-sys`, which needs the library next to the tree. It is not committed — 29 MB of someone else's binary in every clone — so fetch it once:
 
 ```powershell
 # Windows: libduckdb-windows-amd64.zip from https://github.com/duckdb/duckdb/releases
